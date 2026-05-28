@@ -1,0 +1,3 @@
+*.log
+*.dmp
+mp_client_load_error.txt
