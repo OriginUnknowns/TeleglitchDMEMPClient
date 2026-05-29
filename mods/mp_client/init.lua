@@ -415,7 +415,7 @@ local function track_item_host(obj, type_name, x, y)
     end
 end
 
-local joiner_pre_snapshot_items = {}  -- list of obj refs
+local joiner_pre_snapshot_items = {}  -- list of {obj, type, x, y}
 local joiner_pre_snapshot_objs = {}   -- obj_table -> true for dedup by identity
 local joiner_track_seq = 0
 local function track_item_joiner_pre(obj, type_name)
@@ -429,9 +429,9 @@ local function track_item_joiner_pre(obj, type_name)
     end
     if joiner_pre_snapshot_objs[obj] then return end
     joiner_pre_snapshot_objs[obj] = true
-    table.insert(joiner_pre_snapshot_items, obj)
-    joiner_track_seq = joiner_track_seq + 1
     local wx, wy = get_obj_pos(obj)
+    table.insert(joiner_pre_snapshot_items, { obj = obj, type = type_name, x = wx, y = wy })
+    joiner_track_seq = joiner_track_seq + 1
     logf("TRACK JOIN seq=%d type=%s pos=(%.2f,%.2f)",
         joiner_track_seq, tostring(type_name), wx or -999, wy or -999)
 end
@@ -481,83 +481,115 @@ local function count_items_in_world(ptr_set)
     return n
 end
 
--- Apply host's item_list. Joiner ran level gen normally (so RNG matched host's
--- and rooms are identical); we now delete those local items and re-spawn from
--- host's authoritative snapshot, keyed by host's IDs.
+-- Apply host's item_list by ADOPTING locally-generated items (deterministic
+-- gen means same items at same positions on both sides). For each host
+-- snapshot item, find a local item of matching type at matching position
+-- and assign the host's id to it. Items that don't match anything still
+-- get Created (rare for deterministic gen). Orphan local items (we have
+-- but host doesn't) get Deleted.
+--
+-- This replaces the old wipe+respawn burst that was causing heap corruption
+-- in the engine. We do at most a handful of Create/Delete calls instead of
+-- 30+ of each.
+local POS_TOL = 0.05  -- positions match within this many world units
 local function apply_item_list(items)
-    logf("apply_item_list: BEGIN  pre_snapshot_n=%d  spawn=%d",
+    logf("apply_item_list (adopt): BEGIN pre_snapshot=%d host_items=%d",
         #joiner_pre_snapshot_items, #(items or {}))
     pcall(function() if SetVolume then SetVolume(0) end end)
-    -- 1. Build "alive" pointer set so we only Delete items whose underlying
-    --    C++ obj still exists. Many tracked items are "ghosts" (engine spawned
-    --    them then destroyed during overlap resolution) — calling Delete on
-    --    a ghost = R6025 segfault.
+
+    -- 1. Build "alive" pointer set from world scan (filter out ghost items
+    --    the engine destroyed during overlap resolution).
     local pl = player.GetPlayer()
     local px, py = 0, 0
     if pl then pcall(function() px, py = pl:GetPosition() end) end
     local alive_ptrs = {}
-    local objs = GetObjectsInCircle(px, py, 1000)
-    if type(objs) == "table" then
-        for _, o in ipairs(objs) do
-            if type(o) == "table" and o.pointer then
-                alive_ptrs[tostring(o.pointer)] = true
+    do
+        local objs = GetObjectsInCircle(px, py, 1000)
+        if type(objs) == "table" then
+            for _, o in ipairs(objs) do
+                if type(o) == "table" and o.pointer then
+                    alive_ptrs[tostring(o.pointer)] = true
+                end
             end
         end
     end
-    -- 2. Wipe ONLY alive items
-    local pre_deleted, skipped_ghosts = 0, 0
-    for _, obj in ipairs(joiner_pre_snapshot_items) do
-        local ptr = nil
-        if obj and type(obj) == "table" then
-            local ok, p = pcall(function() return tostring(obj.pointer or obj) end)
-            if ok then ptr = p end
-        end
-        if ptr and alive_ptrs[ptr] and type(obj.Delete) == "function" then
-            pcall(function() obj:Delete() end)
-            pre_deleted = pre_deleted + 1
-            if pre_deleted % 2 == 0 then Wait(0.2) end  -- 2 deletes per ~0.2s
-        else
-            skipped_ghosts = skipped_ghosts + 1
+
+    -- 2. Bucket alive local items by type, keep position for matching.
+    local local_by_type = {}  -- type → list of {obj, x, y, taken=false}
+    local alive_local = 0
+    for _, e in ipairs(joiner_pre_snapshot_items) do
+        local ptr_ok, ptr = pcall(function() return tostring(e.obj.pointer or e.obj) end)
+        if ptr_ok and alive_ptrs[ptr] then
+            local_by_type[e.type] = local_by_type[e.type] or {}
+            table.insert(local_by_type[e.type], { obj = e.obj, x = e.x, y = e.y, taken = false })
+            alive_local = alive_local + 1
         end
     end
-    Wait(0.3)
-    logf("apply_item_list: wiped %d alive items (skipped %d ghosts)",
-        pre_deleted, skipped_ghosts)
-    joiner_pre_snapshot_items = {}
-    joiner_pre_snapshot_objs = {}
+    logf("apply_item_list: %d alive local items bucketed", alive_local)
+
     mp.items = {}
     mp.item_obj_to_id = {}
     mp.item_snapshot_received = true
-    local count_in = (type(items) == "table") and #items or 0
-    if count_in == 0 then
-        logf("apply_item_list: SKIP (empty input)")
-        pcall(function() if SetVolume then SetVolume(100) end end)
-        return
-    end
-    local spawned, errors = 0, 0
-    for i, it in ipairs(items or {}) do
-        local ok, obj = pcall(function() return CreateItem(it.x, it.y, it.type) end)
-        if not ok then
-            errors = errors + 1
-            logf("CreateItem ERROR id=%d type=%s pos=(%.1f,%.1f): %s",
-                it.id, tostring(it.type), it.x, it.y, tostring(obj))
-        else
-            local store_obj = (type(obj) == "table") and obj or nil
-            local wx, wy = nil, nil
-            if store_obj then wx, wy = get_obj_pos(store_obj) end
-            mp.items[it.id] = { obj = store_obj, type = it.type, x = it.x, y = it.y }
-            if store_obj then mp.item_obj_to_id[store_obj] = it.id end
-            logf("SPAWN id=%d type=%s requested=(%.2f,%.2f) actual=(%.2f,%.2f) ok=%s",
-                it.id, it.type, it.x, it.y, wx or -999, wy or -999, tostring(store_obj ~= nil))
-            spawned = spawned + 1
+
+    -- 3. For each host item, find best matching local item by position.
+    local adopted, created, errors = 0, 0, 0
+    for _, it in ipairs(items or {}) do
+        local bucket = local_by_type[it.type]
+        local best_idx, best_d2 = nil, 1e9
+        if bucket then
+            for i, cand in ipairs(bucket) do
+                if not cand.taken and cand.x and cand.y then
+                    local dx, dy = cand.x - it.x, cand.y - it.y
+                    local d2 = dx*dx + dy*dy
+                    if d2 < best_d2 and d2 < (POS_TOL*POS_TOL) then
+                        best_idx, best_d2 = i, d2
+                    end
+                end
+            end
         end
-        Wait(0.3)  -- faster than 1s, still gives physics breathing room
+        if best_idx then
+            -- ADOPT: claim this local item with the host's id
+            local cand = bucket[best_idx]
+            cand.taken = true
+            mp.items[it.id] = { obj = cand.obj, type = it.type, x = it.x, y = it.y }
+            mp.item_obj_to_id[cand.obj] = it.id
+            adopted = adopted + 1
+        else
+            -- No local match — must be host-specific (chest drop, etc.). Spawn.
+            local ok, obj = pcall(function() return CreateItem(it.x, it.y, it.type) end)
+            if not ok then
+                errors = errors + 1
+                logf("CreateItem ERROR id=%d type=%s: %s",
+                    it.id, tostring(it.type), tostring(obj))
+            else
+                local store_obj = (type(obj) == "table") and obj or nil
+                mp.items[it.id] = { obj = store_obj, type = it.type, x = it.x, y = it.y }
+                if store_obj then mp.item_obj_to_id[store_obj] = it.id end
+                created = created + 1
+                Wait(0.1)  -- only when actually creating
+            end
+        end
     end
-    -- Restore volume now that the burst is done (settings volume * 100 is std).
-    Wait(0.5)  -- give any in-flight sounds time to settle before unmuting
+
+    -- 4. Delete any local items that nothing claimed (host doesn't know about them).
+    local orphaned = 0
+    for _, bucket in pairs(local_by_type) do
+        for _, cand in ipairs(bucket) do
+            if not cand.taken and type(cand.obj.Delete) == "function" then
+                pcall(function() cand.obj:Delete() end)
+                orphaned = orphaned + 1
+                if orphaned % 4 == 0 then Wait(0.1) end
+            end
+        end
+    end
+
+    joiner_pre_snapshot_items = {}
+    joiner_pre_snapshot_objs = {}
+
+    Wait(0.3)
     pcall(function() if SetVolume then SetVolume(100) end end)
-    logf("joiner applied item_list: requested=%d spawned=%d errors=%d  (audio restored)",
-        #(items or {}), spawned, errors)
+    logf("apply_item_list (adopt) DONE: adopted=%d created=%d orphan_del=%d errors=%d",
+        adopted, created, orphaned, errors)
 end
 
 -- Host: build & send item_list snapshot once after level populates.
