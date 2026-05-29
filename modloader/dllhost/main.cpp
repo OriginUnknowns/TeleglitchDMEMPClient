@@ -268,32 +268,36 @@ static int l_install_hook_takedmg(lua_State* L) {
         host_log("    vtbl[%d] = 0x%08x (mod_off=0x%x in_range=%d)", i, addr, off, off < 0x200000);
     }
 
-    void* target = vtbl[0x60 / 4];
-    if (!IN_RANGE(target)) {
-        host_log("install_takedamage_hook: target %p out of range, REFUSING", target);
-        api.pushboolean(L, 0);
-        return 1;
-    }
-    if (g_hooked_addrs.count(target)) {
-        host_log("install_takedamage_hook: target=%p already hooked, skipping", target);
-        api.pushboolean(L, 1);
-        return 1;
-    }
-    if (g_next_hook_slot >= HOOK_POOL_SIZE) {
-        host_log("install_takedamage_hook: hook pool exhausted (%d slots used)", g_next_hook_slot);
-        api.pushboolean(L, 0);
-        return 1;
-    }
-    int slot = g_next_hook_slot++;
-    g_hooked_addrs.insert(target);
-    host_log("install_takedamage_hook: hooking target=%p in slot %d", target, slot);
+    // Try slot 19 (vtable+0x4c) FIRST — that's what Bullet::Update calls on
+    // hit. Slot 24 (+0x60) is the SetHealth-flag=1 path used by Lua scripts
+    // (boss self-damage, etc.). Hook both for full coverage.
+    int try_offsets[] = { 0x4c, 0x60 };
+    int installed = 0;
+    for (int oi = 0; oi < 2; oi++) {
+        void* target = vtbl[try_offsets[oi] / 4];
+        if (!IN_RANGE(target)) {
+            host_log("install_takedamage_hook: vtable[+0x%x]=%p out of range, skipping",
+                     try_offsets[oi], target);
+            continue;
+        }
+        if (g_hooked_addrs.count(target)) continue;  // dedup silently
+        if (g_next_hook_slot >= HOOK_POOL_SIZE) {
+            host_log("install_takedamage_hook: hook pool exhausted (%d slots used)", g_next_hook_slot);
+            break;
+        }
+        int slot = g_next_hook_slot++;
+        g_hooked_addrs.insert(target);
+        host_log("install_takedamage_hook: hooking vtable[+0x%x]=%p in slot %d",
+                 try_offsets[oi], target, slot);
 
-    MH_STATUS s = MH_CreateHook(target, g_hook_slot_fns[slot], (LPVOID*)&g_origs[slot]);
-    host_log("MH_CreateHook(TakeDamage @%p slot %d): status=%d", target, slot, s);
-    if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
-    s = MH_EnableHook(target);
-    host_log("MH_EnableHook(TakeDamage slot %d): status=%d", slot, s);
-    api.pushboolean(L, s == MH_OK ? 1 : 0);
+        MH_STATUS s = MH_CreateHook(target, g_hook_slot_fns[slot], (LPVOID*)&g_origs[slot]);
+        host_log("  MH_CreateHook status=%d", s);
+        if (s != MH_OK) continue;
+        s = MH_EnableHook(target);
+        host_log("  MH_EnableHook status=%d", s);
+        if (s == MH_OK) installed++;
+    }
+    api.pushboolean(L, installed > 0 ? 1 : 0);
     return 1;
 }
 
