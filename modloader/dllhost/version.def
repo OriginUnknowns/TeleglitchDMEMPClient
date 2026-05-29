@@ -19,3 +19,5 @@ EXPORTS
     VerLanguageNameW                 = "C:\Windows\System32\version.VerLanguageNameW"
     VerQueryValueA                   = "C:\Windows\System32\version.VerQueryValueA"
     VerQueryValueW                   = "C:\Windows\System32\version.VerQueryValueW"
+    ; Our Lua module entry — loaded via package.loadlib from mp_client.lua
+    luaopen_mp_native

@@ -126,7 +126,8 @@ $btnSave.Add_Click({
     for ($i = 0; $i -lt $list.Items.Count; $i++) {
         if ($list.GetItemChecked($i)) { $lines += $mods[$i].Folder }
     }
-    Set-Content -Path $enabledTxt -Value $lines -Encoding utf8
+    # Write WITHOUT BOM (Lua reads it fine but it's cleaner).
+    [System.IO.File]::WriteAllText($enabledTxt, ($lines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding $false))
     [System.Windows.Forms.MessageBox]::Show(
         "Saved $($lines.Count - 1) enabled mod(s) to:`n$enabledTxt",
         "Saved",

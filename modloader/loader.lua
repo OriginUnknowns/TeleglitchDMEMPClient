@@ -9,9 +9,11 @@
 -- not take down the rest.
 
 local function logf(fmt, ...)
+    local msg = "[MODLOADER] " .. os.date("%H:%M:%S ") .. string.format(fmt, ...)
+    print(msg)  -- also stdout, can't be hidden by io being sandboxed
     local f = io.open("modloader/loader.log", "a")
     if not f then return end
-    f:write(os.date("%H:%M:%S ") .. string.format(fmt, ...) .. "\n")
+    f:write(msg .. "\n")
     f:close()
 end
 

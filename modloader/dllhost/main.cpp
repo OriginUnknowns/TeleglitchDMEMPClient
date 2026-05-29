@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "lua52_min.h"
 
 // ---------------------------------------------------------------------------
 // Modloader host API exposed to native mods. Versioned so we can extend.
@@ -106,6 +107,44 @@ static void load_native_mods() {
 // DLL entry. Forwards happen via the .def file's EXPORTS section; here we
 // only handle process-attach init.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Lua module entry point — exported as luaopen_mp_native so mp_client.lua
+// can do:   local mp = package.loadlib("version.dll", "luaopen_mp_native")()
+// This is the OFFICIAL Lua C-extension hook; we get lua_State for free.
+// ---------------------------------------------------------------------------
+
+static LuaApi api;
+static lua_State* g_L = nullptr;
+
+static int l_hello(lua_State* L) {
+    api.pushstring(L, "hello from native (modloader dllhost)");
+    return 1;
+}
+
+static int l_log(lua_State* L) {
+    size_t n = 0;
+    const char* msg = api.tolstring(L, 1, &n);
+    host_log("lua: %s", msg ? msg : "(nil)");
+    return 0;
+}
+
+extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
+    if (!lua_resolve_api(&api)) {
+        // Best-effort: push nil so caller doesn't get garbage
+        return 0;
+    }
+    g_L = L;
+    host_log("luaopen_mp_native: L=%p, api resolved", (void*)L);
+
+    // Build a table: { hello = fn, log = fn }
+    api.createtable(L, 0, 4);
+    api.pushcclosure(L, l_hello, 0);
+    api.setfield(L, -2, "hello");
+    api.pushcclosure(L, l_log, 0);
+    api.setfield(L, -2, "log");
+    return 1;  // return the table
+}
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {

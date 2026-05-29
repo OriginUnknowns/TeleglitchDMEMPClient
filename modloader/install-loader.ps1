@@ -69,7 +69,10 @@ end
         # Fallback: prepend the patch if arenas.lua not found.
         $patched = $patch + "`n" + $initContent
     }
-    Set-Content -Path $initLua -Value $patched -Encoding utf8
+    # WriteAllText with default UTF8 (no BOM) — Lua doesn't choke on BOM,
+    # but PowerShell's Set-Content -Encoding utf8 writes BOM which can break
+    # other tooling. Use raw write to avoid it.
+    [System.IO.File]::WriteAllText($initLua, $patched, (New-Object System.Text.UTF8Encoding $false))
     Write-Host "Patched init.lua to load mod loader"
 } else {
     Write-Host "init.lua already loads mod loader (skipping patch)"

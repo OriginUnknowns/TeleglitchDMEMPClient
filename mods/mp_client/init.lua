@@ -8,6 +8,32 @@ local function dump_err(label, err)
     end
 end
 
+-- Native modloader bridge (modloader dllhost). Optional: if the DLL isn't
+-- installed, we just skip and continue with the pure-Lua mod.
+local mp_native = nil
+do
+    local loader, lerr = package.loadlib("version.dll", "luaopen_mp_native")
+    if loader then
+        local ok, mod = pcall(loader)
+        if ok and type(mod) == "table" then
+            mp_native = mod
+            if mp_native.log then mp_native.log("mp_client: native bridge connected") end
+            local f = io.open("mp_client_native.txt", "w")
+            if f then
+                f:write("native bridge active. hello() returned: " ..
+                    tostring(mp_native.hello and mp_native.hello() or "(no hello)") .. "\n")
+                f:close()
+            end
+        else
+            dump_err("luaopen_mp_native call", mod)
+        end
+    else
+        -- DLL not installed; this is fine, we just run without native hooks.
+        local f = io.open("mp_client_native.txt", "w")
+        if f then f:write("native bridge NOT available (" .. tostring(lerr) .. ")\n"); f:close() end
+    end
+end
+
 local ok_sock, socket = pcall(require, "socket")
 if not ok_sock then dump_err("require(socket)", socket); return end
 
