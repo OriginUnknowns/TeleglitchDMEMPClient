@@ -149,6 +149,47 @@ static void __fastcall hook_BulletCtor(void* self, void* /*edx*/, int a, int b, 
     orig_BulletCtor(self, a, b, c, d);
 }
 
+// Central damage entry: TNewLiving::ApplyHit(attacker, ...). Located via
+// RTTI: TEnemy::OnBulletHit (slot 28) calls this; same for TPlayer. So
+// this is the shared "process a hit on this entity" function. One hook
+// catches all entity damage events from any source.
+// Caller (TEnemy::OnBulletHit at 0x4554c0) pushes 5 stack args before
+// calling 0x44ee80 with `this` in ecx. So signature is __thiscall with 5
+// stack args. Mismatched arg count = stack imbalance on return = crash.
+typedef void (__thiscall *HitFn)(void* self, void* a1, int a2, int a3, int a4, int a5);
+static HitFn orig_CentralHit = nullptr;
+static int g_central_hit_count = 0;
+
+// Forward decls for ring buffer (defined later, shared with hook_common)
+#define HIT_RING_SIZE 256
+extern DWORD g_hit_targets[HIT_RING_SIZE];
+extern volatile int g_hit_write_idx;
+
+static void __fastcall hook_CentralHit(void* self, void* /*edx*/,
+                                       void* a1, int a2, int a3, int a4, int a5) {
+    g_central_hit_count++;
+    g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
+    g_hit_write_idx++;
+    if (g_central_hit_count <= 32 || (g_central_hit_count % 25) == 0) {
+        host_log("hook_CentralHit #%d: target=%p arg1=%p",
+                 g_central_hit_count, self, a1);
+    }
+    orig_CentralHit(self, a1, a2, a3, a4, a5);
+}
+
+static int l_install_central_hit_hook(lua_State* L) {
+    HMODULE m = GetModuleHandleA(NULL);
+    if (!m) { api.pushboolean(L, 0); return 1; }
+    BYTE* target = (BYTE*)m + 0x4ee80;
+    MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_CentralHit, (LPVOID*)&orig_CentralHit);
+    host_log("MH_CreateHook(CentralHit @%p): status=%d", target, s);
+    if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    s = MH_EnableHook(target);
+    host_log("MH_EnableHook(CentralHit): status=%d", s);
+    api.pushboolean(L, s == MH_OK ? 1 : 0);
+    return 1;
+}
+
 static int l_install_hook_bullet(lua_State* L) {
     HMODULE m = GetModuleHandleA(NULL);
     if (!m) { api.pushboolean(L, 0); return 1; }
@@ -179,13 +220,48 @@ static std::set<void*> g_hooked_addrs;
 #define HOOK_POOL_SIZE 8
 static TakeDamageFn g_origs[HOOK_POOL_SIZE] = {0};
 
+// Ring buffer of recent hit target addresses. Lua polls via consume_hit()
+// which returns one address per call, or 0 when empty.
+// (HIT_RING_SIZE defined above near hook_CentralHit forward decl.)
+DWORD g_hit_targets[HIT_RING_SIZE] = {0};
+volatile int g_hit_write_idx = 0;
+static int g_hit_read_idx = 0;
+
 static void hook_common(int slot, void* self, float damage, float kind) {
     g_takedmg_count++;
-    if (g_takedmg_count <= 32 || (g_takedmg_count % 25) == 0) {
-        host_log("hook_TakeDamage[slot %d] #%d: target=%p dmg=%.2f kind=%.2f",
-                 slot, g_takedmg_count, self, damage, kind);
+    g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
+    g_hit_write_idx++;
+    if (g_takedmg_count <= 32 || (g_takedmg_count % 200) == 0) {
+        host_log("hook[slot %d] #%d: target=%p", slot, g_takedmg_count, self);
     }
     g_origs[slot](self, damage, kind);
+}
+
+// Lua-callable: returns the integer address backing a userdata. Lua side
+// compares this to consume_hit() return values to match hits to puppets.
+typedef void* (*LuaToPointerFn)(lua_State*, int);
+static int l_addr_of(lua_State* L) {
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* p = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    api.pushinteger(L, (int)(DWORD)p);
+    return 1;
+}
+
+// Lua-callable: returns one target address per call, or 0 if no more hits.
+// Lua side maps the address to its known mob puppets to detect a real hit.
+static int l_consume_hit(lua_State* L) {
+    if (g_hit_read_idx >= g_hit_write_idx) {
+        api.pushinteger(L, 0);
+        return 1;
+    }
+    DWORD t = g_hit_targets[g_hit_read_idx % HIT_RING_SIZE];
+    g_hit_read_idx++;
+    api.pushinteger(L, (int)t);
+    return 1;
 }
 
 #define HOOK_SLOT(N) \
@@ -268,12 +344,13 @@ static int l_install_hook_takedmg(lua_State* L) {
         host_log("    vtbl[%d] = 0x%08x (mod_off=0x%x in_range=%d)", i, addr, off, off < 0x200000);
     }
 
-    // Try slot 19 (vtable+0x4c) FIRST — that's what Bullet::Update calls on
-    // hit. Slot 24 (+0x60) is the SetHealth-flag=1 path used by Lua scripts
-    // (boss self-damage, etc.). Hook both for full coverage.
-    int try_offsets[] = { 0x4c, 0x60 };
+    // ONLY hook slot 24 (+0x60) — SetHealth-flag=1 path. vtable[+0x4c]
+    // turned out to be the per-frame Update method (fires 100x/sec per
+    // entity), not a bullet-hit handler. Need to find a different hook
+    // target for bullet hits.
+    int try_offsets[] = { 0x60 };
     int installed = 0;
-    for (int oi = 0; oi < 2; oi++) {
+    for (int oi = 0; oi < (int)(sizeof(try_offsets)/sizeof(try_offsets[0])); oi++) {
         void* target = vtbl[try_offsets[oi] / 4];
         if (!IN_RANGE(target)) {
             host_log("install_takedamage_hook: vtable[+0x%x]=%p out of range, skipping",
@@ -334,6 +411,12 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "install_bullet_hook");
     api.pushcclosure(L, l_install_hook_takedmg, 0);
     api.setfield(L, -2, "install_takedamage_hook");
+    api.pushcclosure(L, l_consume_hit, 0);
+    api.setfield(L, -2, "consume_hit");
+    api.pushcclosure(L, l_addr_of, 0);
+    api.setfield(L, -2, "addr_of");
+    api.pushcclosure(L, l_install_central_hit_hook, 0);
+    api.setfield(L, -2, "install_central_hit_hook");
     return 1;  // return the table
 }
 

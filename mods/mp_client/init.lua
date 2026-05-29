@@ -18,19 +18,19 @@ do
         if ok and type(mod) == "table" then
             mp_native = mod
             if mp_native.log then mp_native.log("mp_client: native bridge connected") end
-            -- Try installing the CreateBullet hook. Logs to dllhost.log.
+            -- Install all native hooks. These do NOT cause the pre-existing
+            -- apply_item_list spawn-burst crash (verified by disabling all
+            -- hooks and reproducing the same crash anyway).
             if mp_native.install_bullet_hook then
                 local hook_ok = mp_native.install_bullet_hook()
                 if mp_native.log then mp_native.log("install_bullet_hook returned " .. tostring(hook_ok)) end
             end
-            -- TakeDamage hook needs a Soldat pointer to resolve vtable.
-            -- Player isn't available at mod load time; defer to a tick
-            -- coroutine that fires once player.GetPlayer() returns non-nil.
-            if mp_native.install_takedamage_hook then
-                _G.MP_NATIVE = mp_native
-                _G.MP_INSTALL_TAKEDMG_DEFERRED = true
-                if mp_native.log then mp_native.log("set MP_INSTALL_TAKEDMG_DEFERRED=true") end
+            if mp_native.install_central_hit_hook then
+                local ok = mp_native.install_central_hit_hook()
+                if mp_native.log then mp_native.log("install_central_hit_hook returned " .. tostring(ok)) end
             end
+            -- (per-puppet vtable hook removed — central hit hook covers all)
+            _G.MP_NATIVE = mp_native
             local f = io.open("mp_client_native.txt", "w")
             if f then
                 f:write("native bridge active. hello() returned: " ..
@@ -1729,33 +1729,42 @@ end
 
 -- Key names from lua/keys.lua — keypad +, arrow up/down, return/kp_enter.
 local function dev_menu_tick()
-    -- Install TakeDamage hook on player + every visible mob. The native
-    -- side dedups by function address, so calling for many mobs that share
-    -- a vtable[24] does nothing extra. Limited to once every ~2 seconds.
-    if _G.MP_NATIVE and _G.MP_NATIVE.install_takedamage_hook then
-        local now = socket.gettime()
-        if not _G.MP_TAKEDMG_LAST_SCAN or (now - _G.MP_TAKEDMG_LAST_SCAN) > 2.0 then
-            _G.MP_TAKEDMG_LAST_SCAN = now
-            local pl = player.GetPlayer()
-            if pl and pl.pointer then
-                _G.MP_NATIVE.install_takedamage_hook(pl.pointer)
+    -- Drain native hit events and forward to host as mob_damage. Each event
+    -- is a c-side entity address; we match against our local puppet pointers
+    -- to find the mp mob id. Deduplicate via a short cooldown per id.
+    if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
+        if not _G.MP_HIT_COOLDOWN then _G.MP_HIT_COOLDOWN = {} end
+        if not _G.MP_HIT_PUPPET_ADDRS then _G.MP_HIT_PUPPET_ADDRS = {} end
+        -- Refresh addr→id map periodically (puppet creation rate is low).
+        if (not _G.MP_HIT_ADDR_REFRESH) or (socket.gettime() - _G.MP_HIT_ADDR_REFRESH > 1.0) then
+            _G.MP_HIT_ADDR_REFRESH = socket.gettime()
+            local map = {}
+            for id, entry in pairs(mp.mob_puppets) do
+                if type(entry) == "table" and entry.obj and entry.obj.pointer then
+                    local ok, addr = pcall(function() return _G.MP_NATIVE.addr_of(entry.obj.pointer) end)
+                    if ok and addr and addr ~= 0 then map[addr] = id end
+                end
             end
-            -- Scan nearby mobs and try to hook each. Native side dedups.
-            local px, py = 0, 0
-            if pl then pcall(function() px, py = pl:GetPosition() end) end
-            local objs = GetObjectsInCircle(px, py, 200)
-            if type(objs) == "table" then
-                local tried = 0
-                for _, o in ipairs(objs) do
-                    if type(o) == "table" and o.pointer and o.Alert then  -- soldat-like
-                        pcall(function() _G.MP_NATIVE.install_takedamage_hook(o.pointer) end)
-                        tried = tried + 1
-                        if tried > 12 then break end  -- cap per scan
-                    end
+            _G.MP_HIT_PUPPET_ADDRS = map
+        end
+        -- Drain up to 32 hits per tick
+        local now = socket.gettime()
+        for _ = 1, 32 do
+            local addr = _G.MP_NATIVE.consume_hit()
+            if not addr or addr == 0 then break end
+            local mob_id = _G.MP_HIT_PUPPET_ADDRS[addr]
+            if mob_id then
+                local last = _G.MP_HIT_COOLDOWN[mob_id] or 0
+                if (now - last) > 0.1 then
+                    _G.MP_HIT_COOLDOWN[mob_id] = now
+                    send_msg({ type = "mob_damage", id = mob_id, dmg = 10 })
+                    logf("native hit -> mob_damage id=%d", mob_id)
                 end
             end
         end
     end
+    -- (Per-puppet vtable[+0x60] scan removed — central hit hook covers
+    -- everything via the shared TNewLiving::ApplyHit base method.)
     -- Manual pickup key works on BOTH sides (host AND joiner).
     if kp("kp_minus") then
         logf("manual pickup key pressed")
