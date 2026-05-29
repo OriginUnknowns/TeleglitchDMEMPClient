@@ -1323,10 +1323,12 @@ local function handle_bullet_fire(msg)
     if type(msg.angle) ~= "number" or type(msg.speed) ~= "number" then return end
     local btype = (type(msg.btype) == "number") and msg.btype or 0
     local pl = player.GetPlayer()
+    -- Try owner=nil: host's player as owner might be making the engine
+    -- treat the bullet as "owner team", skipping damage on other Soldats.
     local ok, err = pcall(function()
-        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 0.5, pl)
+        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, nil)
     end)
-    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d ok=%s err=%s",
+    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d (nil owner) ok=%s err=%s",
         tostring(msg.from), msg.x, msg.y, msg.angle, msg.speed, btype, tostring(ok), tostring(err))
 end
 
