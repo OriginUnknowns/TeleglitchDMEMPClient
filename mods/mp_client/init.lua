@@ -1323,13 +1323,29 @@ local function handle_bullet_fire(msg)
     if type(msg.angle) ~= "number" or type(msg.speed) ~= "number" then return end
     local btype = (type(msg.btype) == "number") and msg.btype or 0
     local pl = player.GetPlayer()
-    -- Try owner=nil: host's player as owner might be making the engine
-    -- treat the bullet as "owner team", skipping damage on other Soldats.
+    -- Owner = the joiner's puppet (mp.puppets[from].obj). This makes the
+    -- bullet semantically "fired by the joiner" — the engine should treat
+    -- it as a player bullet that damages mobs. Falls back to host's own
+    -- player if the joiner puppet isn't found.
+    local owner = nil
+    if msg.from and mp.puppets[msg.from] then
+        owner = mp.puppets[msg.from].obj
+    end
+    if not owner then owner = player.GetPlayer() end
+    local bdmg = (type(msg.dmg) == "number") and msg.dmg or 10
+    local bwall = (type(msg.walldmg) == "number") and msg.walldmg or 10
+    local bullet
     local ok, err = pcall(function()
-        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, nil)
+        bullet = CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, owner)
     end)
-    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d (nil owner) ok=%s err=%s",
-        tostring(msg.from), msg.x, msg.y, msg.angle, msg.speed, btype, tostring(ok), tostring(err))
+    -- Set the damage fields directly on the returned bullet — engine reads
+    -- these on collision rather than from owner's weapon.
+    if ok and bullet and type(bullet) == "table" then
+        pcall(function() bullet.damage = bdmg end)
+        pcall(function() bullet.walldamage = bwall end)
+    end
+    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d dmg=%d ok=%s",
+        tostring(msg.from), msg.x, msg.y, msg.angle, msg.speed, btype, bdmg, tostring(ok))
 end
 
 local function handle_mob_died(msg)
@@ -1797,11 +1813,14 @@ local function dev_menu_tick()
         end
         local bspeed = (item and type(item.bulletspeed) == "number") and item.bulletspeed or 15
         local btype  = (item and type(item.bullettype)  == "number") and item.bullettype  or 0
+        local bdmg   = (item and type(item.damage)      == "number") and item.damage      or 10
+        local bwall  = (item and type(item.walldamage)  == "number") and item.walldamage  or 10
         for _ = 1, 16 do
             local x, y, vx, vy = _G.MP_NATIVE.consume_bullet()
             if not x then break end
             local angle = math.atan2(vy, vx)
-            send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = bspeed, btype = btype })
+            send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = bspeed,
+                       btype = btype, dmg = bdmg, walldmg = bwall })
         end
     end
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
@@ -1838,6 +1857,14 @@ local function dev_menu_tick()
     -- (Per-puppet vtable[+0x60] scan removed — central hit hook covers
     -- everything via the shared TNewLiving::ApplyHit base method.)
     -- Manual pickup key works on BOTH sides (host AND joiner).
+    -- Numpad 0: disconnect from relay (safe — lets the user recover from
+    -- accidentally clicking Host twice or other double-connect bugs).
+    if kp("kp_0") then
+        logf("manual disconnect (Numpad 0)")
+        if mp and mp.sock then
+            pcall(disconnect)
+        end
+    end
     if kp("kp_minus") then
         logf("manual pickup key pressed")
         manual_pickup_nearest()
