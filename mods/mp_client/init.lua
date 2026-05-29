@@ -810,7 +810,10 @@ local function install_giveitem_hook()
     local pl = player.GetPlayer()
     if pl and type(pl.GetAmmo) == "function" then
         local ammos = {}
-        for n = 0, 12 do
+        -- Engine only has 11 ammo slots (0-10). Going past that = out-of-bounds
+        -- read on the engine's ammo array — caught by PageHeap as instant
+        -- access violation. Was the source of recurring heap-corruption crashes.
+        for n = 0, 10 do
             local ok, v = pcall(function() return pl:GetAmmo(n) end)
             if ok then table.insert(ammos, n .. "=" .. tostring(v)) end
         end
@@ -1318,6 +1321,13 @@ end
 -- compute angle/speed from the velocity vector; type/force/owner hardcoded
 -- for MVP (pistol bullet owned by the host's own player).
 local function handle_bullet_fire(msg)
+    if not _G.MP_LOGGED_BFIRE then
+        _G.MP_LOGGED_BFIRE = true
+        logf("FIRST bullet_fire: is_host=%s x=%s y=%s angle=%s speed=%s btype=%s dmg=%s",
+            tostring(mp.is_host),
+            tostring(msg.x), tostring(msg.y), tostring(msg.angle),
+            tostring(msg.speed), tostring(msg.btype), tostring(msg.dmg))
+    end
     if not mp.is_host then return end
     if type(msg.x) ~= "number" or type(msg.y) ~= "number" then return end
     if type(msg.angle) ~= "number" or type(msg.speed) ~= "number" then return end
@@ -1333,19 +1343,68 @@ local function handle_bullet_fire(msg)
     end
     if not owner then owner = player.GetPlayer() end
     local bdmg = (type(msg.dmg) == "number") and msg.dmg or 10
-    local bwall = (type(msg.walldmg) == "number") and msg.walldmg or 10
-    local bullet
-    local ok, err = pcall(function()
-        bullet = CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, owner)
-    end)
-    -- Set the damage fields directly on the returned bullet — engine reads
-    -- these on collision rather than from owner's weapon.
-    if ok and bullet and type(bullet) == "table" then
-        pcall(function() bullet.damage = bdmg end)
-        pcall(function() bullet.walldamage = bwall end)
+    -- Spawn the visual bullet (no damage — that's what we couldn't get working).
+    pcall(function() CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, owner) end)
+    -- Server-side damage: raycast from the joiner's fire point in the angle
+    -- direction; first tracked host mob in the bullet's line gets damaged.
+    local MAX_RANGE = 30
+    local HIT_RADIUS = 1.0  -- tolerance perpendicular to ray
+    local dx, dy = math.cos(msg.angle), math.sin(msg.angle)
+    local best_id, best_t = nil, math.huge
+    for ptr, info in pairs(mp.host_mobs) do
+        if info.obj then
+            local mx, my
+            pcall(function() mx, my = info.obj:GetPosition() end)
+            if mx and my then
+                -- Project mob position onto bullet ray
+                local rx, ry = mx - msg.x, my - msg.y
+                local t = rx * dx + ry * dy  -- distance along ray
+                if t > 0 and t < MAX_RANGE then
+                    local perp = math.abs(rx * dy - ry * dx)
+                    if perp < HIT_RADIUS and t < best_t then
+                        best_t, best_id = t, info.id
+                    end
+                end
+            end
+        end
     end
-    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d dmg=%d ok=%s",
-        tostring(msg.from), msg.x, msg.y, msg.angle, msg.speed, btype, bdmg, tostring(ok))
+    if best_id then
+        for ptr, info in pairs(mp.host_mobs) do
+            if info.id == best_id and info.obj then
+                local h
+                pcall(function() h = info.obj:GetHealth() end)
+                if h then
+                    local new_h = h - bdmg
+                    pcall(function() info.obj:SetHealth(new_h, 1) end)
+                    logf("bullet_fire from=%s raycast HIT mob id=%d dmg=%d %d->%d",
+                        tostring(msg.from), best_id, bdmg, h, new_h)
+                end
+                break
+            end
+        end
+    else
+        -- Diagnose: count host_mobs and find nearest by raw distance
+        local count, nearest_d, nearest_id, nearest_t, nearest_perp = 0, math.huge, nil, 0, 0
+        for ptr, info in pairs(mp.host_mobs) do
+            count = count + 1
+            if info.obj then
+                local mx, my
+                pcall(function() mx, my = info.obj:GetPosition() end)
+                if mx and my then
+                    local d = math.sqrt((mx - msg.x)^2 + (my - msg.y)^2)
+                    if d < nearest_d then
+                        nearest_d, nearest_id = d, info.id
+                        local rx, ry = mx - msg.x, my - msg.y
+                        nearest_t = rx * dx + ry * dy
+                        nearest_perp = math.abs(rx * dy - ry * dx)
+                    end
+                end
+            end
+        end
+        logf("bullet_fire from=%s NO HIT: pos=(%.2f,%.2f) angle=%.2f host_mobs=%d nearest=id%s d=%.1f t=%.1f perp=%.1f",
+            tostring(msg.from), msg.x, msg.y, msg.angle,
+            count, tostring(nearest_id), nearest_d, nearest_t, nearest_perp)
+    end
 end
 
 local function handle_mob_died(msg)
@@ -1811,10 +1870,37 @@ local function dev_menu_tick()
         if pl and pl.GetEquippedItem then
             pcall(function() item = pl:GetEquippedItem() end)
         end
-        local bspeed = (item and type(item.bulletspeed) == "number") and item.bulletspeed or 15
-        local btype  = (item and type(item.bullettype)  == "number") and item.bullettype  or 0
-        local bdmg   = (item and type(item.damage)      == "number") and item.damage      or 10
-        local bwall  = (item and type(item.walldamage)  == "number") and item.walldamage  or 10
+        -- The item userdata exposes methods but no Lua-visible stat fields.
+        -- Get its name then look up stats in the global itemtable (defined
+        -- by relvad.lua / ddeweapons.lua).
+        local iname = nil
+        if item and item.GetName then
+            pcall(function() iname = item:GetName() end)
+        end
+        if not _G.MP_LOGGED_ITEM_NAME then
+            _G.MP_LOGGED_ITEM_NAME = true
+            local msg = string.format("equipped probe: item=%s iname=%s itemtable=%s\n",
+                tostring(item), tostring(iname), tostring(_G.itemtable))
+            local f = io.open("mp_joiner_probe.txt", "w")
+            if f then f:write(msg); f:close() end
+            logf("equipped probe: item=%s iname=%s itemtable=%s",
+                tostring(item), tostring(iname), tostring(_G.itemtable))
+        end
+        local def = nil
+        if iname and _G.itemtable then def = _G.itemtable[iname] end
+        -- TEMP: weapon detection broken (GetName returns nil). Hardcode strong
+        -- damage so we can verify the bullet replication pipeline actually
+        -- kills mobs. Restore proper detection after confirming end-to-end.
+        def = def or { damage = 50, walldamage = 50, bulletspeed = 20, bullettype = 0 }
+        if def and not _G.MP_LOGGED_DEF then
+            _G.MP_LOGGED_DEF = true
+            logf("def found: damage=%s bulletspeed=%s bullettype=%s",
+                tostring(def.damage), tostring(def.bulletspeed), tostring(def.bullettype))
+        end
+        local bspeed = (def and type(def.bulletspeed) == "number") and def.bulletspeed or 15
+        local btype  = (def and type(def.bullettype)  == "number") and def.bullettype  or 0
+        local bdmg   = (def and type(def.damage)      == "number") and def.damage      or 10
+        local bwall  = (def and type(def.walldamage)  == "number") and def.walldamage  or 10
         for _ = 1, 16 do
             local x, y, vx, vy = _G.MP_NATIVE.consume_bullet()
             if not x then break end

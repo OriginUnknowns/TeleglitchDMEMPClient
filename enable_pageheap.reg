@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Teleglitch.exe]
+"GlobalFlag"=dword:02000000
+"PageHeapFlags"=dword:00000003
