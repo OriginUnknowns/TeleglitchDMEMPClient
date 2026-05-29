@@ -1,3 +1,7 @@
 *.log
 *.dmp
 mp_client_load_error.txt
+# DLL host build outputs (rebuild from source)
+modloader/dllhost/*.dll
+modloader/dllhost/*.a
+modloader/dllhost/*.o

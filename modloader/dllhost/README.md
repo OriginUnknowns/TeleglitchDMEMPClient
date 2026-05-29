@@ -11,22 +11,21 @@ Each native mod is a separate `.dll` placed at
 
 ## Status
 
-Source scaffold only — **not yet built**. Compile when we start the MP
-DLL overhaul.
+Foundation working: DLL injects into Teleglitch.exe via version.dll
+hijack, logs to `modloader/dllhost.log`, loads optional native mods from
+`modloader/enabled_native.txt`. No engine hooks yet.
 
-## Build (planned)
+## Build
 
-Needs MSVC Build Tools or MinGW-w64 32-bit (Teleglitch is x86).
+Needs LLVM-MinGW with i686 target (Teleglitch is 32-bit x86).
 
-```bat
-cl /LD /MD /O2 main.cpp /link /OUT:version.dll /DEF:version.def
+```powershell
+winget install --id MartinStorsjo.LLVM-MinGW.UCRT
+.\build.ps1
 ```
 
-or with MinGW:
-
-```bash
-i686-w64-mingw32-g++ -shared -O2 main.cpp -o version.dll -Wl,--out-implib,libversion.a -static-libgcc -static-libstdc++
-```
+Outputs `version.dll` next to this README. The `install-dllhost.ps1`
+script (todo) will copy it into the game folder.
 
 ## Install
 
