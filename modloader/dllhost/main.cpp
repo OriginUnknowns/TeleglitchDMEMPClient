@@ -135,18 +135,50 @@ typedef void (__thiscall *BulletCtorFn)(void* self, int a, int b, int c, int d);
 static BulletCtorFn orig_BulletCtor = nullptr;
 static int g_bullet_count = 0;
 
-// MinHook needs a free-function pointer; we wrap thiscall via fastcall (ecx,edx unused).
-// Args reinterpret_cast to floats — Bullet ctor receives 4 floats: (pos.x, pos.y, vel.x, vel.y).
-static bool g_bullet_vtable_dumped = false;
+// Bullet ring buffer for Lua to drain: each entry is (x, y, vx, vy).
+#define BULLET_RING_SIZE 128
+struct BulletEvt { float x, y, vx, vy; };
+static BulletEvt g_bullet_ring[BULLET_RING_SIZE] = {0};
+static volatile int g_bullet_write_idx = 0;
+static int g_bullet_read_idx = 0;
+
 static void __fastcall hook_BulletCtor(void* self, void* /*edx*/, int a, int b, int c, int d) {
     g_bullet_count++;
+    union { int i; float f; } px, py, vx, vy;
+    px.i = a; py.i = b; vx.i = c; vy.i = d;
+    int idx = g_bullet_write_idx % BULLET_RING_SIZE;
+    g_bullet_ring[idx].x = px.f;
+    g_bullet_ring[idx].y = py.f;
+    g_bullet_ring[idx].vx = vx.f;
+    g_bullet_ring[idx].vy = vy.f;
+    g_bullet_write_idx++;
     if (g_bullet_count <= 16 || (g_bullet_count % 50) == 0) {
-        union { int i; float f; } px, py, vx, vy;
-        px.i = a; py.i = b; vx.i = c; vy.i = d;
         host_log("hook_BulletCtor #%d: this=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f)",
                  g_bullet_count, self, px.f, py.f, vx.f, vy.f);
     }
     orig_BulletCtor(self, a, b, c, d);
+}
+
+// Lua-callable: consume one bullet event. Returns nil if none, or 4 numbers
+// (x, y, vx, vy). Caller loops until nil.
+typedef void (*LuaPushNumberFn)(lua_State*, double);
+static int l_consume_bullet(lua_State* L) {
+    if (g_bullet_read_idx >= g_bullet_write_idx) {
+        api.pushnil(L);
+        return 1;
+    }
+    BulletEvt e = g_bullet_ring[g_bullet_read_idx % BULLET_RING_SIZE];
+    g_bullet_read_idx++;
+    static LuaPushNumberFn lua_pushnumber_p = nullptr;
+    if (!lua_pushnumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_pushnumber_p = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
+    }
+    lua_pushnumber_p(L, e.x);
+    lua_pushnumber_p(L, e.y);
+    lua_pushnumber_p(L, e.vx);
+    lua_pushnumber_p(L, e.vy);
+    return 4;
 }
 
 // Central damage entry: TNewLiving::ApplyHit(attacker, ...). Located via
@@ -417,6 +449,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "addr_of");
     api.pushcclosure(L, l_install_central_hit_hook, 0);
     api.setfield(L, -2, "install_central_hit_hook");
+    api.pushcclosure(L, l_consume_bullet, 0);
+    api.setfield(L, -2, "consume_bullet");
     return 1;  // return the table
 }
 

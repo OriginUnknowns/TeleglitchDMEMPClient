@@ -211,6 +211,7 @@ do
         -- full Soldat class with GetHealth/SetHealth) but zero out movement
         -- and disable damage-dealing. Suppresses sounds via inert_ms only.
         local inert_def = {
+            health = 999999,   -- prevents local puppet death (engine cleanup crashes)
             meleedamage = 0,
             meleecooldown = 999999,
             itemdropchance = 0,
@@ -1311,6 +1312,24 @@ local function handle_mob_damage(msg)
     end
 end
 
+-- Host receives a bullet_fire event from a joiner. Re-create the bullet
+-- in the host's world so it propagates collision with real mobs.
+-- Uses Lua's CreateBullet(x, y, angle, speed, type, force, owner). We
+-- compute angle/speed from the velocity vector; type/force/owner hardcoded
+-- for MVP (pistol bullet owned by the host's own player).
+local function handle_bullet_fire(msg)
+    if not mp.is_host then return end
+    if type(msg.x) ~= "number" or type(msg.y) ~= "number" then return end
+    if type(msg.angle) ~= "number" or type(msg.speed) ~= "number" then return end
+    local btype = (type(msg.btype) == "number") and msg.btype or 0
+    local pl = player.GetPlayer()
+    local ok, err = pcall(function()
+        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 0.5, pl)
+    end)
+    logf("bullet_fire RX from=%s pos=(%.2f,%.2f) angle=%.2f speed=%.2f btype=%d ok=%s err=%s",
+        tostring(msg.from), msg.x, msg.y, msg.angle, msg.speed, btype, tostring(ok), tostring(err))
+end
+
 local function handle_mob_died(msg)
     if mp.is_host or not msg.id then return end
     local entry = mp.mob_puppets[msg.id]
@@ -1332,6 +1351,7 @@ local handlers = {
     mob_snapshot = handle_mob_snapshot,
     mob_died = handle_mob_died,
     mob_damage = handle_mob_damage,
+    bullet_fire = handle_bullet_fire,
     item_picked = handle_item_picked,
     item_list = handle_item_list,
     item_spawned = handle_item_spawned,
@@ -1764,6 +1784,24 @@ local function dev_menu_tick()
     -- Drain native hit events and forward to host as mob_damage. Each event
     -- is a c-side entity address; we match against our local puppet pointers
     -- to find the mp mob id. Deduplicate via a short cooldown per id.
+    -- Joiner: drain native bullet events, send to host so host re-fires.
+    -- Include current weapon stats (speed + bullettype) so host creates a
+    -- correctly-tuned bullet (speed AND damage come from bullet type).
+    if _G.MP_NATIVE and _G.MP_NATIVE.consume_bullet and (not mp.is_host) and mp.sock then
+        local item
+        local pl = player.GetPlayer()
+        if pl and pl.GetEquippedItem then
+            pcall(function() item = pl:GetEquippedItem() end)
+        end
+        local bspeed = (item and type(item.bulletspeed) == "number") and item.bulletspeed or 15
+        local btype  = (item and type(item.bullettype)  == "number") and item.bullettype  or 0
+        for _ = 1, 16 do
+            local x, y, vx, vy = _G.MP_NATIVE.consume_bullet()
+            if not x then break end
+            local angle = math.atan2(vy, vx)
+            send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = bspeed, btype = btype })
+        end
+    end
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
         if not _G.MP_HIT_COOLDOWN then _G.MP_HIT_COOLDOWN = {} end
         if not _G.MP_HIT_PUPPET_ADDRS then _G.MP_HIT_PUPPET_ADDRS = {} end
