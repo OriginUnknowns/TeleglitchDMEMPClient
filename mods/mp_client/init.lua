@@ -18,6 +18,19 @@ do
         if ok and type(mod) == "table" then
             mp_native = mod
             if mp_native.log then mp_native.log("mp_client: native bridge connected") end
+            -- Try installing the CreateBullet hook. Logs to dllhost.log.
+            if mp_native.install_bullet_hook then
+                local hook_ok = mp_native.install_bullet_hook()
+                if mp_native.log then mp_native.log("install_bullet_hook returned " .. tostring(hook_ok)) end
+            end
+            -- TakeDamage hook needs a Soldat pointer to resolve vtable.
+            -- Player isn't available at mod load time; defer to a tick
+            -- coroutine that fires once player.GetPlayer() returns non-nil.
+            if mp_native.install_takedamage_hook then
+                _G.MP_NATIVE = mp_native
+                _G.MP_INSTALL_TAKEDMG_DEFERRED = true
+                if mp_native.log then mp_native.log("set MP_INSTALL_TAKEDMG_DEFERRED=true") end
+            end
             local f = io.open("mp_client_native.txt", "w")
             if f then
                 f:write("native bridge active. hello() returned: " ..
@@ -1428,6 +1441,23 @@ end
 local function net_tick_loop()
     local send_interval = 1.0 / config.send_rate_hz
     while true do
+        -- Install TakeDamage hook as soon as a player exists.
+        if _G.MP_INSTALL_TAKEDMG_DEFERRED and _G.MP_NATIVE then
+            local pl = player.GetPlayer()
+            if not _G.MP_TICK_LOGGED then
+                _G.MP_TICK_LOGGED = true
+                if _G.MP_NATIVE.log then
+                    _G.MP_NATIVE.log(string.format(
+                        "deferred installer tick: pl=%s pl.pointer=%s ptype=%s",
+                        tostring(pl), tostring(pl and pl.pointer), type(pl and pl.pointer)))
+                end
+            end
+            if pl and pl.pointer then
+                local ok = _G.MP_NATIVE.install_takedamage_hook(pl.pointer)
+                if _G.MP_NATIVE.log then _G.MP_NATIVE.log("install_takedamage_hook -> " .. tostring(ok)) end
+                _G.MP_INSTALL_TAKEDMG_DEFERRED = nil
+            end
+        end
         if mp.sock then
             local chunk, err, partial = mp.sock:receive(4096)
             if chunk then
@@ -1699,6 +1729,33 @@ end
 
 -- Key names from lua/keys.lua — keypad +, arrow up/down, return/kp_enter.
 local function dev_menu_tick()
+    -- Install TakeDamage hook on player + every visible mob. The native
+    -- side dedups by function address, so calling for many mobs that share
+    -- a vtable[24] does nothing extra. Limited to once every ~2 seconds.
+    if _G.MP_NATIVE and _G.MP_NATIVE.install_takedamage_hook then
+        local now = socket.gettime()
+        if not _G.MP_TAKEDMG_LAST_SCAN or (now - _G.MP_TAKEDMG_LAST_SCAN) > 2.0 then
+            _G.MP_TAKEDMG_LAST_SCAN = now
+            local pl = player.GetPlayer()
+            if pl and pl.pointer then
+                _G.MP_NATIVE.install_takedamage_hook(pl.pointer)
+            end
+            -- Scan nearby mobs and try to hook each. Native side dedups.
+            local px, py = 0, 0
+            if pl then pcall(function() px, py = pl:GetPosition() end) end
+            local objs = GetObjectsInCircle(px, py, 200)
+            if type(objs) == "table" then
+                local tried = 0
+                for _, o in ipairs(objs) do
+                    if type(o) == "table" and o.pointer and o.Alert then  -- soldat-like
+                        pcall(function() _G.MP_NATIVE.install_takedamage_hook(o.pointer) end)
+                        tried = tried + 1
+                        if tried > 12 then break end  -- cap per scan
+                    end
+                end
+            end
+        end
+    end
     -- Manual pickup key works on BOTH sides (host AND joiner).
     if kp("kp_minus") then
         logf("manual pickup key pressed")

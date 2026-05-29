@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "lua52_min.h"
+#include "include/MinHook.h"
+#include <set>
 
 // ---------------------------------------------------------------------------
 // Modloader host API exposed to native mods. Versioned so we can extend.
@@ -117,6 +119,184 @@ static void load_native_mods() {
 static LuaApi api;
 static lua_State* g_L = nullptr;
 
+// ---------------------------------------------------------------------------
+// Hook target addresses (RVA + module base). Resolved at install time so we
+// survive ASLR (Teleglitch's image base 0x400000 matches our objdump VAs,
+// but be defensive).
+// ---------------------------------------------------------------------------
+typedef int (*LuaCFunc)(lua_State* L);
+
+// Bullet ctor — called by EVERY bullet in the engine (Lua + C++ alike).
+// thiscall convention: this in ecx, other args on the stack.
+// Signature inferred from CreateBullet binding @ 0x497040 call site:
+//   Bullet::Bullet(this, ?, ?, ?, ?)  // 4 stack args after this
+// We don't know the precise types yet; log fact-of-call first, then iterate.
+typedef void (__thiscall *BulletCtorFn)(void* self, int a, int b, int c, int d);
+static BulletCtorFn orig_BulletCtor = nullptr;
+static int g_bullet_count = 0;
+
+// MinHook needs a free-function pointer; we wrap thiscall via fastcall (ecx,edx unused).
+// Args reinterpret_cast to floats — Bullet ctor receives 4 floats: (pos.x, pos.y, vel.x, vel.y).
+static bool g_bullet_vtable_dumped = false;
+static void __fastcall hook_BulletCtor(void* self, void* /*edx*/, int a, int b, int c, int d) {
+    g_bullet_count++;
+    if (g_bullet_count <= 16 || (g_bullet_count % 50) == 0) {
+        union { int i; float f; } px, py, vx, vy;
+        px.i = a; py.i = b; vx.i = c; vy.i = d;
+        host_log("hook_BulletCtor #%d: this=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f)",
+                 g_bullet_count, self, px.f, py.f, vx.f, vy.f);
+    }
+    orig_BulletCtor(self, a, b, c, d);
+}
+
+static int l_install_hook_bullet(lua_State* L) {
+    HMODULE m = GetModuleHandleA(NULL);
+    if (!m) { api.pushboolean(L, 0); return 1; }
+    // Bullet ctor at VA 0x497040 — RVA 0x97040
+    BYTE* target = (BYTE*)m + 0x97040;
+    MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_BulletCtor, (LPVOID*)&orig_BulletCtor);
+    host_log("MH_CreateHook(BulletCtor @%p): status=%d", target, s);
+    if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    s = MH_EnableHook(target);
+    host_log("MH_EnableHook(BulletCtor): status=%d", s);
+    api.pushboolean(L, s == MH_OK ? 1 : 0);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// TakeDamage hook (vtable[0x60/4] on Soldat). Catches bullet hits, melee
+// hits, environmental damage — anything that decrements HP. The signature
+// inferred from SetHealth binding:
+//   void __thiscall Soldat::TakeDamage(float damage, float someKind)
+// We capture this+damage and forward; later we'll map this->id for Lua.
+// ---------------------------------------------------------------------------
+typedef void (__thiscall *TakeDamageFn)(void* self, float damage, float kind);
+static int g_takedmg_count = 0;
+static std::set<void*> g_hooked_addrs;
+
+// Pool of hook function slots — each MinHook installation needs its own
+// orig pointer (and own hook function returning the right trampoline).
+#define HOOK_POOL_SIZE 8
+static TakeDamageFn g_origs[HOOK_POOL_SIZE] = {0};
+
+static void hook_common(int slot, void* self, float damage, float kind) {
+    g_takedmg_count++;
+    if (g_takedmg_count <= 32 || (g_takedmg_count % 25) == 0) {
+        host_log("hook_TakeDamage[slot %d] #%d: target=%p dmg=%.2f kind=%.2f",
+                 slot, g_takedmg_count, self, damage, kind);
+    }
+    g_origs[slot](self, damage, kind);
+}
+
+#define HOOK_SLOT(N) \
+    static void __fastcall hook_slot##N(void* self, void* /*edx*/, float dmg, float kind) { \
+        hook_common(N, self, dmg, kind); \
+    }
+HOOK_SLOT(0) HOOK_SLOT(1) HOOK_SLOT(2) HOOK_SLOT(3)
+HOOK_SLOT(4) HOOK_SLOT(5) HOOK_SLOT(6) HOOK_SLOT(7)
+
+static void* g_hook_slot_fns[HOOK_POOL_SIZE] = {
+    (void*)hook_slot0, (void*)hook_slot1, (void*)hook_slot2, (void*)hook_slot3,
+    (void*)hook_slot4, (void*)hook_slot5, (void*)hook_slot6, (void*)hook_slot7,
+};
+static int g_next_hook_slot = 0;
+
+// Takes a userdata pointer (e.g. player.GetPlayer().pointer) and reads its
+// vtable. Reads vtable[0x60/4] — the TakeDamage slot — and hooks it.
+// Lua signature: install_takedamage_hook(soldat_ptr_as_lightuserdata_or_number)
+// We accept it as a number (lua_tointeger) for simplicity — caller does
+//   mp_native.install_takedamage_hook(player.GetPlayer().pointer)
+// where .pointer is already a number-typed userdata field.
+static int l_install_hook_takedmg(lua_State* L) {
+    // arg 1 is a lightuserdata or integer holding the C++ object address.
+    // Lua's lua_topointer returns void* for any reference-typed value, so
+    // we try a couple paths.
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    typedef ptrdiff_t (*LuaToIntegerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+
+    // For light userdata, lua_topointer returns the stored void* (== entity).
+    // For full userdata, it returns the payload start; engine stores entity
+    // pointer at payload[0]. Try light first; if vtable looks bogus, retry
+    // with one extra dereference.
+    void* udblock = (void*)lua_topointer_p(L, 1);
+    if (!udblock) {
+        host_log("install_takedamage_hook: nil pointer arg");
+        api.pushboolean(L, 0);
+        return 1;
+    }
+
+    HMODULE me = GetModuleHandleA(NULL);
+    DWORD mod_base = (DWORD)me;
+    #define IN_RANGE(p) (((DWORD)(p) - mod_base) < 0x200000)
+
+    void* entity_light = udblock;
+    void* entity_full  = *(void**)udblock;
+    host_log("install_takedamage_hook: udblock=%p, light_entity=%p, full_entity=%p",
+             udblock, entity_light, entity_full);
+
+    // Pick whichever yields an in-range vtable.
+    void* entity = nullptr;
+    void** vtbl  = nullptr;
+    if (entity_light) {
+        void** v = *(void***)entity_light;
+        host_log("  try light: vtbl_candidate=%p in_range=%d", v, IN_RANGE(v));
+        if (IN_RANGE(v)) { entity = entity_light; vtbl = v; }
+    }
+    if (!vtbl && entity_full) {
+        void** v = *(void***)entity_full;
+        host_log("  try full:  vtbl_candidate=%p in_range=%d", v, IN_RANGE(v));
+        if (IN_RANGE(v)) { entity = entity_full; vtbl = v; }
+    }
+    if (!vtbl) {
+        host_log("install_takedamage_hook: no good vtable, REFUSING");
+        api.pushboolean(L, 0);
+        return 1;
+    }
+
+    host_log("  chosen entity=%p vtbl=%p", entity, vtbl);
+    // Dump first 28 vtable slots
+    for (int i = 0; i < 28; i++) {
+        DWORD addr = (DWORD)vtbl[i];
+        DWORD off  = addr - mod_base;
+        host_log("    vtbl[%d] = 0x%08x (mod_off=0x%x in_range=%d)", i, addr, off, off < 0x200000);
+    }
+
+    void* target = vtbl[0x60 / 4];
+    if (!IN_RANGE(target)) {
+        host_log("install_takedamage_hook: target %p out of range, REFUSING", target);
+        api.pushboolean(L, 0);
+        return 1;
+    }
+    if (g_hooked_addrs.count(target)) {
+        host_log("install_takedamage_hook: target=%p already hooked, skipping", target);
+        api.pushboolean(L, 1);
+        return 1;
+    }
+    if (g_next_hook_slot >= HOOK_POOL_SIZE) {
+        host_log("install_takedamage_hook: hook pool exhausted (%d slots used)", g_next_hook_slot);
+        api.pushboolean(L, 0);
+        return 1;
+    }
+    int slot = g_next_hook_slot++;
+    g_hooked_addrs.insert(target);
+    host_log("install_takedamage_hook: hooking target=%p in slot %d", target, slot);
+
+    MH_STATUS s = MH_CreateHook(target, g_hook_slot_fns[slot], (LPVOID*)&g_origs[slot]);
+    host_log("MH_CreateHook(TakeDamage @%p slot %d): status=%d", target, slot, s);
+    if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    s = MH_EnableHook(target);
+    host_log("MH_EnableHook(TakeDamage slot %d): status=%d", slot, s);
+    api.pushboolean(L, s == MH_OK ? 1 : 0);
+    return 1;
+}
+
 static int l_hello(lua_State* L) {
     api.pushstring(L, "hello from native (modloader dllhost)");
     return 1;
@@ -137,12 +317,19 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     g_L = L;
     host_log("luaopen_mp_native: L=%p, api resolved", (void*)L);
 
-    // Build a table: { hello = fn, log = fn }
+    // Initialize MinHook once; safe to call multiple times.
+    MH_Initialize();
+
+    // Build a table: { hello = fn, log = fn, install_bullet_hook = fn }
     api.createtable(L, 0, 4);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
     api.setfield(L, -2, "log");
+    api.pushcclosure(L, l_install_hook_bullet, 0);
+    api.setfield(L, -2, "install_bullet_hook");
+    api.pushcclosure(L, l_install_hook_takedmg, 0);
+    api.setfield(L, -2, "install_takedamage_hook");
     return 1;  // return the table
 }
 
