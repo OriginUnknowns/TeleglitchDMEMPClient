@@ -1,4 +1,4 @@
-# TeleglitchDME Mod Manager — minimal WinForms GUI.
+# TeleglitchDME Mod Manager - minimal WinForms GUI.
 #
 # Lists every folder under <GamePath>/mods/ as a checkbox. Reading
 # manifest.lua (if present) for name/version/description. Reads/writes
@@ -37,15 +37,17 @@ function Read-ManifestField {
     return $null
 }
 
+function Coalesce { param($a, $b); if ($null -ne $a -and $a -ne "") { return $a } else { return $b } }
+
 $mods = @()
 if (Test-Path $modsDir) {
     foreach ($dir in (Get-ChildItem $modsDir -Directory | Sort-Object Name)) {
         $manifest = Join-Path $dir.FullName "manifest.lua"
         $mods += [PSCustomObject]@{
             Folder      = $dir.Name
-            Name        = (Read-ManifestField $manifest "name")        ?? $dir.Name
-            Version     = (Read-ManifestField $manifest "version")     ?? "?"
-            Description = (Read-ManifestField $manifest "description") ?? ""
+            Name        = Coalesce (Read-ManifestField $manifest "name")        $dir.Name
+            Version     = Coalesce (Read-ManifestField $manifest "version")     "?"
+            Description = Coalesce (Read-ManifestField $manifest "description") ""
         }
     }
 }
@@ -98,7 +100,7 @@ foreach ($mod in $mods) {
 $list.Add_SelectedIndexChanged({
     $i = $list.SelectedIndex
     if ($i -ge 0 -and $i -lt $mods.Count) {
-        $detail.Text = "$($mods[$i].Folder) — $($mods[$i].Description)"
+        $detail.Text = "$($mods[$i].Folder) - $($mods[$i].Description)"
     } else {
         $detail.Text = ""
     }
@@ -120,14 +122,16 @@ $btnCancel.DialogResult = "Cancel"
 $form.Controls.Add($btnCancel)
 
 $btnSave.Add_Click({
-    $lines = @("# TeleglitchDME enabled mods — managed by manager.ps1")
+    $lines = @("# TeleglitchDME enabled mods - managed by manager.ps1")
     for ($i = 0; $i -lt $list.Items.Count; $i++) {
         if ($list.GetItemChecked($i)) { $lines += $mods[$i].Folder }
     }
     Set-Content -Path $enabledTxt -Value $lines -Encoding utf8
     [System.Windows.Forms.MessageBox]::Show(
         "Saved $($lines.Count - 1) enabled mod(s) to:`n$enabledTxt",
-        "Saved", "OK", "Information") | Out-Null
+        "Saved",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 })
 
 [void]$form.ShowDialog()
