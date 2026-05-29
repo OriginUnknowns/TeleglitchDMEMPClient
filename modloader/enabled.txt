@@ -1,0 +1,3 @@
+# TeleglitchDME enabled mods — one mod folder name per line.
+# Lines starting with # are ignored. Order is load order.
+mp_client
