@@ -617,39 +617,139 @@ static int l_set_main_player(lua_State* L) {
     return 1;
 }
 
-// Passive remote players: a remote player is a real TPlayer, but the engine
-// runs its per-frame think on EVERY player — so the remote reads our input,
-// re-claims the camera, and can shoot/kill itself. We hook the two TPlayer
-// think methods (vtable[10]=FUN_0045cbc0, vtable[11]=FUN_0045bff0) and SKIP
-// them for any player that isn't the main player (DAT_005747a4). The remote
-// is then fully driven by us (position/angle/action) and never self-acts.
+// Passive remote players: a remote player is a real TPlayer (so it animates
+// with proper weapon-coupled rendering), but the engine runs each player's
+// per-frame think on EVERY player. think1 (vtable[10]=FUN_0045cbc0) reads OUR
+// input and can fire weapons; think2 (vtable[11]=FUN_0045bff0) recomputes the
+// global camera zoom AND contains the RENDER/DRAW block.
+//
+// The old approach SKIPPED both think fns for non-main players — but that also
+// skipped think2's render block, so the remote turned invisible/crashed. The
+// fix: WRAP orig and neuter only the coupling, so render/anim run untouched:
+//   * input  — swap the shared input device (DAT_00574798) to a zeroed dummy
+//     for the duration of the call: every input query reads "nothing pressed".
+//   * self-shoot — force the engine's OWN per-instance fire gate (byte
+//     this+0xE4) non-zero around think1, so all fire/reload/drop blocks skip.
+//   * camera zoom — save/restore the global view-zoom (DAT_00572700/0057588c)
+//     around think2 so the remote computes-and-discards its zoom contribution.
+// The main-player/camera global DAT_005747a4 is NOT touched by either think
+// (only the ctor writes it — handled by save/restore around CreatePlayer in Lua).
+//
+// Input device ABI (TCombinedInputDevice, vtable @0x558974) resolved statically:
+//   +0x00 ret 0xC  out-point getter (out,in0,in1 -> fills 2 floats, returns out)
+//   +0x04 ret 0x4  out-point getter (out -> fills 2 floats, returns out)
+//   +0x08/0x0c/0x10/0x14/0x1c/0x44 ret 0  (int/bool queries + ack)
+// Modeled as __fastcall(ecx=this, edx_dummy, <stack args>) so g++ emits the
+// matching ret N — same thiscall-mimic trick as the bullet-ctor hook.
+#define INPUT_DEV_RVA  0x174798   // DAT_00574798  shared input/command device ptr
+#define VIEW_ZOOM_RVA  0x172700   // DAT_00572700  global view zoom
+#define VIEW_ZOOM2_RVA 0x15888c   // DAT_0057588c  zoom compare/target
+#define FIRE_GATE_OFF  0xE4       // byte this+0xE4 (local_18[0x39]): !=0 -> no fire
+#define HP_OFF         0xBC       // float this+0xBC: actor health
+#define INVULN_OFF     0xFC       // byte  this+0xFC: invulnerable flag
+
+static BYTE* g_base = nullptr;
+static inline BYTE* mod_base() { if (!g_base) g_base = (BYTE*)GetModuleHandleA(NULL); return g_base; }
+
+// Zeroed dummy input device: a fake object whose [0] is a vtable of no-op stubs.
+static void* __fastcall dev_point3(void* ecx, void* edx, float* out, unsigned i0, unsigned i1) {
+    (void)ecx; (void)edx; (void)i0; (void)i1; if (out) { out[0] = 0.0f; out[1] = 0.0f; } return out;
+}
+static void* __fastcall dev_point1(void* ecx, void* edx, float* out) {
+    (void)ecx; (void)edx; if (out) { out[0] = 0.0f; out[1] = 0.0f; } return out;
+}
+static int __fastcall dev_ret0(void* ecx, void* edx) { (void)ecx; (void)edx; return 0; }
+static void* g_dummy_vtbl[20];
+static void* g_dummy_dev[2];
+static bool g_dummy_ready = false;
+static void init_dummy_device() {
+    if (g_dummy_ready) return;
+    for (int i = 0; i < 20; ++i) g_dummy_vtbl[i] = (void*)&dev_ret0;  // ret 0 default
+    g_dummy_vtbl[0] = (void*)&dev_point3;   // +0x00 (ret 0xC)
+    g_dummy_vtbl[1] = (void*)&dev_point1;   // +0x04 (ret 0x4)
+    g_dummy_dev[0] = (void*)g_dummy_vtbl;
+    g_dummy_dev[1] = nullptr;
+    g_dummy_ready = true;
+}
+
 typedef int (__thiscall *PThinkFn)(void* self);
 static PThinkFn orig_PThink1 = nullptr;
 static PThinkFn orig_PThink2 = nullptr;
 
 static bool is_passive_player(void* self) {
-    HMODULE me = GetModuleHandleA(NULL);
-    void* mainp = *(void**)((char*)me + MAIN_PLAYER_RVA);
+    void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
     return self != mainp;   // not the local/controlled player -> passive
 }
+
 static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
-    if (is_passive_player(self)) return 1;
-    return orig_PThink1(self);
+    if (!is_passive_player(self)) return orig_PThink1(self);
+    init_dummy_device();
+    void** ip = (void**)(mod_base() + INPUT_DEV_RVA);
+    unsigned char* gate = (unsigned char*)self + FIRE_GATE_OFF;
+    void* saved_in = *ip;
+    unsigned char saved_gate = *gate;
+    *ip = (void*)g_dummy_dev;   // every input query reads "nothing pressed"
+    *gate = 1;                  // engine's own gate: skip fire/reload/drop/shoot
+    int r = orig_PThink1(self); // anim state machine + position + aim cache run
+    *gate = saved_gate;
+    *ip = saved_in;
+    return r;
 }
+
 static int __fastcall hook_PThink2(void* self, void* /*edx*/) {
-    if (is_passive_player(self)) return 1;
-    return orig_PThink2(self);
+    if (!is_passive_player(self)) return orig_PThink2(self);
+    init_dummy_device();
+    void** ip = (void**)(mod_base() + INPUT_DEV_RVA);
+    float* zoom  = (float*)(mod_base() + VIEW_ZOOM_RVA);
+    float* zoom2 = (float*)(mod_base() + VIEW_ZOOM2_RVA);
+    void* saved_in = *ip;
+    float sz = *zoom, sz2 = *zoom2;
+    *ip = (void*)g_dummy_dev;
+    int r = orig_PThink2(self);  // render/draw block runs (this+0xFD==0); zoom discarded
+    *zoom = sz; *zoom2 = sz2;
+    *ip = saved_in;
+    return r;
 }
+
 static int l_install_passive_player_hooks(lua_State* L) {
-    HMODULE m = GetModuleHandleA(NULL);
-    BYTE* t1 = (BYTE*)m + 0x5cbc0;   // FUN_0045cbc0 (vtable[10] think)
-    BYTE* t2 = (BYTE*)m + 0x5bff0;   // FUN_0045bff0 (vtable[11] think)
+    g_base = (BYTE*)GetModuleHandleA(NULL);
+    init_dummy_device();
+    BYTE* t1 = g_base + 0x5cbc0;   // FUN_0045cbc0 (vtable[10] think1)
+    BYTE* t2 = g_base + 0x5bff0;   // FUN_0045bff0 (vtable[11] think2/render)
     MH_STATUS s1 = MH_CreateHook(t1, (LPVOID)&hook_PThink1, (LPVOID*)&orig_PThink1);
     if (s1 == MH_OK) s1 = MH_EnableHook(t1);
     MH_STATUS s2 = MH_CreateHook(t2, (LPVOID)&hook_PThink2, (LPVOID*)&orig_PThink2);
     if (s2 == MH_OK) s2 = MH_EnableHook(t2);
     host_log("install_passive_player_hooks: think1=%d think2=%d", s1, s2);
     api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK) ? 1 : 0);
+    return 1;
+}
+
+// pin_hp(ptr) — write a positive health to actor+0xBC so a passive remote never
+// reaches HP<=0 locally (which would run the death branch + gameover HUD over
+// OUR screen). Called each snapshot for tplayer remotes.
+static int l_pin_hp(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushboolean(L, 0); return 1; }
+    *(float*)((char*)e + HP_OFF) = 9999.0f;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_invulnerable(ptr, bool) — write actor+0xFC (mirrors engine SetInvulnerable
+// FUN_0045ede0), gating the damage screen-shake path for passive remotes.
+static int l_set_invulnerable(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushboolean(L, 0); return 1; }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 2) : 1;
+    *(unsigned char*)((char*)e + INVULN_OFF) = on ? 1 : 0;
+    api.pushboolean(L, 1);
     return 1;
 }
 
@@ -710,6 +810,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_main_player");
     api.pushcclosure(L, l_install_passive_player_hooks, 0);
     api.setfield(L, -2, "install_passive_player_hooks");
+    api.pushcclosure(L, l_pin_hp, 0);
+    api.setfield(L, -2, "pin_hp");
+    api.pushcclosure(L, l_set_invulnerable, 0);
+    api.setfield(L, -2, "set_invulnerable");
     return 1;  // return the table
 }
 

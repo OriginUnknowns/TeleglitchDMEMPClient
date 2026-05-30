@@ -1044,6 +1044,14 @@ handle_join = function(p)
         if obj then
             is_tplayer = true
             pcall(function() obj:SetAngle(p.angle or 0) end)
+            -- Keep the remote alive & damage-inert: a mob (or stray hit) dropping
+            -- its HP<=0 would run the death branch + gameover HUD over OUR screen.
+            -- The wrapped think neuters its own input; HP-pin + invuln cover
+            -- external damage. (Natives are absent/no-op on the puppet path.)
+            pcall(function()
+                if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(obj.pointer, true) end
+                if _G.MP_NATIVE.pin_hp then _G.MP_NATIVE.pin_hp(obj.pointer) end
+            end)
         end
     end
     if not obj then
@@ -1160,6 +1168,16 @@ local function handle_snapshot(msg)
                     -- safe, unlike poking the downstream frame. Makes the puppet
                     -- play the real walk/shoot/aim animation. Guard: live + a
                     -- moment to initialize.
+                    -- Keep the remote alive & damage-inert each tick (idempotent,
+                    -- cheap). Prevents a mob hit from popping its death HUD on our
+                    -- screen. Runs BEFORE we drive the obj below.
+                    if entry.is_tplayer and entry.obj.pointer and _G.MP_NATIVE
+                       and entity_alive(entry.obj) then
+                        pcall(function()
+                            if _G.MP_NATIVE.pin_hp then _G.MP_NATIVE.pin_hp(entry.obj.pointer) end
+                            if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(entry.obj.pointer, true) end
+                        end)
+                    end
                     -- Drive the remote player's ANIMATION. Only safe on a real
                     -- TPlayer (full anim/weapon setup); the old enemy puppet
                     -- null-derefs. Writes the action id to +0xB4 (engine's own

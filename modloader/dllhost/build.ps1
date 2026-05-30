@@ -3,7 +3,9 @@
 # Requires LLVM-MinGW with i686 target. Install via:
 #   winget install --id MartinStorsjo.LLVM-MinGW.UCRT
 #
-# Outputs version.dll next to this script.
+# Outputs version.dll next to this script. Compiles main.cpp together with the
+# vendored MinHook sources (main.cpp only #includes MinHook.h, so the .c files
+# must be compiled in — otherwise MH_* link as undefined symbols).
 
 $ErrorActionPreference = "Stop"
 
@@ -14,12 +16,18 @@ if (-not (Test-Path $cxx)) {
 
 Push-Location $PSScriptRoot
 try {
-    & $cxx -shared -O2 -static `
-        -o version.dll `
-        main.cpp version.def `
-        -Wl,--out-implib,libversion.a `
-        -lkernel32
+    $sources = @(
+        "main.cpp",
+        "minhook\hook.c",
+        "minhook\buffer.c",
+        "minhook\trampoline.c",
+        "minhook\hde\hde32.c"
+    )
+    $buildArgs = @("-shared", "-O2", "-static", "-o", "version.dll") +
+        $sources +
+        @("version.def", "-Wl,--out-implib,libversion.a", "-lkernel32")
 
+    & $cxx @buildArgs
     if ($LASTEXITCODE -ne 0) { Write-Error "Build failed (exit $LASTEXITCODE)" }
 
     Write-Host "Built: $(Resolve-Path version.dll)"
