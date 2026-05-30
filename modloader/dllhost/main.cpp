@@ -584,6 +584,75 @@ static int l_set_action(lua_State* L) {
     return 1;
 }
 
+// The engine's global "main player" pointer (DAT_005747a4, RVA 0x1747a4) —
+// what the camera/input/HUD follow. The TPlayer ctor OVERWRITES it, so when we
+// CreatePlayer() a remote player it would steal the camera. We save the local
+// player's pointer and restore it right after creating each remote TPlayer.
+#define MAIN_PLAYER_RVA 0x1747a4
+
+// get_main_player() -> integer address of the current main player.
+static int l_get_main_player(lua_State* L) {
+    HMODULE me = GetModuleHandleA(NULL);
+    void* p = *(void**)((char*)me + MAIN_PLAYER_RVA);
+    api.pushinteger(L, (int)(DWORD)p);
+    return 1;
+}
+
+// set_main_player(ptr) — restore the main player global to a saved pointer
+// (passed as a .pointer light userdata). Resolves the raw entity address and
+// writes it to DAT_005747a4.
+static int l_set_main_player(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* p = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!p) { api.pushboolean(L, 0); return 1; }
+    HMODULE me = GetModuleHandleA(NULL);
+    *(void**)((char*)me + MAIN_PLAYER_RVA) = p;
+    host_log("set_main_player: restored main=%p", p);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// Passive remote players: a remote player is a real TPlayer, but the engine
+// runs its per-frame think on EVERY player — so the remote reads our input,
+// re-claims the camera, and can shoot/kill itself. We hook the two TPlayer
+// think methods (vtable[10]=FUN_0045cbc0, vtable[11]=FUN_0045bff0) and SKIP
+// them for any player that isn't the main player (DAT_005747a4). The remote
+// is then fully driven by us (position/angle/action) and never self-acts.
+typedef int (__thiscall *PThinkFn)(void* self);
+static PThinkFn orig_PThink1 = nullptr;
+static PThinkFn orig_PThink2 = nullptr;
+
+static bool is_passive_player(void* self) {
+    HMODULE me = GetModuleHandleA(NULL);
+    void* mainp = *(void**)((char*)me + MAIN_PLAYER_RVA);
+    return self != mainp;   // not the local/controlled player -> passive
+}
+static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
+    if (is_passive_player(self)) return 1;
+    return orig_PThink1(self);
+}
+static int __fastcall hook_PThink2(void* self, void* /*edx*/) {
+    if (is_passive_player(self)) return 1;
+    return orig_PThink2(self);
+}
+static int l_install_passive_player_hooks(lua_State* L) {
+    HMODULE m = GetModuleHandleA(NULL);
+    BYTE* t1 = (BYTE*)m + 0x5cbc0;   // FUN_0045cbc0 (vtable[10] think)
+    BYTE* t2 = (BYTE*)m + 0x5bff0;   // FUN_0045bff0 (vtable[11] think)
+    MH_STATUS s1 = MH_CreateHook(t1, (LPVOID)&hook_PThink1, (LPVOID*)&orig_PThink1);
+    if (s1 == MH_OK) s1 = MH_EnableHook(t1);
+    MH_STATUS s2 = MH_CreateHook(t2, (LPVOID)&hook_PThink2, (LPVOID*)&orig_PThink2);
+    if (s2 == MH_OK) s2 = MH_EnableHook(t2);
+    host_log("install_passive_player_hooks: think1=%d think2=%d", s1, s2);
+    api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK) ? 1 : 0);
+    return 1;
+}
+
 static int l_hello(lua_State* L) {
     api.pushstring(L, "hello from native (modloader dllhost)");
     return 1;
@@ -635,6 +704,12 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "get_action");
     api.pushcclosure(L, l_set_action, 0);
     api.setfield(L, -2, "set_action");
+    api.pushcclosure(L, l_get_main_player, 0);
+    api.setfield(L, -2, "get_main_player");
+    api.pushcclosure(L, l_set_main_player, 0);
+    api.setfield(L, -2, "set_main_player");
+    api.pushcclosure(L, l_install_passive_player_hooks, 0);
+    api.setfield(L, -2, "install_passive_player_hooks");
     return 1;  // return the table
 }
 

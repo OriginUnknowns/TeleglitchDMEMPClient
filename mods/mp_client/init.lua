@@ -25,6 +25,12 @@ do
                 local hook_ok = mp_native.install_bullet_hook()
                 if mp_native.log then mp_native.log("install_bullet_hook returned " .. tostring(hook_ok)) end
             end
+            -- Passivate remote TPlayers: skip their per-frame think so they
+            -- don't steal input/camera or shoot themselves (we drive them).
+            if mp_native.install_passive_player_hooks then
+                local ok = mp_native.install_passive_player_hooks()
+                if mp_native.log then mp_native.log("install_passive_player_hooks returned " .. tostring(ok)) end
+            end
             -- central_hit + takedamage hooks DISABLED (2026-05-29). They fed
             -- the old consume_hit -> mob_damage path, which bullet replication
             -- has fully superseded — so they're redundant (and risk double-
@@ -984,26 +990,60 @@ local function refresh_objective_string()
     pcall(function() level.SetObjectiveString(line) end)
 end
 
+-- Toggle: represent remote players as REAL TPlayer instances (proper weapon-
+-- coupled animation) vs. the old stripped enemy puppet.
+-- TPlayer WIP (2026-05-30): proven to ANIMATE, but a real player is deeply
+-- coupled — it claims the camera and runs a per-frame think that reads our
+-- input / can self-shoot. Skipping the think wholesale (passive hooks) breaks
+-- rendering + crashes. Needs SURGICAL neutering of just the input+camera reads
+-- inside the think. Gated OFF until then; puppets are the stable path.
+_G.MP_USE_TPLAYER = false  -- WIP: see active-player-writer issue; puppets = stable
+
 handle_join = function(p)
     if mp.puppets[p.id] then return end
     local pl = player.GetPlayer()
     local px, py = 0, 0
     if pl then px, py = pl:GetPosition() end
     local sx, sy = p.x or (px + 3), p.y or (py + 3)
-    local obj
-    pcall(function() obj = Create{ type = "mp_remote_player", x = sx, y = sy, angle = p.angle or 0 } end)
+    local obj, is_tplayer = nil, false
+    -- Proper remote player: a real TPlayer. CreatePlayer overwrites the global
+    -- main-player pointer (camera/input/HUD), so save the LOCAL player's ptr
+    -- and restore it immediately — keeping the camera on us.
+    if _G.MP_USE_TPLAYER and CreatePlayer and _G.MP_NATIVE and _G.MP_NATIVE.set_main_player and pl and pl.pointer then
+        local saved = pl.pointer
+        local main_before, local_addr
+        pcall(function() main_before = _G.MP_NATIVE.get_main_player() end)
+        pcall(function() local_addr = _G.MP_NATIVE.addr_of(pl.pointer) end)
+        pcall(function() obj = CreatePlayer(sx, sy) end)
+        local main_after_create
+        pcall(function() main_after_create = _G.MP_NATIVE.get_main_player() end)
+        pcall(function() _G.MP_NATIVE.set_main_player(saved) end)
+        local main_after_restore, remote_addr
+        pcall(function() main_after_restore = _G.MP_NATIVE.get_main_player() end)
+        if obj then pcall(function() remote_addr = _G.MP_NATIVE.addr_of(obj.pointer) end) end
+        logf("TPLAYER join id=%s: local=%s main_before=%s main_after_create=%s remote=%s main_after_restore=%s",
+            tostring(p.id), tostring(local_addr), tostring(main_before),
+            tostring(main_after_create), tostring(remote_addr), tostring(main_after_restore))
+        if obj then
+            is_tplayer = true
+            pcall(function() obj:SetAngle(p.angle or 0) end)
+        end
+    end
+    if not obj then
+        pcall(function() obj = Create{ type = "mp_remote_player", x = sx, y = sy, angle = p.angle or 0 } end)
+    end
     local display_name = (p.name or "?") .. "#" .. tostring(p.id)
     if obj then pcall(function() obj:SetName("mp_player_" .. tostring(p.id)) end) end
     local init_text = display_name .. " HP:" .. tostring(p.hp or 100)
     local nameplate
     pcall(function() nameplate = CreateTextObj(sx, sy - 1.2, init_text) end)
     mp.puppets[p.id] = {
-        obj = obj, name = display_name, hp = p.hp or 100,
+        obj = obj, is_tplayer = is_tplayer, name = display_name, hp = p.hp or 100,
         last_x = sx, last_y = sy,
         created_at = socket.gettime(),
         nameplate = nameplate, nameplate_text = init_text,
     }
-    logf("join id=%s name=%s pos=(%.2f, %.2f)", tostring(p.id), display_name, sx, sy)
+    logf("join id=%s name=%s pos=(%.2f, %.2f) tplayer=%s", tostring(p.id), display_name, sx, sy, tostring(is_tplayer))
     refresh_objective_string()
 end
 
@@ -1083,10 +1123,15 @@ local function handle_snapshot(msg)
                     -- safe, unlike poking the downstream frame. Makes the puppet
                     -- play the real walk/shoot/aim animation. Guard: live + a
                     -- moment to initialize.
-                    -- ACTION SYNC ABANDONED (2026-05-30): set_action on the
-                    -- puppet (even walk/idle) null-derefs the engine's actor
-                    -- anim/render. The puppet is fundamentally un-animatable.
-                    -- p.act still synced (harmless) but not applied.
+                    -- Drive the remote player's ANIMATION. Only safe on a real
+                    -- TPlayer (full anim/weapon setup); the old enemy puppet
+                    -- null-derefs. Writes the action id to +0xB4 (engine's own
+                    -- SetAction field) so the engine plays the proper animation.
+                    if entry.is_tplayer and p.act and entry.obj.pointer
+                       and _G.MP_NATIVE and _G.MP_NATIVE.set_action
+                       and entity_alive(entry.obj) then
+                        pcall(function() _G.MP_NATIVE.set_action(entry.obj.pointer, p.act) end)
+                    end
                     entry.last_x = p.x
                     entry.last_y = p.y
                     if p.hp then entry.hp = p.hp end
