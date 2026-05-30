@@ -588,14 +588,31 @@ local function apply_item_list(items)
         end
     end
 
-    -- 4. Delete any local items that nothing claimed (host doesn't know about them).
+    -- 4. Delete any local items that nothing claimed (host doesn't know about
+    --    them). The Create loop above yielded via Wait, so the alive set from
+    --    step 1 is stale — a freed-then-recycled pointer would be Deleted into
+    --    freed memory (heap corruption). Re-scan FRESH here and run the deletes
+    --    ATOMICALLY (no Wait inside the loop) so the net coroutine can't free an
+    --    item between our liveness check and the Delete.
     local orphaned = 0
+    local fresh_alive = {}
+    do
+        local fpx, fpy = 0, 0
+        if pl then pcall(function() fpx, fpy = pl:GetPosition() end) end
+        local objs2 = GetObjectsInCircle(fpx, fpy, 1000)
+        if type(objs2) == "table" then
+            for _, o in ipairs(objs2) do
+                if type(o) == "table" and o.pointer then fresh_alive[tostring(o.pointer)] = true end
+            end
+        end
+    end
     for _, bucket in pairs(local_by_type) do
         for _, cand in ipairs(bucket) do
-            if not cand.taken and type(cand.obj.Delete) == "function" then
+            if not cand.taken and cand.obj and type(cand.obj) == "table"
+               and cand.obj.pointer and fresh_alive[tostring(cand.obj.pointer)] == true
+               and type(cand.obj.Delete) == "function" then
                 pcall(function() cand.obj:Delete() end)
                 orphaned = orphaned + 1
-                if orphaned % 4 == 0 then Wait(0.1) end
             end
         end
     end
@@ -1058,15 +1075,6 @@ local function handle_welcome(msg)
     refresh_objective_string()
 end
 
-local function handle_leave(msg)
-    local entry = mp.puppets[msg.id]
-    if entry and entry.obj then pcall(function() entry.obj:Delete() end) end
-    if entry and entry.nameplate then pcall(function() entry.nameplate:Delete() end) end
-    mp.puppets[msg.id] = nil
-    logf("left id=%s", tostring(msg.id))
-    refresh_objective_string()
-end
-
 -- Liveness cache: scan world ONCE per tick, reuse for all puppet checks.
 -- Caches a set of alive pointer strings for ~0.5s. Calling entity_alive
 -- 28x per tick was tanking FPS (each call scanned hundreds of objects).
@@ -1093,6 +1101,35 @@ local function entity_alive(obj)
     if not obj or type(obj) ~= "table" or not obj.pointer then return false end
     refresh_alive_cache()
     return alive_ptr_cache[tostring(obj.pointer)] == true
+end
+
+-- Liveness-gated Delete. The engine recycles freed C++ pointers and, when a
+-- binding (Delete/SetPosition/GetHealth/…) is called on freed memory, aborts
+-- INSIDE native code — pcall cannot catch it and the heap gets scribbled, which
+-- surfaces seconds later as the RtlReAllocateHeap/luaL_gsub crash. So before
+-- Deleting any handle the engine MAY have freed out-of-band (item picked up
+-- locally, entity destroyed during a Wait yield, …), force a FRESH world scan
+-- and only Delete if the exact pointer is still present. Returns true when the
+-- object is gone (deleted now, or already gone — nothing to do).
+local function safe_delete(obj)
+    if not obj or type(obj) ~= "table" or not obj.pointer then return true end
+    alive_ptr_cache_at = 0           -- never trust a stale set for a Delete
+    if not entity_alive(obj) then return true end   -- already freed/recycled away
+    pcall(function() if obj.Delete then obj:Delete() end end)
+    return true
+end
+
+local function handle_leave(msg)
+    local entry = mp.puppets[msg.id]
+    if entry then
+        safe_delete(entry.obj)
+        -- Nameplate is a TextObj (not in the actor scan); we own its lifetime
+        -- and Delete it exactly once here, so a plain guarded Delete is safe.
+        if entry.nameplate then pcall(function() entry.nameplate:Delete() end) end
+    end
+    mp.puppets[msg.id] = nil
+    logf("left id=%s", tostring(msg.id))
+    refresh_objective_string()
 end
 
 local function handle_snapshot(msg)
@@ -1199,10 +1236,14 @@ local function handle_item_picked(msg)
     end
     local deleted = false
     if entry.obj then
-        local ok = pcall(function() if entry.obj.Delete then entry.obj:Delete(); deleted = true end end)
-        if not ok then deleted = false end
-    end
-    if not deleted then
+        -- We hold a handle: liveness-gated Delete. The item may already have
+        -- been destroyed C-side by a local pickup — Deleting that freed handle
+        -- is the prime heap corruptor, so safe_delete confirms it's still live.
+        safe_delete(entry.obj)
+        deleted = true
+    else
+        -- No local handle: find the item by position. Freshly-scanned objects
+        -- are live, so Deleting one is heap-safe.
         local objs = GetObjectsInCircle(entry.x, entry.y, 0.4)
         if type(objs) == "table" then
             for _, o in ipairs(objs) do
@@ -1479,7 +1520,7 @@ local function handle_mob_died(msg)
     -- Untrack FIRST so the snapshot handler never SetPositions a dying/freed
     -- object (that path calls native abort, which pcall can't catch).
     mp.mob_puppets[msg.id] = nil
-    if entry.obj then
+    if entry.obj and entity_alive(entry.obj) then
         -- CORPSE-VIA-ENGINE-DEATH DISABLED (2026-05-29). kill_actor poked the
         -- puppet's health negative to make the engine run native death — but
         -- that triggers the engine's puppet death-cleanup, which corrupts the
@@ -1650,7 +1691,7 @@ local function disconnect_only()
     if mp.sock then pcall(function() mp.sock:close() end); mp.sock = nil end
     mp.rx_buf = ""
     for _, entry in pairs(mp.puppets) do
-        if entry.obj then pcall(function() entry.obj:Delete() end) end
+        safe_delete(entry.obj)
         if entry.nameplate then pcall(function() entry.nameplate:Delete() end) end
     end
     mp.puppets = {}
@@ -1813,9 +1854,19 @@ local function clear_local_mobs()
     local my_ptr = tostring(pl.pointer)
     local objs = GetObjectsInCircle(px, py, 1000)
     if type(objs) ~= "table" then mp.cleanup_done = true; return end
+    -- Belt-and-suspenders: never Delete one of our OWN tracked puppets even if
+    -- GetName misfires — a dangling entry.obj would later be double-freed.
+    local owned = {}
+    for _, e in pairs(mp.puppets) do
+        if type(e) == "table" and e.obj and e.obj.pointer then owned[tostring(e.obj.pointer)] = true end
+    end
+    for _, e in pairs(mp.mob_puppets) do
+        if type(e) == "table" and e.obj and e.obj.pointer then owned[tostring(e.obj.pointer)] = true end
+    end
     local deleted, batch = 0, 0
     for _, obj in ipairs(objs) do
-        if type(obj) == "table" and obj.Alert and obj.Delete and tostring(obj.pointer) ~= my_ptr then
+        if type(obj) == "table" and obj.Alert and obj.Delete and tostring(obj.pointer) ~= my_ptr
+           and not owned[tostring(obj.pointer)] then
             local nm = ""
             pcall(function() nm = obj:GetName() or "" end)
             if string.sub(nm, 1, 3) ~= "mp_" then
@@ -1977,9 +2028,7 @@ local function manual_pickup_nearest()
     for p, pid in pairs(mp.item_obj_to_id) do
         if pid == best_id then mp.item_obj_to_id[p] = nil end
     end
-    if entry.obj and type(entry.obj.Delete) == "function" then
-        pcall(function() entry.obj:Delete() end)
-    end
+    if entry.obj then safe_delete(entry.obj) end
     if mp.sock then
         send_msg({ type = "item_picked", id = best_id, picker_id = mp.my_id })
         logf("manual_pickup: id=%d type=%s d=%.2f BROADCAST",
