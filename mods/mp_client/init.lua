@@ -25,11 +25,16 @@ do
                 local hook_ok = mp_native.install_bullet_hook()
                 if mp_native.log then mp_native.log("install_bullet_hook returned " .. tostring(hook_ok)) end
             end
-            if mp_native.install_central_hit_hook then
+            -- central_hit + takedamage hooks DISABLED (2026-05-29). They fed
+            -- the old consume_hit -> mob_damage path, which bullet replication
+            -- has fully superseded — so they're redundant (and risk double-
+            -- counting). Removing them also shrinks the native code-patch
+            -- surface while we chase the remaining heap corruptor. Only the
+            -- bullet ctor hook (needed for the joiner bullet drain) stays.
+            if false and mp_native.install_central_hit_hook then
                 local ok = mp_native.install_central_hit_hook()
                 if mp_native.log then mp_native.log("install_central_hit_hook returned " .. tostring(ok)) end
             end
-            -- (per-puppet vtable hook removed — central hit hook covers all)
             _G.MP_NATIVE = mp_native
             local f = io.open("mp_client_native.txt", "w")
             if f then
@@ -173,6 +178,11 @@ else
             stepsound = "s6dur_samm", animspeedmult = 0.1, stepsounddelay = 999999,
             turnspeed = 0,
         },
+        -- Animations neutered (frozen at frame 0). Driving the puppet's
+        -- animation is IMPOSSIBLE without crashing — proven via frame poke,
+        -- action+attack-frames, and action+walk-only (all null-deref the
+        -- engine's actor render/anim code). Remote-player animation needs the
+        -- TPlayer rework, not an enemy puppet.
         animations = {
             ["walk"] = { startf = 0, endf = 0, speed = 0, repeating = true },
             ["pain"] = { startf = 0, endf = 0, speed = 0, repeating = false },
@@ -1066,6 +1076,17 @@ local function handle_snapshot(msg)
                     if p.angle then
                         pcall(function() entry.obj:SetAngle(p.angle) end)
                     end
+                    -- Drive the puppet's ANIMATION by mirroring the remote
+                    -- player's action id onto its +0xB4 field (the engine's own
+                    -- SetAction target). This is UPSTREAM of the anim state, so
+                    -- the engine rebuilds a consistent animation each frame —
+                    -- safe, unlike poking the downstream frame. Makes the puppet
+                    -- play the real walk/shoot/aim animation. Guard: live + a
+                    -- moment to initialize.
+                    -- ACTION SYNC ABANDONED (2026-05-30): set_action on the
+                    -- puppet (even walk/idle) null-derefs the engine's actor
+                    -- anim/render. The puppet is fundamentally un-animatable.
+                    -- p.act still synced (harmless) but not applied.
                     entry.last_x = p.x
                     entry.last_y = p.y
                     if p.hp then entry.hp = p.hp end
@@ -1200,6 +1221,9 @@ local function handle_item_list(msg)
 end
 
 local MAX_SPAWNS_PER_TICK = 3
+-- Puppet reposition toggle. Left in as a diagnostic switch; bisect (2026-05-29)
+-- cleared puppet movement as a crash source, so it's enabled (true) normally.
+_G.MP_BISECT_PUPPET_MOVE = true
 local function handle_mob_snapshot(msg)
     if mp.is_host or not mp.cleanup_done or not msg.mobs then return end
     if not mp._mob_snap_logged then
@@ -1249,8 +1273,15 @@ local function handle_mob_snapshot(msg)
                     alive = entry.obj.pointer and alive_ptr_cache[tostring(entry.obj.pointer)] == true
                 end
                 if alive then
-                    pcall(function() entry.obj:SetPosition(m.x, m.y) end)
-                    if m.a then pcall(function() entry.obj:SetAngle(m.a) end) end
+                    -- BISECT (2026-05-29): puppet repositioning temporarily
+                    -- disabled to test whether SetPosition/SetAngle on a
+                    -- stale/freed entity is the joiner heap corruptor. Puppets
+                    -- freeze where spawned. If the joiner stops crashing, this
+                    -- path is the culprit. Re-enable after confirming.
+                    if _G.MP_BISECT_PUPPET_MOVE ~= false then
+                        pcall(function() entry.obj:SetPosition(m.x, m.y) end)
+                        if m.a then pcall(function() entry.obj:SetAngle(m.a) end) end
+                    end
                     -- SetHealth sync disabled — was triggering native abort.
                     -- Joiner's puppet HP starts at def.health (999999); damage
                     -- diff still reports drops correctly to host.
@@ -1328,82 +1359,71 @@ local function handle_bullet_fire(msg)
             tostring(msg.x), tostring(msg.y), tostring(msg.angle),
             tostring(msg.speed), tostring(msg.btype), tostring(msg.dmg))
     end
-    if not mp.is_host then return end
     if type(msg.x) ~= "number" or type(msg.y) ~= "number" then return end
     if type(msg.angle) ~= "number" or type(msg.speed) ~= "number" then return end
-    local btype = (type(msg.btype) == "number") and msg.btype or 0
-    local pl = player.GetPlayer()
-    -- Owner = the joiner's puppet (mp.puppets[from].obj). This makes the
-    -- bullet semantically "fired by the joiner" — the engine should treat
-    -- it as a player bullet that damages mobs. Falls back to host's own
-    -- player if the joiner puppet isn't found.
-    local owner = nil
-    if msg.from and mp.puppets[msg.from] then
-        owner = mp.puppets[msg.from].obj
-    end
-    if not owner then owner = player.GetPlayer() end
-    local bdmg = (type(msg.dmg) == "number") and msg.dmg or 10
-    -- Spawn the visual bullet (no damage — that's what we couldn't get working).
-    pcall(function() CreateBullet(msg.x, msg.y, msg.angle, msg.speed, btype, 2.0, owner) end)
-    -- Server-side damage: raycast from the joiner's fire point in the angle
-    -- direction; first tracked host mob in the bullet's line gets damaged.
-    local MAX_RANGE = 30
-    local HIT_RADIUS = 1.0  -- tolerance perpendicular to ray
+    -- CreateBullet(x, y, angle, speed, ARG5, ARG6, owner)
+    -- Decompilation finding: the engine writes ARG5 raw into TBullet+0xB0
+    -- and ARG6 into TBullet+0xB8. At hit time TActor::TakeDamage reads
+    -- both AS FLOATS: hp -= ARG5 (armorless) or hp -= ARG5*ARG6 (armored).
+    -- So ARG5 is DAMAGE (a float), NOT a bullettype id. ARG6 is the
+    -- force/multiplier that also drives knockback and tick decay.
+    -- Owner MUST be host's own player so the engine treats this as a
+    -- player-fired bullet (mob-owned bullets damage players instead).
+    --
+    -- The HOST spawns a REAL bullet (full damage) for an incoming joiner shot
+    -- — that's authoritative combat. A JOINER spawns a COSMETIC bullet
+    -- (damage 0) so you SEE peers shooting without applying phantom damage to
+    -- the joiner's inert puppets. Either way we mute the capture flag around
+    -- CreateBullet so the spawned bullet isn't re-drained and re-broadcast
+    -- (that would feed back into an infinite amplification loop).
+    local owner = player.GetPlayer()
+    local cosmetic = not mp.is_host
+    local bdmg = cosmetic and 0 or ((type(msg.dmg) == "number") and msg.dmg or 10)
+    local bforce = 2.0  -- knockback force; also bullet "range" via tick decay
+    pcall(function()
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
+        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
+    end)
+end
+
+-- A remote player stabbed. Only the host is authoritative for mobs, so the
+-- host finds mobs within knife reach and frontal arc of the attacker and
+-- applies melee damage + lets the knockback system react (visible feedback).
+local MELEE_RANGE = 2.2      -- knife reach (world units)
+local MELEE_ARC_DOT = 0.5    -- cos of half-arc (~±60° in front)
+local MELEE_DAMAGE = 35      -- knife damage (approx; refine later)
+local function handle_melee(msg)
+    if not mp.is_host then return end
+    if type(msg.x) ~= "number" or type(msg.y) ~= "number" or type(msg.angle) ~= "number" then return end
     local dx, dy = math.cos(msg.angle), math.sin(msg.angle)
-    local best_id, best_t = nil, math.huge
+    -- Liveness gate: never call methods on a freed mob (vtable NULL → native
+    -- abort). Same safety the snapshot builder uses.
+    refresh_alive_cache()
+    local best_id, best_obj, best_d = nil, nil, math.huge
     for ptr, info in pairs(mp.host_mobs) do
-        if info.obj then
+        if info.obj and info.obj.pointer and alive_ptr_cache[tostring(info.obj.pointer)] == true then
             local mx, my
             pcall(function() mx, my = info.obj:GetPosition() end)
             if mx and my then
-                -- Project mob position onto bullet ray
                 local rx, ry = mx - msg.x, my - msg.y
-                local t = rx * dx + ry * dy  -- distance along ray
-                if t > 0 and t < MAX_RANGE then
-                    local perp = math.abs(rx * dy - ry * dx)
-                    if perp < HIT_RADIUS and t < best_t then
-                        best_t, best_id = t, info.id
+                local dist = math.sqrt(rx * rx + ry * ry)
+                if dist > 0.01 and dist <= MELEE_RANGE then
+                    local ndot = (rx * dx + ry * dy) / dist   -- frontal check
+                    if ndot >= MELEE_ARC_DOT and dist < best_d then
+                        best_d, best_id, best_obj = dist, info.id, info.obj
                     end
                 end
             end
         end
     end
-    if best_id then
-        for ptr, info in pairs(mp.host_mobs) do
-            if info.id == best_id and info.obj then
-                local h
-                pcall(function() h = info.obj:GetHealth() end)
-                if h then
-                    local new_h = h - bdmg
-                    pcall(function() info.obj:SetHealth(new_h, 1) end)
-                    logf("bullet_fire from=%s raycast HIT mob id=%d dmg=%d %d->%d",
-                        tostring(msg.from), best_id, bdmg, h, new_h)
-                end
-                break
-            end
+    if best_obj then
+        local h
+        pcall(function() if best_obj.GetHealth then h = best_obj:GetHealth() end end)
+        if h then
+            pcall(function() best_obj:SetHealth(h - MELEE_DAMAGE, 1) end)
+            logf("melee from=%s HIT mob id=%d %d->%d", tostring(msg.from), best_id, h, h - MELEE_DAMAGE)
         end
-    else
-        -- Diagnose: count host_mobs and find nearest by raw distance
-        local count, nearest_d, nearest_id, nearest_t, nearest_perp = 0, math.huge, nil, 0, 0
-        for ptr, info in pairs(mp.host_mobs) do
-            count = count + 1
-            if info.obj then
-                local mx, my
-                pcall(function() mx, my = info.obj:GetPosition() end)
-                if mx and my then
-                    local d = math.sqrt((mx - msg.x)^2 + (my - msg.y)^2)
-                    if d < nearest_d then
-                        nearest_d, nearest_id = d, info.id
-                        local rx, ry = mx - msg.x, my - msg.y
-                        nearest_t = rx * dx + ry * dy
-                        nearest_perp = math.abs(rx * dy - ry * dx)
-                    end
-                end
-            end
-        end
-        logf("bullet_fire from=%s NO HIT: pos=(%.2f,%.2f) angle=%.2f host_mobs=%d nearest=id%s d=%.1f t=%.1f perp=%.1f",
-            tostring(msg.from), msg.x, msg.y, msg.angle,
-            count, tostring(nearest_id), nearest_d, nearest_t, nearest_perp)
     end
 end
 
@@ -1411,12 +1431,21 @@ local function handle_mob_died(msg)
     if mp.is_host or not msg.id then return end
     local entry = mp.mob_puppets[msg.id]
     if not entry then return end
+    -- Untrack FIRST so the snapshot handler never SetPositions a dying/freed
+    -- object (that path calls native abort, which pcall can't catch).
     mp.mob_puppets[msg.id] = nil
     if entry.obj then
-        -- Hide rather than Delete (vtable may be corrupted from heap stomp).
+        -- CORPSE-VIA-ENGINE-DEATH DISABLED (2026-05-29). kill_actor poked the
+        -- puppet's health negative to make the engine run native death — but
+        -- that triggers the engine's puppet death-cleanup, which corrupts the
+        -- heap and crashes ~tens of seconds later in free(). This is exactly
+        -- why the inert def uses health=999999 ("prevents local puppet death —
+        -- engine cleanup crashes"). Confirmed: every test with kill_actor
+        -- enabled crashed; hiding is stable. Corpses need a SAFE method later
+        -- (spawn a separate decorative corpse sprite, not kill the puppet).
         pcall(function() entry.obj:SetPosition(-500, -500) end)
     end
-    logf("mob_died: id=%d hidden", msg.id)
+    logf("mob_died: id=%d hidden (corpse disabled — was crash source)", msg.id)
 end
 
 local handlers = {
@@ -1429,6 +1458,7 @@ local handlers = {
     mob_died = handle_mob_died,
     mob_damage = handle_mob_damage,
     bullet_fire = handle_bullet_fire,
+    melee = handle_melee,
     item_picked = handle_item_picked,
     item_list = handle_item_list,
     item_spawned = handle_item_spawned,
@@ -1447,7 +1477,10 @@ local function build_mob_snapshot()
         local pl = player.GetPlayer()
         local px, py = 0, 0
         if pl then pcall(function() px, py = pl:GetPosition() end) end
-        local objs = GetObjectsInCircle(px, py, 5000)
+        -- Huge radius: the scan is a SAFETY filter (don't call methods on a
+        -- freed C++ entity), not a relevance filter. A small radius centered
+        -- on the host player falsely culls mobs the roaming joiner is fighting.
+        local objs = GetObjectsInCircle(px, py, 1000000)
         if type(objs) == "table" then
             for _, o in ipairs(objs) do
                 if type(o) == "table" and o.pointer then
@@ -1456,12 +1489,30 @@ local function build_mob_snapshot()
             end
         end
     end
+    -- Debounce: a mob absent from the scan for ONE frame is NOT proof of death
+    -- (the scan glitches / can miss live entities). Only declare a mob dead
+    -- after it's been absent MISS_LIMIT consecutive snapshots. This was the
+    -- "mobs revive" bug: a single-frame scan miss fired a false mob_died, the
+    -- joiner killed the puppet, then the still-alive mob respawned it.
+    local MISS_LIMIT = 3
     for ptr, info in pairs(mp.host_mobs) do
         local in_world = info.obj and info.obj.pointer and alive_set[tostring(info.obj.pointer)]
         if not in_world then
-            table.insert(dead_ids, info.id)
-            table.insert(dead_ptrs, ptr)
+            info.miss = (info.miss or 0) + 1
+            if info.miss >= MISS_LIMIT then
+                table.insert(dead_ids, info.id)
+                table.insert(dead_ptrs, ptr)
+            else
+                -- Not confirmed dead yet — keep last known position in the
+                -- snapshot so the puppet doesn't flicker or get re-spawned.
+                if info.last_x then
+                    table.insert(mobs, { id = info.id, type = info.type,
+                        x = info.last_x, y = info.last_y, a = info.last_a or 0,
+                        h = info.last_h, mh = info.mh })
+                end
+            end
         else
+            info.miss = 0
             local x, y, a, h, mh
             local ok = pcall(function()
                 x, y = info.obj:GetPosition()
@@ -1470,8 +1521,11 @@ local function build_mob_snapshot()
                 if info.obj.GetMaxHealth then mh = info.obj:GetMaxHealth() end
             end)
             if ok and x and y and (not h or h > 0) then
+                -- Cache last-known state for the debounce path above.
+                info.last_x, info.last_y, info.last_a, info.last_h = x, y, a or 0, h
                 table.insert(mobs, { id = info.id, type = info.type, x = x, y = y, a = a or 0, h = h, mh = mh })
             else
+                -- Confirmed dead: GetHealth <= 0 (real death, not a scan miss).
                 table.insert(dead_ids, info.id)
                 table.insert(dead_ptrs, ptr)
             end
@@ -1497,6 +1551,11 @@ local function connect_and_handshake(proposed_seed)
     sock:settimeout(3)
     local ok, err = sock:connect(config.host, config.port)
     if not ok then logf("connect failed: %s", tostring(err)); return false, err end
+    -- Disable Nagle's algorithm. Without this, small frames (bullet_fire,
+    -- mob_died, mob_damage) get coalesced and held up to ~40ms before the
+    -- OS sends them — the single biggest source of perceived MP lag. The
+    -- relay already sets setNoDelay on its side; this is the client half.
+    pcall(function() sock:setoption("tcp-nodelay", true) end)
 
     local hello = { type = "hello", name = config.name }
     if proposed_seed then hello.seed = proposed_seed end
@@ -1618,11 +1677,38 @@ local function net_tick_loop()
                     local x, y = pl:GetPosition()
                     local a = pl:GetAngle()
                     local hp = pl:GetHealth()
-                    send_msg({ type = "state", x = x, y = y, angle = a, hp = hp })
+                    -- Sync the player's animation frame. GetFrame() returns the
+                    -- body sprite frame, which encodes the full pose (per-weapon
+                    -- hold/shoot/reload/stab). The puppet can't SetFrame from Lua
+                    -- (thin handle), so the remote side pokes it natively by ptr.
+                    local f
+                    pcall(function() if pl.GetFrame then f = pl:GetFrame() end end)
+                    -- Read the player's real ACTION id (engine field +0xB4) to
+                    -- sync to peers. Unlike the frame, the action is upstream of
+                    -- the anim state, so writing it on the puppet is safe and
+                    -- drives the real walk/shoot/aim animation.
+                    local act
+                    if _G.MP_NATIVE and _G.MP_NATIVE.get_action and pl.pointer then
+                        pcall(function() act = _G.MP_NATIVE.get_action(pl.pointer) end)
+                    end
+                    -- Melee detection via the body frame. The knife stab swing
+                    -- animates frames 27..29 (idle=0, pystol shoot=5/6). When we
+                    -- enter that range we fire a one-shot "melee" event so the
+                    -- host can apply knife damage to nearby mobs (like bullets).
+                    local is_stab = f and f >= 26.5 and f <= 30.5
+                    if is_stab and not _G.MP_WAS_STABBING then
+                        send_msg({ type = "melee", x = x, y = y, angle = a })
+                    end
+                    _G.MP_WAS_STABBING = is_stab
+                    send_msg({ type = "state", x = x, y = y, angle = a, hp = hp, f = f, act = act })
                 end
                 mp.last_send = now
             end
-            if mp.is_host and mp.sock and now - mp.last_mob_send >= 0.1 then
+            -- 20 Hz mob sync (was 10). build_mob_snapshot also detects deaths
+            -- and fires mob_died, so this rate doubles as the death-event rate
+            -- — faster corpses on the joiner and smoother mob motion. Cheap on
+            -- localhost; still fine for Railway (a few mobs * 20 Hz).
+            if mp.is_host and mp.sock and now - mp.last_mob_send >= 0.05 then
                 send_msg({ type = "mob_snapshot", mobs = build_mob_snapshot() })
                 mp.last_mob_send = now
             end
@@ -1864,7 +1950,11 @@ local function dev_menu_tick()
     -- Joiner: drain native bullet events, send to host so host re-fires.
     -- Include current weapon stats (speed + bullettype) so host creates a
     -- correctly-tuned bullet (speed AND damage come from bullet type).
-    if _G.MP_NATIVE and _G.MP_NATIVE.consume_bullet and (not mp.is_host) and mp.sock then
+    -- Drain on BOTH sides now: the joiner's shots reach the host for real
+    -- damage, AND every shot is broadcast so peers can render a cosmetic copy
+    -- (so you SEE other players shooting). handle_bullet_fire decides real vs
+    -- cosmetic per receiver.
+    if _G.MP_NATIVE and _G.MP_NATIVE.consume_bullet and mp.sock then
         local item
         local pl = player.GetPlayer()
         if pl and pl.GetEquippedItem then

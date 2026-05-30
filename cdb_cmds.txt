@@ -1,0 +1,9 @@
+.echo ===VSTACK-A-BEGIN===
+kP 120
+.echo ---registers---
+r
+.echo ---faulting-instr---
+u eip L4
+.dump /ma E:\projects\TMEMultiplayerClient\crash_a.dmp
+.echo ===VSTACK-A-END===
+q

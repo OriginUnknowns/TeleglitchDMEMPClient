@@ -1,7 +1,11 @@
-*.log
+# Ghidra analysis artifacts (large / regenerable)
+ghidra_project/
+ghidra_*.txt
 *.dmp
-mp_client_load_error.txt
-# DLL host build outputs (rebuild from source)
-modloader/dllhost/*.dll
-modloader/dllhost/*.a
-modloader/dllhost/*.o
+# cdb / debug logs
+cdb_*.log
+cdb_*.err
+*.log
+# build outputs
+modloader/dllhost/version.dll
+modloader/dllhost/libversion.a

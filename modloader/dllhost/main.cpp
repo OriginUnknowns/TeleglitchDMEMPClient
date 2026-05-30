@@ -126,12 +126,22 @@ static lua_State* g_L = nullptr;
 // ---------------------------------------------------------------------------
 typedef int (*LuaCFunc)(lua_State* L);
 
-// Bullet ctor — called by EVERY bullet in the engine (Lua + C++ alike).
-// thiscall convention: this in ecx, other args on the stack.
-// Signature inferred from CreateBullet binding @ 0x497040 call site:
-//   Bullet::Bullet(this, ?, ?, ?, ?)  // 4 stack args after this
-// We don't know the precise types yet; log fact-of-call first, then iterate.
-typedef void (__thiscall *BulletCtorFn)(void* self, int a, int b, int c, int d);
+// TBullet ctor @ 0x497040 — called by EVERY bullet in the engine.
+// Verified via Ghidra + live crash analysis: __thiscall, `this` in ECX plus
+// 8 stack args, RET 0x20 (callee purges the 32 bytes of stack args; ECX is
+// not purged). `this` is the freshly new'd TBullet; the 8 stack args are
+// posx, posy, velx, vely, damage, type, force, ? (args 1-4 are raw float
+// bits). We model thiscall as __fastcall(self=ecx, edx_dummy, a1..a8): this
+// keeps ECX(this) intact AND declares all 8 stack args so the hook cleans
+// the full 32 bytes (RET 0x20) — matching the original exactly.
+//
+// History: the very first hook used __fastcall with only 4 stack args, so it
+// cleaned 16 instead of 32 — leaking 16 bytes/bullet (the random-crash bug).
+// A subsequent __stdcall attempt dropped ECX entirely, so the ctor wrote its
+// vtable to a garbage `this` and crashed instantly. This form fixes both.
+typedef void* (__fastcall *BulletCtorFn)(void* self, void* edx,
+                                         int a1, int a2, int a3, int a4,
+                                         int a5, int a6, int a7, int a8);
 static BulletCtorFn orig_BulletCtor = nullptr;
 static int g_bullet_count = 0;
 
@@ -141,11 +151,22 @@ struct BulletEvt { float x, y, vx, vy; };
 static BulletEvt g_bullet_ring[BULLET_RING_SIZE] = {0};
 static volatile int g_bullet_write_idx = 0;
 static int g_bullet_read_idx = 0;
+// When false, the hook still passes the bullet through to the engine but does
+// NOT record it for Lua to drain. Lua mutes capture around its own
+// CreateBullet calls (replicated/cosmetic bullets) so they aren't re-broadcast
+// — without this, every spawned bullet would feed back into the drain and
+// amplify infinitely.
+static volatile bool g_bullet_capture = true;
 
-static void __fastcall hook_BulletCtor(void* self, void* /*edx*/, int a, int b, int c, int d) {
+static void* __fastcall hook_BulletCtor(void* self, void* edx,
+                                        int a1, int a2, int a3, int a4,
+                                        int a5, int a6, int a7, int a8) {
     g_bullet_count++;
+    if (!g_bullet_capture) {
+        return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    }
     union { int i; float f; } px, py, vx, vy;
-    px.i = a; py.i = b; vx.i = c; vy.i = d;
+    px.i = a1; py.i = a2; vx.i = a3; vy.i = a4;
     int idx = g_bullet_write_idx % BULLET_RING_SIZE;
     g_bullet_ring[idx].x = px.f;
     g_bullet_ring[idx].y = py.f;
@@ -156,7 +177,7 @@ static void __fastcall hook_BulletCtor(void* self, void* /*edx*/, int a, int b, 
         host_log("hook_BulletCtor #%d: this=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f)",
                  g_bullet_count, self, px.f, py.f, vx.f, vy.f);
     }
-    orig_BulletCtor(self, a, b, c, d);
+    return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
 // Lua-callable: consume one bullet event. Returns nil if none, or 4 numbers
@@ -410,6 +431,159 @@ static int l_install_hook_takedmg(lua_State* L) {
     return 1;
 }
 
+// Lua-callable: kill_actor(ptr) — force an actor to die through the engine so
+// it leaves a real corpse (death sprite + blood + gibs + deathsound). The
+// joiner's mob puppets are Create{}-handles that DON'T expose :SetHealth, so
+// Lua can't kill them; we poke the C++ object directly instead.
+//
+// From the decompiled TActor::TakeDamage (0x44e3e0): health is a float at
+// object+0xBC and armor at +0xC0. Writing health negative makes the actor's
+// next native Update run its death path. We validate the vtable is in module
+// range first so a stale/freed pointer can never make us scribble on garbage.
+static int l_kill_actor(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* udblock = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!udblock) { api.pushboolean(L, 0); return 1; }
+
+    HMODULE me = GetModuleHandleA(NULL);
+    DWORD mod_base = (DWORD)me;
+    #define KA_IN_RANGE(p) (((DWORD)(p) - mod_base) < 0x200000)
+
+    // .pointer is light userdata -> udblock IS the entity. Fall back to one
+    // dereference (full userdata) if the light path's vtable looks bogus.
+    void* entity = nullptr;
+    {
+        void** v = *(void***)udblock;
+        if (KA_IN_RANGE(v)) entity = udblock;
+    }
+    if (!entity) {
+        void* full = *(void**)udblock;
+        if (full) {
+            void** v = *(void***)full;
+            if (KA_IN_RANGE(v)) entity = full;
+        }
+    }
+    if (!entity) {
+        host_log("kill_actor: no in-range vtable, refusing (udblock=%p)", udblock);
+        api.pushboolean(L, 0);
+        return 1;
+    }
+
+    *(float*)((char*)entity + 0xBC) = -9999.0f;  // health
+    *(float*)((char*)entity + 0xC0) = 0.0f;      // armor
+    host_log("kill_actor: poked entity=%p health=-9999 (corpse pending)", entity);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// Lua-callable: set_frame(ptr, frame) — write the actor's animation frame.
+// From the decompiled SetFrame binding (0x4bd4c0): the frame is a float at
+// actor+0x70. Pure visual field (no engine logic triggered), so unlike
+// kill_actor this is safe to poke freely. Used to mirror a remote player's
+// pose (hold/shoot/stab/reload) onto their puppet, whose thin Create-handle
+// has no :SetFrame. Validates the vtable is in module range before writing.
+static int l_set_frame(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+        lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+    }
+    void* udblock = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!udblock) { api.pushboolean(L, 0); return 1; }
+    float frame = lua_tonumber_p ? (float)lua_tonumber_p(L, 2, nullptr) : 0.0f;
+
+    HMODULE me = GetModuleHandleA(NULL);
+    DWORD mod_base = (DWORD)me;
+    #define SF_IN_RANGE(p) (((DWORD)(p) - mod_base) < 0x200000)
+    void* entity = nullptr;
+    {
+        void** v = *(void***)udblock;
+        if (SF_IN_RANGE(v)) entity = udblock;
+    }
+    if (!entity) {
+        void* full = *(void**)udblock;
+        if (full) { void** v = *(void***)full; if (SF_IN_RANGE(v)) entity = full; }
+    }
+    if (!entity) { api.pushboolean(L, 0); return 1; }
+
+    *(float*)((char*)entity + 0x70) = frame;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// Lua-callable: set_capture(bool) — mute/unmute bullet-hook recording. Lua
+// wraps its own CreateBullet calls with set_capture(false)/set_capture(true)
+// so replicated/cosmetic bullets aren't re-captured and re-broadcast.
+static int l_set_capture(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 1;
+    g_bullet_capture = (on != 0);
+    return 0;
+}
+
+// Shared pointer resolver for actor-field accessors. Returns the validated
+// C++ entity pointer behind a Lua light/full userdata (its .pointer), or null.
+static void* resolve_entity(lua_State* L, int idx) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* udblock = lua_topointer_p ? lua_topointer_p(L, idx) : nullptr;
+    if (!udblock) return nullptr;
+    HMODULE me = GetModuleHandleA(NULL);
+    DWORD mod_base = (DWORD)me;
+    #define RE_IN_RANGE(p) (((DWORD)(p) - mod_base) < 0x200000)
+    { void** v = *(void***)udblock; if (RE_IN_RANGE(v)) return udblock; }
+    { void* full = *(void**)udblock; if (full) { void** v = *(void***)full; if (RE_IN_RANGE(v)) return full; } }
+    return nullptr;
+}
+
+// Lua-callable: get_action(ptr) -> int. Reads the actor's current action id
+// (the int the engine's SetAction writes) at actor+0xB4. Used to read the
+// LOCAL player's real action for syncing to peers.
+static int l_get_action(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushinteger(L, -1); return 1; }
+    api.pushinteger(L, *(int*)((char*)e + 0xB4));
+    return 1;
+}
+
+// Lua-callable: set_action(ptr, id) -> bool. Writes actor+0xB4, exactly what
+// the engine's own SetAction (FUN_0044ddc0) does. SAFE (unlike set_frame):
+// the action is UPSTREAM of the anim state, so the engine rebuilds a
+// consistent animation from it each frame. Drives the remote player's puppet
+// to play the real walk/shoot/aim/etc. animation.
+static int l_set_action(lua_State* L) {
+    typedef ptrdiff_t (*LuaToIntFn)(lua_State*, int, int*);
+    static LuaToIntFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushboolean(L, 0); return 1; }
+    int id = lua_tointeger_p ? (int)lua_tointeger_p(L, 2, nullptr) : 0;
+    *(int*)((char*)e + 0xB4) = id;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 static int l_hello(lua_State* L) {
     api.pushstring(L, "hello from native (modloader dllhost)");
     return 1;
@@ -451,6 +625,16 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "install_central_hit_hook");
     api.pushcclosure(L, l_consume_bullet, 0);
     api.setfield(L, -2, "consume_bullet");
+    api.pushcclosure(L, l_kill_actor, 0);
+    api.setfield(L, -2, "kill_actor");
+    api.pushcclosure(L, l_set_frame, 0);
+    api.setfield(L, -2, "set_frame");
+    api.pushcclosure(L, l_set_capture, 0);
+    api.setfield(L, -2, "set_capture");
+    api.pushcclosure(L, l_get_action, 0);
+    api.setfield(L, -2, "get_action");
+    api.pushcclosure(L, l_set_action, 0);
+    api.setfield(L, -2, "set_action");
     return 1;  // return the table
 }
 
