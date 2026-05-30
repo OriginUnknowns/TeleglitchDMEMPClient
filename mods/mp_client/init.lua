@@ -589,31 +589,40 @@ local function apply_item_list(items)
     end
 
     -- 4. Delete any local items that nothing claimed (host doesn't know about
-    --    them). The Create loop above yielded via Wait, so the alive set from
-    --    step 1 is stale — a freed-then-recycled pointer would be Deleted into
-    --    freed memory (heap corruption). Re-scan FRESH here and run the deletes
-    --    ATOMICALLY (no Wait inside the loop) so the net coroutine can't free an
-    --    item between our liveness check and the Delete.
-    local orphaned = 0
-    local fresh_alive = {}
-    do
+    --    them). Two hazards to respect at once:
+    --      * Deleting a freed/recycled handle = native abort / heap scribble, so
+    --        re-scan liveness FRESH and only Delete a pointer still in the world.
+    --      * A big ATOMIC Delete burst can itself heap-corrupt the engine (the
+    --        original wipe+respawn bug), so spread Deletes across frames with a
+    --        Wait, and re-scan after each yield (the yield can free more items).
+    local orphan_objs = {}
+    for _, bucket in pairs(local_by_type) do
+        for _, cand in ipairs(bucket) do
+            if not cand.taken and cand.obj and type(cand.obj) == "table"
+               and cand.obj.pointer and type(cand.obj.Delete) == "function" then
+                table.insert(orphan_objs, cand.obj)
+            end
+        end
+    end
+    local function rescan_alive()
+        local fa = {}
         local fpx, fpy = 0, 0
         if pl then pcall(function() fpx, fpy = pl:GetPosition() end) end
         local objs2 = GetObjectsInCircle(fpx, fpy, 1000)
         if type(objs2) == "table" then
             for _, o in ipairs(objs2) do
-                if type(o) == "table" and o.pointer then fresh_alive[tostring(o.pointer)] = true end
+                if type(o) == "table" and o.pointer then fa[tostring(o.pointer)] = true end
             end
         end
+        return fa
     end
-    for _, bucket in pairs(local_by_type) do
-        for _, cand in ipairs(bucket) do
-            if not cand.taken and cand.obj and type(cand.obj) == "table"
-               and cand.obj.pointer and fresh_alive[tostring(cand.obj.pointer)] == true
-               and type(cand.obj.Delete) == "function" then
-                pcall(function() cand.obj:Delete() end)
-                orphaned = orphaned + 1
-            end
+    local orphaned = 0
+    local fresh_alive = rescan_alive()
+    for _, obj in ipairs(orphan_objs) do
+        if obj.pointer and fresh_alive[tostring(obj.pointer)] == true then
+            pcall(function() obj:Delete() end)
+            orphaned = orphaned + 1
+            if orphaned % 4 == 0 then Wait(0.1); fresh_alive = rescan_alive() end
         end
     end
 

@@ -1,0 +1,3 @@
+sxe -c ".dump /ma E:\projects\TMEMultiplayerClient\crash_joiner.dmp; .echo ===STACK===; kP 120; .echo ===REGS===; r; .echo ===FAULT===; u @eip L8; .echo ===CRASH_CAPTURED===; q" av
+sxe -c ".dump /ma E:\projects\TMEMultiplayerClient\crash_joiner.dmp; .echo ===STACK===; kP 120; .echo ===CRASH_CAPTURED===; q" 0xc0000374
+g
