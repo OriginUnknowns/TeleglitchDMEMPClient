@@ -145,9 +145,11 @@ typedef void* (__fastcall *BulletCtorFn)(void* self, void* edx,
 static BulletCtorFn orig_BulletCtor = nullptr;
 static int g_bullet_count = 0;
 
-// Bullet ring buffer for Lua to drain: each entry is (x, y, vx, vy).
+// Bullet ring buffer for Lua to drain: pos/vel + the engine's real per-shot
+// damage (ctor a5), force (a7) and bullet type (a6). This is the authoritative
+// per-weapon damage — no Lua-side GetEquippedItem guesswork.
 #define BULLET_RING_SIZE 128
-struct BulletEvt { float x, y, vx, vy; };
+struct BulletEvt { float x, y, vx, vy, dmg, force; int type; };
 static BulletEvt g_bullet_ring[BULLET_RING_SIZE] = {0};
 static volatile int g_bullet_write_idx = 0;
 static int g_bullet_read_idx = 0;
@@ -165,23 +167,28 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
     if (!g_bullet_capture) {
         return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
     }
-    union { int i; float f; } px, py, vx, vy;
-    px.i = a1; py.i = a2; vx.i = a3; vy.i = a4;
+    // a1-a4 = pos/vel float bits; a5 = damage (float, -> TBullet+0xB0),
+    // a6 = bullet type (int id), a7 = force (float, -> TBullet+0xB8).
+    union { int i; float f; } px, py, vx, vy, dmgf, forcef;
+    px.i = a1; py.i = a2; vx.i = a3; vy.i = a4; dmgf.i = a5; forcef.i = a7;
     int idx = g_bullet_write_idx % BULLET_RING_SIZE;
     g_bullet_ring[idx].x = px.f;
     g_bullet_ring[idx].y = py.f;
     g_bullet_ring[idx].vx = vx.f;
     g_bullet_ring[idx].vy = vy.f;
+    g_bullet_ring[idx].dmg = dmgf.f;
+    g_bullet_ring[idx].force = forcef.f;
+    g_bullet_ring[idx].type = a6;
     g_bullet_write_idx++;
     if (g_bullet_count <= 16 || (g_bullet_count % 50) == 0) {
-        host_log("hook_BulletCtor #%d: this=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f)",
-                 g_bullet_count, self, px.f, py.f, vx.f, vy.f);
+        host_log("hook_BulletCtor #%d: pos=(%.2f,%.2f) vel=(%.2f,%.2f) dmg=%.1f type=%d force=%.2f",
+                 g_bullet_count, px.f, py.f, vx.f, vy.f, dmgf.f, a6, forcef.f);
     }
     return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
-// Lua-callable: consume one bullet event. Returns nil if none, or 4 numbers
-// (x, y, vx, vy). Caller loops until nil.
+// Lua-callable: consume one bullet event. Returns nil if none, or 7 numbers
+// (x, y, vx, vy, damage, force, type). Caller loops until nil.
 typedef void (*LuaPushNumberFn)(lua_State*, double);
 static int l_consume_bullet(lua_State* L) {
     if (g_bullet_read_idx >= g_bullet_write_idx) {
@@ -199,7 +206,10 @@ static int l_consume_bullet(lua_State* L) {
     lua_pushnumber_p(L, e.y);
     lua_pushnumber_p(L, e.vx);
     lua_pushnumber_p(L, e.vy);
-    return 4;
+    lua_pushnumber_p(L, e.dmg);
+    lua_pushnumber_p(L, e.force);
+    lua_pushnumber_p(L, (double)e.type);
+    return 7;  // x, y, vx, vy, damage, force, type
 }
 
 // Central damage entry: TNewLiving::ApplyHit(attacker, ...). Located via

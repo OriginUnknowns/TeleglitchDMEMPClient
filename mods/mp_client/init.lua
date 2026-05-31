@@ -1492,7 +1492,10 @@ local function handle_bullet_fire(msg)
     local owner = player.GetPlayer()
     local cosmetic = not mp.is_host
     local bdmg = cosmetic and 0 or ((type(msg.dmg) == "number") and msg.dmg or 10)
-    local bforce = 2.0  -- knockback force; also bullet "range" via tick decay
+    -- Real force from the firing weapon (ctor a7); fall back to 2.0. Force also
+    -- drives knockback + bullet range (tick decay), so the replicated shot
+    -- behaves like the original weapon.
+    local bforce = (type(msg.force) == "number" and msg.force > 0) and msg.force or 2.0
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
         CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
@@ -2076,48 +2079,22 @@ local function dev_menu_tick()
     -- (so you SEE other players shooting). handle_bullet_fire decides real vs
     -- cosmetic per receiver.
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_bullet and mp.sock then
-        local item
-        local pl = player.GetPlayer()
-        if pl and pl.GetEquippedItem then
-            pcall(function() item = pl:GetEquippedItem() end)
-        end
-        -- The item userdata exposes methods but no Lua-visible stat fields.
-        -- Get its name then look up stats in the global itemtable (defined
-        -- by relvad.lua / ddeweapons.lua).
-        local iname = nil
-        if item and item.GetName then
-            pcall(function() iname = item:GetName() end)
-        end
-        if not _G.MP_LOGGED_ITEM_NAME then
-            _G.MP_LOGGED_ITEM_NAME = true
-            local msg = string.format("equipped probe: item=%s iname=%s itemtable=%s\n",
-                tostring(item), tostring(iname), tostring(_G.itemtable))
-            local f = io.open("mp_joiner_probe.txt", "w")
-            if f then f:write(msg); f:close() end
-            logf("equipped probe: item=%s iname=%s itemtable=%s",
-                tostring(item), tostring(iname), tostring(_G.itemtable))
-        end
-        local def = nil
-        if iname and _G.itemtable then def = _G.itemtable[iname] end
-        -- TEMP: weapon detection broken (GetName returns nil). Hardcode strong
-        -- damage so we can verify the bullet replication pipeline actually
-        -- kills mobs. Restore proper detection after confirming end-to-end.
-        def = def or { damage = 50, walldamage = 50, bulletspeed = 20, bullettype = 0 }
-        if def and not _G.MP_LOGGED_DEF then
-            _G.MP_LOGGED_DEF = true
-            logf("def found: damage=%s bulletspeed=%s bullettype=%s",
-                tostring(def.damage), tostring(def.bulletspeed), tostring(def.bullettype))
-        end
-        local bspeed = (def and type(def.bulletspeed) == "number") and def.bulletspeed or 15
-        local btype  = (def and type(def.bullettype)  == "number") and def.bullettype  or 0
-        local bdmg   = (def and type(def.damage)      == "number") and def.damage      or 10
-        local bwall  = (def and type(def.walldamage)  == "number") and def.walldamage  or 10
+        -- Real per-shot stats come straight from the engine's TBullet ctor
+        -- (captured natively): damage (a5), force (a7), bullet type (a6). Speed
+        -- and angle are recovered from the real velocity. No GetEquippedItem/
+        -- itemtable lookup (GetName returned nil — removed).
         for _ = 1, 16 do
-            local x, y, vx, vy = _G.MP_NATIVE.consume_bullet()
+            local x, y, vx, vy, dmg, force, btype = _G.MP_NATIVE.consume_bullet()
             if not x then break end
             local angle = math.atan2(vy, vx)
-            send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = bspeed,
-                       btype = btype, dmg = bdmg, walldmg = bwall })
+            local speed = math.sqrt(vx * vx + vy * vy)
+            if not _G.MP_LOGGED_BSTATS then
+                _G.MP_LOGGED_BSTATS = true
+                logf("bullet stats (from ctor): dmg=%s force=%s type=%s speed=%.2f",
+                    tostring(dmg), tostring(force), tostring(btype), speed)
+            end
+            send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = speed,
+                       dmg = dmg or 10, force = force, btype = btype or 0 })
         end
     end
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
