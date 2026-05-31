@@ -1,57 +1,79 @@
 # Known Issues
 
-## 🔴 Intermittent joiner heap-corruption crash (UNRESOLVED — deferred 2026-05-30)
+## 🔴 Intermittent heap-corruption crash — NARROWED to the native bridge (2026-05-30)
 
-**Symptom:** The JOINER crashes intermittently — roughly *every other* join/start.
-Sometimes mid-`apply_item_list` (~4 s after join), sometimes a few seconds after
-picking up items. The host is unaffected. Manifests as a hard process death
-(TCP `ECONNRESET` at the relay), no Lua error (so it's a native crash, not a
-caught Lua exception).
+**Symptom:** Joiner crashes intermittently (~every other join, and at startup under
+page heap). Heap corruption; without page heap it surfaces late as
+`MSVCR110!realloc -> lua52!luaL_gsub` (a Lua string/table realloc tripping over
+already-corrupted heap metadata).
 
-**Nature:** Heap corruption. WinDbg victim stack (prior sessions) bottoms out in
-`MSVCR110!realloc -> lua52!luaL_gsub -> lua_pcallk` — i.e. a later allocation
-trips over already-corrupted heap metadata. The real out-of-bounds write / UAF
-happened *earlier* and elsewhere. Lua is memory-safe, so the corruptor is a Lua
-call into an engine C-binding with bad args (OOB write / double-free / UAF on a
-freed-and-recycled pointer). Reproduces with all native dllhost hooks disabled,
-so it is NOT in version.dll.
+### MAJOR PROGRESS this session — bisected with FULL page heap
+1. **Why prior page-heap attempts "couldn't find it":** they used **light** page
+   heap (or it was never actually elevated). The crash dumps show
+   `RtlpValidateHeapEntry`/`RtlDebugReAllocateHeap` (validate-at-realloc =
+   light/standard), never a full guard-page fault. **Full page heap needs an
+   ELEVATED reg import** — the HKLM IFEO key fails silently from a non-admin shell.
+2. **Full page heap DOES work** (verified `!gflag` shows `hpa`). With
+   `GlobalFlag=0x02000000, PageHeapFlags=0x3` (elevated) the crash is
+   **deterministic at startup**. The engine allocates every object via the
+   MSVCR110 CRT heap (no custom pool), so page heap can see it.
+3. **The corruptor is in OUR MOD, not the base game.** Base game (mod disabled)
+   runs clean under page heap; mod enabled crashes.
+4. **It's the NATIVE BRIDGE (`version.dll`), not the Lua code.** Pure-Lua mod
+   (native bridge disabled via `package.loadlib` -> nil) runs clean under page
+   heap; loading the bridge crashes.
+5. **Within the bridge it's `luaopen_mp_native`'s load-time work** — bisect:
+   bridge-loaded-but-no-hooks-installed STILL crashes (intermittently), so it's
+   `luaopen` itself (`lua_resolve_api` [clean] + `MH_Initialize` + the 18-entry
+   Lua-C-API table build). Installing the MinHook hooks makes it **deterministic**
+   (so MinHook aggravates / is likely the core).
+6. **The corrupted block:** ~400 bytes (0x190) of NaN-boxed Lua TValues (lua52
+   uses NaN-boxing, `7ff7a5xx` tags) — a Lua table array-part or stack — with a
+   "corrupted start stamp" (`abcdbbbb`), i.e. a use-after-free/double-op or a
+   buffer underrun. On the MSVCR110 heap.
+7. **`ust` (GlobalFlag 0x02001000) MASKS it** -> layout-sensitive overrun (a
+   Heisenbug). Use **plain** `0x02000000` to reproduce.
 
-### What has been tried (don't just repeat these)
-- **`safe_delete()` liveness-gating** (commit af3eff7, 2026-05-30): gated every
-  stale-handle `:Delete()` (item pickup, leave, disconnect, apply orphan loop)
-  behind a fresh world-scan pointer check. Hardens real UAF/double-free hazards
-  but did NOT eliminate the crash — kept as defense-in-depth.
-- **Full PageHeap + cdb**: the textbook tool, but attempted repeatedly across
-  sessions without landing a root cause. Blockers seen: (a) the IFEO reg key is
-  HKLM = needs an ELEVATED shell (a non-admin `reg import` fails with "Error
-  accessing the registry"); (b) the crash is intermittent, so a single run often
-  doesn't trip it. PageHeap is still the most likely to *finally* pin it IF run
-  elevated AND the joiner then loots until it faults (PageHeap makes the bad
-  write fault deterministically at its exact instruction).
-- **Plain cdb (no PageHeap)**: only yields the victim stack (realloc/luaL_gsub),
-  not the cause.
+### Root cause (static + dump forensics, 2026-05-30, ~0.6 confidence)
+Dump forensics (`!heap -s` = `HEAP_FAILURE_BUFFER_OVERRUN` on the MSVCR110 heap;
+the smashed header is overwritten by a Lua value+tag `…7ff7a546`; faulting stack
+is entirely `lua52`/`MSVCR110`/`ntdll` with **no version.dll/MinHook/UCRT frames**)
+show the writer is **lua52 itself**, over-writing a TValue past an array end — NOT
+a foreign cross-heap stomp from our DLL. The **trigger** is in `luaopen_mp_native`:
+`createtable(L,0,4)` then **18** `setfield`s → lua52 reallocs the table array
+repeatedly mid-population; under full page heap those guard-paged grows turn
+lua52's normally-harmless trailing write into a hard fault. **MinHook makes it
+deterministic** only by perturbing heap layout (not the writer). Caveat: the dump
+caught the later *free* that detects the corruption, not the write itself, so the
+exact site is inferred (hence 0.6).
 
-### Recommended next approaches (cheapest first)
-1. **Lua flushed per-op tracer (no admin):** add `mp.log_file:flush()` after each
-   `logf`, or a dedicated trace point with flush, around the hot suspects
-   (apply_item_list adopt/create/orphan, handle_item_picked, diff_inventory /
-   diff_ammo, handle_mob_snapshot spawn, handle_snapshot puppet SetPosition).
-   Crash a handful of times; the common LAST flushed op localizes the culprit.
-   Works *with* the intermittent + delayed nature where victim-stacks fail.
-2. **Subsystem bisect across runs:** toggle off one subsystem per run and see
-   which removal stops the crash. `_G.MP_BISECT_PUPPET_MOVE=false` already gates
-   mob-puppet SetPosition; add similar flags for item-sync apply, player-puppet
-   SetPosition, and the bullet/native drain.
-3. **Top unaddressed static suspect — recycle race on per-frame SETTERS:** the
-   alive cache (`refresh_alive_cache`) is a pointer-STRING set; it cannot tell
-   "ptr X still alive" from "X freed, new object recycled to X". So
-   `handle_snapshot` SetPosition (player puppet), mob-puppet move, and melee
-   SetHealth can dispatch on a recycled/type-confused entity → silent scribble.
-   Fix = identity-token cache: store the entity's `mp_*` SetName in the cache and
-   verify it before any setter (deferred during the 2026-05-30 work).
-4. **Elevated PageHeap** (only if 1–3 don't converge): from an Admin shell
-   `reg import enable_pageheap.reg`, relaunch the joiner under cdb, loot until it
-   faults. Revert with `reg import disable_pageheap.reg`. Game will be slow.
+### Fix ladder (apply cheapest first, test each under PLAIN page heap 5+ runs)
+1. **APPLIED (2026-05-30):** `createtable(L,0,4)` → `createtable(L,0,18)` in
+   main.cpp luaopen_mp_native — sizes the table once, no mid-build reallocs.
+   Near-zero risk, correct regardless. **Needs verification under page heap.**
+2. If still reproducing: move `MH_Initialize()` (and ideally the hook installs) out
+   of `luaopen` into `DllMain`/`load_native_mods` so MinHook's heap/VirtualAlloc
+   churn doesn't interleave with lua52's table realloc.
+3. If still: reduce version.dll's load-time UCRT-heap footprint (host_log `fopen`
+   FILE buffer; `std::set<void*> g_hooked_addrs`) — or rebuild version.dll
+   freestanding (kernel32-only I/O via WriteFile, no `<stdio.h>`/`<set>`/UCRT) so
+   it shares NO heap surface with lua52. (Heaviest; last resort.)
+4. Harness: `cdb_pageheap.txt` now also catches `0xc0000409` (the verifier abort/
+   fastfail) so the next reproduction actually saves `crash_ph.dmp`.
 
-See `~/.claude/.../memory/teleglitch-engine-internals.md` ("Heap corruptor ROOT
-CAUSE + fix") for the offset-level detail.
+### Tooling built this session (reusable)
+- `pageheap_capture.ps1` — self-elevating: enables full page heap, launches the
+  joiner under cdb with `cdb_pageheap.txt`, captures the fault, **always disables
+  page heap again** (try/finally). Run: `powershell -ExecutionPolicy Bypass -File
+  pageheap_capture.ps1` (UAC).
+- `cdb_pageheap.txt` — cdb script (verifier-stop capture or sxe av/heap-corruption).
+- A Lua 5.2.2 `luac` for syntax-checking (rebuild from server-repo lua-5.2.2 src
+  via WinLibs gcc).
+- Bisect method: edit deployed `init.lua` to toggle (native bridge / individual
+  hooks / `MH_Initialize`), run plain page heap, observe crash-vs-menu. Because
+  it's intermittent, run each "clean" candidate 4-5+ times.
+
+### Earlier (superseded) work
+- `safe_delete()` liveness-gating (commit af3eff7) hardened real UAF/double-free
+  hazards in the Lua item/puppet Delete paths — kept as defense-in-depth, but it
+  was NOT this corruptor (this is native-bridge-side).

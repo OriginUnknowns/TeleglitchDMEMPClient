@@ -776,8 +776,12 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // Initialize MinHook once; safe to call multiple times.
     MH_Initialize();
 
-    // Build a table: { hello = fn, log = fn, install_bullet_hook = fn }
-    api.createtable(L, 0, 4);
+    // Build a table of native functions. Size the hash part for the EXACT field
+    // count (18) up front: an under-sized hint (was 0,4) makes lua52 luaH_resize/
+    // realloc the table's array repeatedly mid-population, and under full page heap
+    // those guard-paged grows turn lua52's trailing TValue write into a hard fault
+    // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
+    api.createtable(L, 0, 18);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);

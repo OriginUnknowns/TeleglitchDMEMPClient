@@ -1,0 +1,7 @@
+.echo ===GFLAG (hpa = page heap ON)===
+!gflag
+.echo ===RUNNING: a 'VERIFIER STOP' / 'CRASHED' line below = it crashed; reaching the menu with none = CLEAN (close the game).===
+sxe -c ".echo ===CRASHED-AV===; r; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" av
+sxe -c ".echo ===CRASHED-HC===; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" 0xc0000374
+sxe -c ".echo ===CRASHED-FASTFAIL===; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" 0xc0000409
+g

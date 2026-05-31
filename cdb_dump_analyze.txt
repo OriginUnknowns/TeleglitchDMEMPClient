@@ -1,0 +1,13 @@
+.echo ===HEAP-P-A (block alloc/free history)===
+!heap -p -a 41a22e70
+.echo ===BLOCK-HEADER-BYTES===
+dd 41a22e40 L48
+.echo ===ENGINE-CALLER-OF-lua_resume (Debug_miks+0x15390)===
+u Debug_miks+0x15370 L20
+.echo ===ENGINE-CALLER-2 (Debug_miks+0x1524a)===
+u Debug_miks+0x15230 L18
+.echo ===MODULES===
+lmv m Debug_miks
+lmv m version
+.echo ===DONE===
+q
