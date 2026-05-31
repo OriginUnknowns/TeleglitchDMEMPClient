@@ -1447,16 +1447,21 @@ local function handle_mob_damage(msg)
     if not mp.is_host or type(msg.id) ~= "number" or type(msg.dmg) ~= "number" then return end
     for ptr, info in pairs(mp.host_mobs) do
         if info.id == msg.id and info.obj then
+            -- Liveness gate: this path now drives joiner melee, so guard the
+            -- GetHealth/SetHealth — calling them on a freed mob is an
+            -- uncatchable native abort.
+            if not entity_alive(info.obj) then return end
             local h
             pcall(function() if info.obj.GetHealth then h = info.obj:GetHealth() end end)
             if h then
                 local new_h = h - msg.dmg
                 pcall(function() info.obj:SetHealth(new_h, 1) end)
-                logf("mob_damage RX id=%d dmg=%d %d->%d", msg.id, msg.dmg, h, new_h)
+                logf("mob_damage RX id=%d dmg=%s hp %.0f->%.0f", msg.id, tostring(msg.dmg), h, new_h)
             end
             return
         end
     end
+    logf("mob_damage RX id=%s: not in host_mobs (dead/untracked?)", tostring(msg.id))
 end
 
 -- Host receives a bullet_fire event from a joiner. Re-create the bullet
@@ -1506,9 +1511,9 @@ end
 -- A remote player stabbed. Only the host is authoritative for mobs, so the
 -- host finds mobs within knife reach and frontal arc of the attacker and
 -- applies melee damage + lets the knockback system react (visible feedback).
-local MELEE_RANGE = 2.2      -- knife reach (world units)
+local MELEE_RANGE = 2.6      -- knife reach (world units; a touch generous)
 local MELEE_ARC_DOT = 0.5    -- cos of half-arc (~±60° in front)
-local MELEE_DAMAGE = 35      -- knife damage (approx; refine later)
+local MELEE_DAMAGE = 35      -- base knife damage (engine value is native; tune here)
 local function handle_melee(msg)
     if not mp.is_host then return end
     if type(msg.x) ~= "number" or type(msg.y) ~= "number" or type(msg.angle) ~= "number" then return end
@@ -1807,13 +1812,51 @@ local function net_tick_loop()
                     if _G.MP_NATIVE and _G.MP_NATIVE.get_action and pl.pointer then
                         pcall(function() act = _G.MP_NATIVE.get_action(pl.pointer) end)
                     end
-                    -- Melee detection via the body frame. The knife stab swing
-                    -- animates frames 27..29 (idle=0, pystol shoot=5/6). When we
-                    -- enter that range we fire a one-shot "melee" event so the
-                    -- host can apply knife damage to nearby mobs (like bullets).
+                    -- Melee detection via the body frame (knife stab = frames
+                    -- 27..29). JOINER-AUTHORITATIVE: when WE stab, pick the mob
+                    -- PUPPET we're hitting (the one we can see) and tell the host
+                    -- to damage that exact mob by id over the mob_damage channel.
+                    -- Trusting the joiner's own pick is far more reliable than the
+                    -- host re-deriving the hit from a lagged position. Only the
+                    -- joiner has mob_puppets, so this no-ops on the host (whose own
+                    -- stabs the local engine already applies).
                     local is_stab = f and f >= 26.5 and f <= 30.5
-                    if is_stab and not _G.MP_WAS_STABBING then
-                        send_msg({ type = "melee", x = x, y = y, angle = a })
+                    if is_stab and not _G.MP_WAS_STABBING and not mp.is_host then
+                        local cdx, cdy = math.cos(a), math.sin(a)
+                        local best_id, best_entry, best_d = nil, nil, math.huge
+                        refresh_alive_cache()
+                        for id, entry in pairs(mp.mob_puppets) do
+                            if type(entry) == "table" and entry.obj and entry.obj.pointer
+                               and entity_alive(entry.obj) then
+                                local mx, my
+                                pcall(function() mx, my = entry.obj:GetPosition() end)
+                                if mx and my then
+                                    local rx, ry = mx - x, my - y
+                                    local dist = math.sqrt(rx * rx + ry * ry)
+                                    if dist <= MELEE_RANGE then
+                                        local ndot = (dist > 0.01) and ((rx * cdx + ry * cdy) / dist) or 1.0
+                                        if ndot >= MELEE_ARC_DOT and dist < best_d then
+                                            best_d, best_id, best_entry = dist, id, entry
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                        if best_id then
+                            -- Armored/robotic mobs resist the knife (knifedamagemult
+                            -- in monsterstats, e.g. 0.2). Compute final damage here
+                            -- (the host trusts whatever the joiner reports).
+                            local mult = 1.0
+                            local ms = _G.monsterstats
+                            if ms and best_entry.type and ms[best_entry.type]
+                               and type(ms[best_entry.type].knifedamagemult) == "number" then
+                                mult = ms[best_entry.type].knifedamagemult
+                            end
+                            local dmg = math.floor(MELEE_DAMAGE * mult + 0.5)
+                            send_msg({ type = "mob_damage", id = best_id, dmg = dmg })
+                            logf("stab -> mob_damage id=%d dmg=%d type=%s dist=%.2f",
+                                best_id, dmg, tostring(best_entry.type), best_d)
+                        end
                     end
                     _G.MP_WAS_STABBING = is_stab
                     send_msg({ type = "state", x = x, y = y, angle = a, hp = hp, f = f, act = act })
