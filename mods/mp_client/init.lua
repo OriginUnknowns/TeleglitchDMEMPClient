@@ -393,35 +393,41 @@ local function send_msg(msg)
     if not mp.sock then return end
     local body = json.encode(msg)
     local frame = pack_u32_be(#body) .. body
-    -- Non-blocking socket: when the kernel buffer fills, send() returns
-    -- nil + "timeout" + count_of_bytes_actually_sent. The old single-shot
-    -- send() ignored partial sends → tail bytes were dropped → receiver
-    -- desynced (read JSON content as the next frame's length prefix) →
-    -- "oversize frame 842214434 — bailing". Now we loop until all bytes
-    -- are out OR we get a real error. small yield between attempts so
-    -- the kernel can drain.
+    -- Non-blocking socket: partial sends require a loop. Critical guard:
+    -- bound the loop iterations + abort on no-progress, otherwise a
+    -- persistently-full kernel buffer (engine not pumping reads) hangs
+    -- the whole game in this loop ("not responding"). On hang, abort
+    -- the send and disconnect — better than locking the game forever.
     local sent = 0
     local total = #frame
-    while sent < total do
+    local max_iters = 100
+    local last_sent = -1
+    local stuck = 0
+    for i = 1, max_iters do
+        if sent >= total then return end
         local ok, err, partial = mp.sock:send(frame, sent + 1)
-        local n = ok or partial or 0
-        sent = n  -- LuaSocket returns last-byte-index sent
+        sent = ok or partial or sent
         if not ok then
             if err == "timeout" then
-                -- Buffer full. Yield a tick if we're in a coroutine,
-                -- otherwise just retry tight (rare on small msgs).
-                if coroutine.isyieldable and coroutine.isyieldable() then
-                    pcall(coroutine.yield)
+                if sent == last_sent then
+                    stuck = stuck + 1
+                    if stuck >= 5 then
+                        logf("send STUCK at %d/%d — disconnecting", sent, total)
+                        mp.sock:close(); mp.sock = nil; return
+                    end
+                else
+                    stuck = 0
+                    last_sent = sent
                 end
             else
                 logf("send error: %s sent=%d/%d — disconnecting",
                     tostring(err), sent, total)
-                mp.sock:close()
-                mp.sock = nil
-                return
+                mp.sock:close(); mp.sock = nil; return
             end
         end
     end
+    logf("send hit max_iters at %d/%d — disconnecting", sent, total)
+    mp.sock:close(); mp.sock = nil
 end
 
 local function try_recv_msg()
@@ -1580,9 +1586,16 @@ end
 -- engines tick down together and explode at the same world location.
 local function handle_bomb_activated(msg)
     if not (msg and msg.btype) then return end
+    -- Set in_giveitem so track_item_host/joiner_pre skip this CreateItem
+    -- — otherwise on HOST the wrap broadcasts item_spawned, joiner gets it,
+    -- joiner CreateItems ANOTHER bomb. End result: 2 bombs per activation
+    -- (the real one from local engine + the echo from host's re-broadcast).
     -- Use CreateItem (the right dispatch for itype=explosive → _CreateBomb).
+    local prev_in_give = in_giveitem
+    in_giveitem = true
     local obj
     pcall(function() obj = CreateItem(msg.x or 0, msg.y or 0, msg.btype) end)
+    in_giveitem = prev_in_give
     if not (obj and obj.pointer) then
         logf("bomb_activated: CreateItem failed type=%s", tostring(msg.btype))
         return
@@ -1594,6 +1607,10 @@ local function handle_bomb_activated(msg)
     local vx = math.cos(msg.angle or 0) * ts
     local vy = math.sin(msg.angle or 0) * ts
     local fuse = msg.fuse or (def and def.delay) or 25
+    -- activate_bomb (calling engine orig) crashed at NULL+12 because the
+    -- engine activate expects an inventory back-ptr (+0x98) that a
+    -- CreateItem'd bomb doesn't have. Stick with arm_bomb (manual fuse
+    -- poke). Bombs may not tick properly without more state — TBD.
     if _G.MP_NATIVE and _G.MP_NATIVE.arm_bomb then
         pcall(function() _G.MP_NATIVE.arm_bomb(obj.pointer, fuse, vx, vy) end)
     end

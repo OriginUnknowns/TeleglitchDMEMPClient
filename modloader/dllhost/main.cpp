@@ -192,6 +192,22 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
 }
 
 static void* resolve_entity(lua_State* L, int idx);  // fwd decl — body lives below
+
+// Defensive hook on FUN_0042b2d0 — a 2-instruction helper called from a Lua
+// script-table dispatcher. It writes to DAT_005747a4+0xFD/+0x30, but if
+// main_p is NULL (e.g. during a level reset or transition window) the
+// write AVs. Bail when main_p is NULL — engine continues, no NULL deref.
+typedef void (*VoidFn0)(void);
+static VoidFn0 orig_RenderGateSet = nullptr;
+static void hook_RenderGateSet() {
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    void* main_p = *(void**)(base + 0x1747a4);
+    if (!main_p) {
+        host_log("FUN_0042b2d0: main_p=NULL — bailing");
+        return;
+    }
+    orig_RenderGateSet();
+}
 typedef void (*LuaPushNumberFn)(lua_State*, double);
 // ---- Bomb activation hook (TTimeBomb::Activate @ 0x00470aa0) ----
 // Captures bomb-activation events (left-click on explosive items) so Lua can
@@ -210,12 +226,15 @@ static int g_bomb_read_idx = 0;
 typedef int (__thiscall *BombActivateFn)(void* self);
 static BombActivateFn orig_BombActivate = nullptr;
 
-// Mute counter — arm_bomb sets this to N, and the next N hook fires are
-// suppressed. Prevents the host↔joiner feedback loop: when peer receives
-// bomb_activated and calls arm_bomb, the engine's tick detects the newly
-// armed bomb and calls FUN_00470aa0 → our hook fires → we'd broadcast
-// AGAIN. Without this guard each peer activation echoes infinitely.
-static int g_bomb_mute_count = 0;
+// Time-window mute — arm_bomb stamps a deadline; the hook bails for any
+// fire within ~200 ms after arm. The previous "fixed-count" mute (2 hook
+// fires) was buggy: after joiner armed a host bomb, the next 2 hook
+// fires were muted — but if the joiner's NEXT real activation happened
+// before the engine's echo fired both mutes, the real activation got
+// muted instead → joiner's bomb didn't reach host. A short time window
+// catches the immediate echo without trapping later real activations.
+static DWORD g_bomb_mute_until = 0;
+#define BOMB_MUTE_WINDOW_MS 200
 
 // Ultra-safe bomb activation capture. Read ONLY from self (the bomb actor):
 // the type name (inline at +0x14) and the delay (+0x100). Skip any pointer-
@@ -224,11 +243,12 @@ static int g_bomb_mute_count = 0;
 // player at the moment of inv decrease — far more reliable than reading
 // any cached/uninitialized fields here.
 static int __fastcall hook_BombActivate(void* self, void* /*edx*/) {
-    if (g_bomb_mute_count > 0) {
-        g_bomb_mute_count--;
-        host_log("hook_BombActivate: MUTED (mute_count now %d)", g_bomb_mute_count);
+    DWORD now = GetTickCount();
+    if (g_bomb_mute_until && now < g_bomb_mute_until) {
+        host_log("hook_BombActivate: MUTED (window %lu ms left)", g_bomb_mute_until - now);
         return orig_BombActivate(self);
     }
+    g_bomb_mute_until = 0;
     const char* type_ptr = (const char*)((char*)self + 0x14);
     int delay = *(int*)((char*)self + 0x100);
     int idx = g_bomb_write_idx % BOMB_RING_SIZE;
@@ -284,6 +304,22 @@ static int l_validate_vtable(lua_State* L) {
     return 1;
 }
 
+// activate_bomb(ptr) — call the engine's REAL bomb activation function on a
+// just-CreateItem'd bomb. Unlike arm_bomb (which just pokes +0xfc), this
+// runs the full TTimeBomb::Activate path: fuse arm + velocity + any other
+// state setup the engine needs. The mute counter prevents our hook from
+// echoing this synthetic activation back as a network broadcast.
+static int l_activate_bomb(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushboolean(L, 0); return 1; }
+    if (!orig_BombActivate) { api.pushboolean(L, 0); return 1; }
+    g_bomb_mute_until = GetTickCount() + BOMB_MUTE_WINDOW_MS;
+    int r = orig_BombActivate(e);
+    host_log("activate_bomb: invoked engine activate, ret=%d", r);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 // Read a bomb's fuse field (+0xfc). Returns -1 if inert, positive count if armed.
 // Used by Lua-side bomb activation detection to distinguish dropped (inert)
 // bombs from activated (armed) bombs after an inventory decrease.
@@ -313,11 +349,23 @@ static int l_arm_bomb(lua_State* L) {
     int fuse = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 25;
     float vx = lua_tonumber_p ? (float)lua_tonumber_p(L, 3, nullptr) : 0.0f;
     float vy = lua_tonumber_p ? (float)lua_tonumber_p(L, 4, nullptr) : 0.0f;
+    // STRICT vtable check: must be a TTimeBomb (vftable RVA 0x157274). If
+    // the pointer was recycled into another actor class, writing +0xfc
+    // could corrupt that other class's fields → heap corruption surfaces
+    // seconds later in ntdll's heap walk.
+    if (IsBadReadPtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    DWORD_PTR vt = *(DWORD_PTR*)e;
+    DWORD_PTR expected = (DWORD_PTR)GetModuleHandleA(NULL) + 0x157274;
+    if (vt != expected) {
+        host_log("arm_bomb: REJECT — vt=%p expected TTimeBomb=%p", (void*)vt, (void*)expected);
+        api.pushboolean(L, 0); return 1;
+    }
     *(int*)((char*)e + 0xfc) = fuse;
-    // Mute the next hook fire — the engine's tick will see the newly armed
-    // bomb and call FUN_00470aa0 again. Without muting we'd broadcast a
-    // spurious echo. 1 fire is enough but we use 2 for slack.
-    g_bomb_mute_count = 2;
+    // Start a short time-window mute. Any hook fire within the next
+    // BOMB_MUTE_WINDOW_MS is treated as the engine's echo of our arm
+    // and gets suppressed. After the window expires, real user
+    // activations broadcast normally.
+    g_bomb_mute_until = GetTickCount() + BOMB_MUTE_WINDOW_MS;
     // NOTE: NOT writing body velocity. The +0x40 offset for b2Body
     // m_linearVelocity was a guess and likely caused heap corruption
     // (crash inside ntdll's heap check). For now the bomb just sits
@@ -490,6 +538,12 @@ static int l_install_hook_bullet(lua_State* L) {
     MH_STATUS bs = MH_CreateHook(bomb, (LPVOID)&hook_BombActivate, (LPVOID*)&orig_BombActivate);
     if (bs == MH_OK) bs = MH_EnableHook(bomb);
     host_log("bomb activate hook: status=%d", bs);
+
+    // Render-gate setter — NULL-deref guard.
+    BYTE* rgs = (BYTE*)m + 0x2b2d0;   // FUN_0042b2d0 RVA
+    MH_STATUS rs = MH_CreateHook(rgs, (LPVOID)&hook_RenderGateSet, (LPVOID*)&orig_RenderGateSet);
+    if (rs == MH_OK) rs = MH_EnableHook(rgs);
+    host_log("render-gate hook: status=%d", rs);
 
     api.pushboolean(L, s == MH_OK ? 1 : 0);
     return 1;
@@ -1784,7 +1838,7 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // realloc the table's array repeatedly mid-population, and under full page heap
     // those guard-paged grows turn lua52's trailing TValue write into a hard fault
     // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
-    api.createtable(L, 0, 32);
+    api.createtable(L, 0, 33);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
@@ -1829,6 +1883,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "consume_bomb");
     api.pushcclosure(L, l_arm_bomb, 0);
     api.setfield(L, -2, "arm_bomb");
+    api.pushcclosure(L, l_activate_bomb, 0);
+    api.setfield(L, -2, "activate_bomb");
     api.pushcclosure(L, l_read_fuse, 0);
     api.setfield(L, -2, "read_fuse");
     api.pushcclosure(L, l_validate_vtable, 0);
