@@ -382,11 +382,34 @@ local function send_msg(msg)
     if not mp.sock then return end
     local body = json.encode(msg)
     local frame = pack_u32_be(#body) .. body
-    local ok, err = mp.sock:send(frame)
-    if not ok then
-        logf("send error: %s — disconnecting", tostring(err))
-        mp.sock:close()
-        mp.sock = nil
+    -- Non-blocking socket: when the kernel buffer fills, send() returns
+    -- nil + "timeout" + count_of_bytes_actually_sent. The old single-shot
+    -- send() ignored partial sends → tail bytes were dropped → receiver
+    -- desynced (read JSON content as the next frame's length prefix) →
+    -- "oversize frame 842214434 — bailing". Now we loop until all bytes
+    -- are out OR we get a real error. small yield between attempts so
+    -- the kernel can drain.
+    local sent = 0
+    local total = #frame
+    while sent < total do
+        local ok, err, partial = mp.sock:send(frame, sent + 1)
+        local n = ok or partial or 0
+        sent = n  -- LuaSocket returns last-byte-index sent
+        if not ok then
+            if err == "timeout" then
+                -- Buffer full. Yield a tick if we're in a coroutine,
+                -- otherwise just retry tight (rare on small msgs).
+                if coroutine.isyieldable and coroutine.isyieldable() then
+                    pcall(coroutine.yield)
+                end
+            else
+                logf("send error: %s sent=%d/%d — disconnecting",
+                    tostring(err), sent, total)
+                mp.sock:close()
+                mp.sock = nil
+                return
+            end
+        end
     end
 end
 
@@ -1236,12 +1259,46 @@ local function handle_snapshot(msg)
                         if p.hp then entry.hp = p.hp end
                         goto continue_puppet
                     end
-                    if entry.is_tplayer then logf("[PUP] pre-SetPos ptr=%s", tostring(entry.obj.pointer)) end
+                    -- SetPosition every snapshot. The deadzone we tried
+                    -- caused puppet-side physics drift (when we stopped
+                    -- SetPosition'ing during idle, residual engine velocity
+                    -- kept moving the puppet). Better to keep the puppet
+                    -- glued to authoritative pos and handle walk/idle anim
+                    -- via the action field.
                     pcall(function() entry.obj:SetPosition(p.x, p.y) end)
-                    if entry.is_tplayer then logf("[PUP] post-SetPos") end
                     if p.angle then
                         pcall(function() entry.obj:SetAngle(p.angle) end)
-                        if entry.is_tplayer then logf("[PUP] post-SetAngle") end
+                        -- Pin angle natively so the engine's case-1 walk
+                        -- handler doesn't reset +0xB0 to a velocity-derived
+                        -- value (which is 0 because dummy input). Without
+                        -- this, the puppet snaps to last-set angle every
+                        -- ~33 ms but otherwise faces angle 0.
+                        if entry.is_tplayer and _G.MP_NATIVE and _G.MP_NATIVE.pin_angle then
+                            -- Pass position too — the puppet's +0x1B8/+0x1BC
+                            -- cache can be stale if aliveUpdate hasn't run,
+                            -- and the dummy-device aim target needs an
+                            -- accurate origin to produce the right angle.
+                            pcall(function() _G.MP_NATIVE.pin_angle(entry.obj.pointer, p.angle, p.x, p.y) end)
+                        end
+                    end
+                    -- Mirror the exact body sprite frame too — action sync
+                    -- alone leaves attack frames (stab 27..29, shoot 6,
+                    -- aim 5) partially driven because the engine ramps
+                    -- through them in response to mouse-input events the
+                    -- puppet never receives. Writing the raw frame value
+                    -- forces the matching pose.
+                    if entry.is_tplayer and p.f and entry.obj.pointer
+                       and _G.MP_NATIVE and _G.MP_NATIVE.set_frame
+                       and entity_alive(entry.obj) then
+                        -- Only mirror "meaningful" frames — weapon hold (5),
+                        -- shoot (6), and stab swing (27..29.5). Below 5 is
+                        -- idle (0) / walk cycle (1..4) where the puppet's own
+                        -- engine think drives the anim smoothly. Mirroring
+                        -- those at 30 Hz against local 60 Hz interpolation
+                        -- gives sub-frame jitter visible at idle.
+                        if p.f >= 5 then
+                            pcall(function() _G.MP_NATIVE.set_frame(entry.obj.pointer, p.f) end)
+                        end
                     end
                     -- Drive the puppet's ANIMATION by mirroring the remote
                     -- player's action id onto its +0xB4 field (the engine's own
@@ -1274,13 +1331,16 @@ local function handle_snapshot(msg)
                     -- "crash ~Ns into play" we saw on the first MP_USE_TPLAYER=true
                     -- flight (2026-06-01). Restore shoot/aim once the puppet has
                     -- a real weapon and we trust the render path.
-                    -- Path A v3 (2026-06-01): set_action DISABLED entirely on
-                    -- TPlayer puppets. v1 (no filter) crashed ~4s in; v2 (filter
-                    -- + give pystol) froze on preamble dismiss. Hypothesis is
-                    -- one of those interventions perturbs an engine state that
-                    -- only manifests once the level is fully running. Keep the
-                    -- puppet a pure position-receiver until v3 is proven stable.
-                    -- if entry.is_tplayer and p.act ... DISABLED
+                    -- Mirror remote's action including idle/walk. Skipping
+                    -- 0/1 left puppets stuck in stale anim after the local
+                    -- transitioned. Engine on the puppet doesn't derive
+                    -- action from position because dummy input drives no
+                    -- velocity → it must be told explicitly.
+                    if entry.is_tplayer and p.act and entry.obj.pointer
+                       and _G.MP_NATIVE and _G.MP_NATIVE.set_action
+                       and entity_alive(entry.obj) then
+                        pcall(function() _G.MP_NATIVE.set_action(entry.obj.pointer, p.act) end)
+                    end
                     entry.last_x = p.x
                     entry.last_y = p.y
                     if p.hp then entry.hp = p.hp end
@@ -2097,6 +2157,14 @@ local function net_tick_loop()
                 local pl = player.GetPlayer()
                 if pl then
                     local x, y = pl:GetPosition()
+                    -- Use the engine's committed body angle (+0xB0). During
+                    -- stab/aim the engine locks +0xB0 to the attack
+                    -- direction it captured when the attack started — that
+                    -- IS the angle the local body renders at, so the
+                    -- puppet should match it. Mouse-derived angles drift
+                    -- away from the locked attack direction (user-visible
+                    -- mismatch). Outside attack states +0xB0 still tracks
+                    -- mouse via the engine's normal case-1/case-8 logic.
                     local a = pl:GetAngle()
                     local hp = pl:GetHealth()
                     -- Sync the player's animation frame. GetFrame() returns the

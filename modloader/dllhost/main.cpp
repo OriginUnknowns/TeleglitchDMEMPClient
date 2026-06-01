@@ -811,12 +811,25 @@ static int l_set_main_player(lua_State* L) {
 static BYTE* g_base = nullptr;
 static inline BYTE* mod_base() { if (!g_base) g_base = (BYTE*)GetModuleHandleA(NULL); return g_base; }
 
-// Zeroed dummy input device: a fake object whose [0] is a vtable of no-op stubs.
+// Per-puppet aim target — set by hook_PThink1 before orig runs, read by the
+// dummy input device's mouse-pos getters. Without this the dev_pointN slots
+// always returned 0,0 → engine's case-7/8 (shoot/aim) and the stab overlay
+// rendered toward (0,0) from the puppet's position → fixed "upper-right"
+// aim no matter what angle we pinned via +0xB0. By making the dummy device
+// answer "mouse is at (puppet_pos + dir-at-pinned-angle)" we feed the engine
+// the same mouse-cursor input the LOCAL player has, so the engine writes
+// +0xB0 correctly AND the overlay aims correctly.
+static float g_puppet_aim_x = 0.0f;
+static float g_puppet_aim_y = 0.0f;
 static void* __fastcall dev_point3(void* ecx, void* edx, float* out, unsigned i0, unsigned i1) {
-    (void)ecx; (void)edx; (void)i0; (void)i1; if (out) { out[0] = 0.0f; out[1] = 0.0f; } return out;
+    (void)ecx; (void)edx; (void)i0; (void)i1;
+    if (out) { out[0] = g_puppet_aim_x; out[1] = g_puppet_aim_y; }
+    return out;
 }
 static void* __fastcall dev_point1(void* ecx, void* edx, float* out) {
-    (void)ecx; (void)edx; if (out) { out[0] = 0.0f; out[1] = 0.0f; } return out;
+    (void)ecx; (void)edx;
+    if (out) { out[0] = g_puppet_aim_x; out[1] = g_puppet_aim_y; }
+    return out;
 }
 static int __fastcall dev_ret0(void* ecx, void* edx) { (void)ecx; (void)edx; return 0; }
 static void* g_dummy_vtbl[20];
@@ -877,6 +890,76 @@ static bool is_passive_player(void* self) {
     return self != mainp;   // not the local/controlled player -> passive
 }
 
+// Per-puppet angle override. The engine's TPlayer think1 case 1 (walk)
+// recomputes +0xB0 (angle) from the velocity each frame — with a dummy
+// input device the velocity is zero, so the angle gets stuck at 0 and
+// our SetAngle from snapshot is overwritten by orig think1 on the very
+// next frame. Fix: store the snapshot's angle here per-puppet, then
+// re-apply it in hook_PThink1 post-orig.
+struct AnglePin { void* who; float angle; float px; float py; bool valid; };
+static AnglePin g_angle_pins[8];
+
+static int l_pin_angle(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+    }
+    void* who = resolve_entity(L, 1);
+    float angle = lua_tonumber_p ? (float)lua_tonumber_p(L, 2, nullptr) : 0.0f;
+    // Optional px,py (args 3,4) — puppet's world position, supplied by Lua
+    // because the puppet's +0x1B8/+0x1BC cache is populated by aliveUpdate
+    // which may not have run yet on a passive puppet. Without an accurate
+    // origin the dummy-device aim target ends up near (0,0) and the
+    // engine's case-7/8 computation gives angle-toward-origin instead of
+    // the pinned angle.
+    float px = lua_tonumber_p ? (float)lua_tonumber_p(L, 3, nullptr) : 0.0f;
+    float py = lua_tonumber_p ? (float)lua_tonumber_p(L, 4, nullptr) : 0.0f;
+    if (!who) { api.pushboolean(L, 0); return 1; }
+    for (int i = 0; i < 8; ++i) {
+        if (g_angle_pins[i].who == who) {
+            g_angle_pins[i].angle = angle;
+            g_angle_pins[i].px = px;
+            g_angle_pins[i].py = py;
+            g_angle_pins[i].valid = true;
+            api.pushboolean(L, 1); return 1;
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (!g_angle_pins[i].valid) {
+            g_angle_pins[i].who = who;
+            g_angle_pins[i].angle = angle;
+            g_angle_pins[i].px = px;
+            g_angle_pins[i].py = py;
+            g_angle_pins[i].valid = true;
+            api.pushboolean(L, 1); return 1;
+        }
+    }
+    api.pushboolean(L, 0); return 1;
+}
+
+static int g_pin_debug_n = 0;
+static void apply_angle_pin_after_think(void* self) {
+    for (int i = 0; i < 8; ++i) {
+        if (g_angle_pins[i].valid && g_angle_pins[i].who == self) {
+            float before = *(float*)((char*)self + 0xB0);
+            *(float*)((char*)self + 0xB0) = g_angle_pins[i].angle;
+            // Log a sample when the engine's case-handler wrote a DIFFERENT
+            // angle than our pin — that's the case-7/8 path overwriting us.
+            // Throttled: only first 40 mismatches so it doesn't flood.
+            if (g_pin_debug_n < 40 && before != g_angle_pins[i].angle) {
+                int action = *(int*)((char*)self + 0xB4);
+                float frame = *(float*)((char*)self + 0x70);
+                host_log("pin_apply MISMATCH puppet=%p engine_angle=%.3f pin=%.3f action=%d frame=%.1f",
+                    self, before, g_angle_pins[i].angle, action, frame);
+                ++g_pin_debug_n;
+            }
+            return;
+        }
+    }
+}
+
 // First-N logger so we can see which puppet survived how many think frames
 // before crashing. Keyed by ptr identity; per-puppet up to 16 frames.
 struct PThinkLog { void* who; int frames; };
@@ -927,7 +1010,32 @@ static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
     *(float*)((char*)self + HP_OFF) = 9999.0f;
     *((unsigned char*)self + INVULN_OFF) = 1;
     *(int*)((char*)self + DEATH_TIMER_OFF) = DEATH_TIMER_SENTINEL;
+    // Set dummy-device's mouse target so case-7/8 (shoot/aim) computes the
+    // right angle from puppet's perspective. Target = puppet_pos + unit
+    // vector at pinned angle. Box2D body at +0x50; world position is the
+    // Box2D body's transform. We can use the cached pos field at... well
+    // easier: just read GetPos via vt[2] (TActor base GetPos returns +0x50
+    // body pos as 2 floats). But that's a vtable call mid-hook. Simpler:
+    // use the position fields at +0x1B8/+0x1BC that aliveUpdate maintains
+    // (per the diagnostic, aliveUpdate just copies XY there each frame).
+    // Real input device returns mouse position RELATIVE to player (not
+    // absolute world coords). Our dummy must do the same: a unit direction
+    // vector at the pinned angle. Engine then computes atan2(sin, cos) =
+    // pinned_angle exactly, eliminating position-dependent jitter and
+    // making cases 1/7/8 all compute the correct rotation.
+    float pinned_angle = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        if (g_angle_pins[i].valid && g_angle_pins[i].who == self) {
+            pinned_angle = g_angle_pins[i].angle;
+            break;
+        }
+    }
+    g_puppet_aim_x = __builtin_cosf(pinned_angle);
+    g_puppet_aim_y = __builtin_sinf(pinned_angle);
     int r = orig_PThink1(self); // anim state machine + position + aim cache run
+    // Re-apply our snapshot angle. case 1 (walk) inside orig wrote +0xB0
+    // from a velocity-derived value that's stuck at 0 due to dummy input.
+    apply_angle_pin_after_think(self);
     log_first_frames(self, "PT1.post");
     *gate = saved_gate;
     *ip = saved_in;
@@ -941,6 +1049,10 @@ static int __fastcall hook_PThink2(void* self, void* /*edx*/) {
     void** ip = (void**)(mod_base() + INPUT_DEV_RVA);
     void* saved_in = *ip;
     *ip = (void*)g_dummy_dev;
+    // Note: do NOT re-set g_puppet_aim_x/y here. Doing so caused worse
+    // visible behavior (jitter + render artifacts) — PT1's setting is
+    // enough for the engine to compute case-7/8 correctly, and read-back
+    // during render uses a different angle source we shouldn't touch.
     // Belt-and-braces: even with the camera-sub hook below, force action=8
     // (aim) for the duration of orig_PThink2 so that IF the hook somehow
     // misses the sub (e.g. inlined elsewhere), the action!=8 branch — the
@@ -1504,7 +1616,7 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // realloc the table's array repeatedly mid-population, and under full page heap
     // those guard-paged grows turn lua52's trailing TValue write into a hard fault
     // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
-    api.createtable(L, 0, 27);
+    api.createtable(L, 0, 28);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
@@ -1543,6 +1655,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "install_passive_player_hooks");
     api.pushcclosure(L, l_pin_hp, 0);
     api.setfield(L, -2, "pin_hp");
+    api.pushcclosure(L, l_pin_angle, 0);
+    api.setfield(L, -2, "pin_angle");
     api.pushcclosure(L, l_set_invulnerable, 0);
     api.setfield(L, -2, "set_invulnerable");
     api.pushcclosure(L, l_probe_memory, 0);
