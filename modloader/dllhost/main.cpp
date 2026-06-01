@@ -228,16 +228,45 @@ static int g_central_hit_count = 0;
 extern DWORD g_hit_targets[HIT_RING_SIZE];
 extern volatile int g_hit_write_idx;
 
+// Latest captured ApplyHit args from a real engine-side hit. apply_damage
+// reuses these as a "shape template" so we replay the engine's own call
+// pattern instead of guessing at the signature. Updated every time a real
+// bullet/explosion lands on a tracked entity.
+static volatile bool g_apply_hit_seen = false;
+static void*         g_apply_hit_last_a1 = nullptr;
+static int           g_apply_hit_last_a2 = 0;
+static int           g_apply_hit_last_a3 = 0;
+static int           g_apply_hit_last_a4 = 0;
+static int           g_apply_hit_last_a5 = 0;
+
 static void __fastcall hook_CentralHit(void* self, void* /*edx*/,
                                        void* a1, int a2, int a3, int a4, int a5) {
     g_central_hit_count++;
     g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
     g_hit_write_idx++;
-    if (g_central_hit_count <= 32 || (g_central_hit_count % 25) == 0) {
-        host_log("hook_CentralHit #%d: target=%p arg1=%p",
-                 g_central_hit_count, self, a1);
-    }
+    // Capture the freshest engine-side ApplyHit args so apply_damage can
+    // replay the exact call shape.
+    g_apply_hit_last_a1 = a1;
+    g_apply_hit_last_a2 = a2;
+    g_apply_hit_last_a3 = a3;
+    g_apply_hit_last_a4 = a4;
+    g_apply_hit_last_a5 = a5;
+    g_apply_hit_seen    = true;
+    // Read HP before+after so we know which arg is damage and what numeric
+    // form (raw int vs. float-as-int).
+    float hp_before = *(float*)((char*)self + 0xBC);
+    union { int i; float f; } f2, f3, f4, f5;
+    f2.i = a2; f3.i = a3; f4.i = a4; f5.i = a5;
     orig_CentralHit(self, a1, a2, a3, a4, a5);
+    float hp_after  = *(float*)((char*)self + 0xBC);
+    if (g_central_hit_count <= 64 || (g_central_hit_count % 25) == 0) {
+        host_log("hook_CentralHit #%d: target=%p a1=%p a2=0x%08x(int=%d,f=%.3f) "
+                 "a3=0x%08x(int=%d,f=%.3f) a4=0x%08x(int=%d,f=%.3f) a5=0x%08x(int=%d,f=%.3f) "
+                 "hp %.1f->%.1f",
+                 g_central_hit_count, self, a1,
+                 a2, a2, f2.f, a3, a3, f3.f, a4, a4, f4.f, a5, a5, f5.f,
+                 hp_before, hp_after);
+    }
 }
 
 static int l_install_central_hit_hook(lua_State* L) {
@@ -249,6 +278,54 @@ static int l_install_central_hit_hook(lua_State* L) {
     if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
     s = MH_EnableHook(target);
     host_log("MH_EnableHook(CentralHit): status=%d", s);
+    api.pushboolean(L, s == MH_OK ? 1 : 0);
+    return 1;
+}
+
+// ALSO hook TActor::TakeDamage at RVA 0x4e3e0 (per kill_actor comment, this
+// is the function whose decompilation revealed health at +0xBC). Bullets may
+// route through this instead of (or in addition to) the ApplyHit at 0x4ee80.
+// Same arg-shape captures + ring-buffer slot so we can identify which fires.
+typedef void (__thiscall *TakeDamage2Fn)(void* self, void* a1, int a2, int a3, int a4, int a5);
+static TakeDamage2Fn orig_TakeDmg2 = nullptr;
+static int g_take_dmg2_count = 0;
+static volatile bool g_take_dmg2_seen = false;
+static void* g_take_dmg2_last_a1 = nullptr;
+static int   g_take_dmg2_last_a2 = 0;
+static int   g_take_dmg2_last_a3 = 0;
+static int   g_take_dmg2_last_a4 = 0;
+static int   g_take_dmg2_last_a5 = 0;
+
+static void __fastcall hook_TakeDmg2(void* self, void* /*edx*/,
+                                     void* a1, int a2, int a3, int a4, int a5) {
+    g_take_dmg2_count++;
+    g_take_dmg2_last_a1 = a1; g_take_dmg2_last_a2 = a2;
+    g_take_dmg2_last_a3 = a3; g_take_dmg2_last_a4 = a4; g_take_dmg2_last_a5 = a5;
+    g_take_dmg2_seen   = true;
+    float hp_before = *(float*)((char*)self + 0xBC);
+    union { int i; float f; } f2, f3, f4, f5;
+    f2.i = a2; f3.i = a3; f4.i = a4; f5.i = a5;
+    orig_TakeDmg2(self, a1, a2, a3, a4, a5);
+    float hp_after = *(float*)((char*)self + 0xBC);
+    if (g_take_dmg2_count <= 64 || (g_take_dmg2_count % 25) == 0) {
+        host_log("hook_TakeDmg2 #%d: target=%p a1=%p a2=0x%08x(int=%d,f=%.3f) "
+                 "a3=0x%08x(int=%d,f=%.3f) a4=0x%08x(int=%d,f=%.3f) a5=0x%08x(int=%d,f=%.3f) "
+                 "hp %.1f->%.1f",
+                 g_take_dmg2_count, self, a1,
+                 a2, a2, f2.f, a3, a3, f3.f, a4, a4, f4.f, a5, a5, f5.f,
+                 hp_before, hp_after);
+    }
+}
+
+static int l_install_takedmg2_hook(lua_State* L) {
+    HMODULE m = GetModuleHandleA(NULL);
+    if (!m) { api.pushboolean(L, 0); return 1; }
+    BYTE* target = (BYTE*)m + 0x4e3e0;
+    MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_TakeDmg2, (LPVOID*)&orig_TakeDmg2);
+    host_log("MH_CreateHook(TakeDmg2 @%p): status=%d", target, s);
+    if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    s = MH_EnableHook(target);
+    host_log("MH_EnableHook(TakeDmg2): status=%d", s);
     api.pushboolean(L, s == MH_OK ? 1 : 0);
     return 1;
 }
@@ -294,10 +371,13 @@ static void hook_common(int slot, void* self, float damage, float kind) {
     g_takedmg_count++;
     g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
     g_hit_write_idx++;
-    if (g_takedmg_count <= 32 || (g_takedmg_count % 200) == 0) {
-        host_log("hook[slot %d] #%d: target=%p", slot, g_takedmg_count, self);
-    }
+    float hp_before = *(float*)((char*)self + 0xBC);
     g_origs[slot](self, damage, kind);
+    float hp_after  = *(float*)((char*)self + 0xBC);
+    if (g_takedmg_count <= 96 || (g_takedmg_count % 50) == 0) {
+        host_log("vtable_takedmg[slot %d] #%d: target=%p damage=%.3f kind=%.3f hp %.1f->%.1f",
+                 slot, g_takedmg_count, self, damage, kind, hp_before, hp_after);
+    }
 }
 
 // Lua-callable: returns the integer address backing a userdata. Lua side
@@ -489,6 +569,70 @@ static int l_kill_actor(lua_State* L) {
     host_log("kill_actor: poked entity=%p health=-9999 (corpse pending)", entity);
     api.pushboolean(L, 1);
     return 1;
+}
+
+// Lua-callable: apply_damage(ptr, dmg) — decrement an actor's health by `dmg`.
+// Same trick as kill_actor (health float at entity+0xBC) but partial: read
+// current HP, subtract, write back. Engine's next Update tick handles the
+// death path when HP <= 0 (corpse + sfx + score, just like a real bullet).
+// Returns (true, new_hp) on success, (false) on failed vtable validation.
+// Used by the joiner-authoritative melee path: host receives a mob_damage
+// message and applies it directly without needing a Lua-bound SetHealth
+// (which not all mob classes expose).
+static int l_apply_damage(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    static LuaPushNumberFn lua_pushnumber_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p   = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+        lua_tonumber_p    = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+        lua_pushnumber_p  = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
+    }
+    void* udblock = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!udblock) { api.pushboolean(L, 0); return 1; }
+    float dmg = lua_tonumber_p ? (float)lua_tonumber_p(L, 2, nullptr) : 0.0f;
+
+    HMODULE me = GetModuleHandleA(NULL);
+    DWORD mod_base = (DWORD)me;
+    #define AD_IN_RANGE(p) (((DWORD)(p) - mod_base) < 0x200000)
+
+    void* entity = nullptr;
+    {
+        void** v = *(void***)udblock;
+        if (AD_IN_RANGE(v)) entity = udblock;
+    }
+    if (!entity) {
+        void* full = *(void**)udblock;
+        if (full) {
+            void** v = *(void***)full;
+            if (AD_IN_RANGE(v)) entity = full;
+        }
+    }
+    if (!entity) {
+        host_log("apply_damage: no in-range vtable, refusing (udblock=%p)", udblock);
+        api.pushboolean(L, 0);
+        return 1;
+    }
+
+    // Safe HP poke at +0xBC. Works for Soldat subclass (kills them) but
+    // for mutant/zombie classes the visible HP isn't here — write succeeds,
+    // mob keeps walking. Returning post_hp lets Lua observe whether the
+    // poke had real effect; the caller (handle_mob_damage) falls back to
+    // removing the mob from snapshot tracking when it doesn't.
+    // ApplyHit-at-0x4ee80 looked promising but crashed the host with our
+    // best-guess signature — reverted until we can capture real arg values
+    // from the central_hit hook to replay.
+    float* hp_p = (float*)((char*)entity + 0xBC);
+    float old_hp = *hp_p;
+    float new_hp = old_hp - dmg;
+    *hp_p = new_hp;
+    host_log("apply_damage: entity=%p hp %.1f -> %.1f (dmg=%.1f)", entity, old_hp, new_hp, dmg);
+    api.pushboolean(L, 1);
+    lua_pushnumber_p(L, (double)new_hp);
+    return 2;
 }
 
 // Lua-callable: set_frame(ptr, frame) — write the actor's animation frame.
@@ -763,6 +907,395 @@ static int l_set_invulnerable(lua_State* L) {
     return 1;
 }
 
+// set_button_label(button_ptr_userdata, "new text") — write a new label
+// into the C++ button object's std::string at offset +0x28. Probe found the
+// classic MSVC SSO layout: 16-byte inline buffer at +0x28, size at +0x38,
+// capacity at +0x3c (set to 15). For labels ≤15 chars we write directly into
+// the inline buffer and update size. Strings longer than 15 chars would need
+// heap allocation via the engine's allocator — not supported here, so we
+// truncate. Returns true on success.
+//
+// SAFETY: validates the std::string capacity field is still 15 (the SSO
+// sentinel) before touching anything. If a different value appears, the
+// button might be using a heap-backed string and we refuse to write rather
+// than scribble random memory.
+static int l_set_button_label(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* p = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!p || IsBadWritePtr(p, 0x40)) {
+        api.pushboolean(L, 0); return 1;
+    }
+    size_t n = 0;
+    const char* txt = api.tolstring(L, 2, &n);
+    if (!txt) { api.pushboolean(L, 0); return 1; }
+
+    const int STR_OFF      = 0x28;  // inline buffer start
+    const int SIZE_OFF     = 0x38;  // current size (uint32)
+    const int CAP_OFF      = 0x3c;  // capacity (uint32, 15 = SSO)
+    const int SSO_CAPACITY = 15;
+
+    uint32_t cap = *(uint32_t*)((char*)p + CAP_OFF);
+    if (cap != SSO_CAPACITY) {
+        host_log("set_button_label: REFUSE — capacity=%u not SSO sentinel %d", cap, SSO_CAPACITY);
+        api.pushboolean(L, 0); return 1;
+    }
+
+    size_t write_n = n;
+    if (write_n > (size_t)SSO_CAPACITY) write_n = SSO_CAPACITY;
+    char* buf = (char*)p + STR_OFF;
+    memcpy(buf, txt, write_n);
+    buf[write_n] = '\0';                                  // null-terminate
+    *(uint32_t*)((char*)p + SIZE_OFF) = (uint32_t)write_n;
+    // capacity stays at 15 (SSO)
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// probe_memory(ptr_userdata) — hex+ascii dump of 192 bytes starting at the
+// userdata's raw address. Lua-side passes button.pointer; we hexdump so we
+// can find where the C++ button object stores its label string. Logs both
+// direct interpretation (pointer is the object) AND one-dereference (pointer
+// is a pointer to the object) so we cover both userdata shapes.
+static int l_probe_memory(lua_State* L) {
+    typedef void* (*LuaToPointerFn)(lua_State*, int);
+    static LuaToPointerFn lua_topointer_p = nullptr;
+    if (!lua_topointer_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_topointer_p = (LuaToPointerFn)GetProcAddress(lm, "lua_topointer");
+    }
+    void* p = lua_topointer_p ? lua_topointer_p(L, 1) : nullptr;
+    if (!p) { return 0; }
+
+    auto dump_at = [&](const char* tag, void* base) {
+        if (!base) return;
+        if (IsBadReadPtr(base, 192)) {
+            host_log("probe %s @%p UNREADABLE", tag, base);
+            return;
+        }
+        char line[260];
+        unsigned char* b = (unsigned char*)base;
+        for (int row = 0; row < 12; row++) {
+            char* pos = line;
+            pos += snprintf(pos, sizeof(line) - (pos - line), "+0x%02x  ", row * 16);
+            for (int c = 0; c < 16; c++) {
+                pos += snprintf(pos, sizeof(line) - (pos - line), "%02x ", b[row*16 + c]);
+            }
+            pos += snprintf(pos, sizeof(line) - (pos - line), " ");
+            for (int c = 0; c < 16; c++) {
+                unsigned char ch = b[row*16 + c];
+                *pos++ = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+            }
+            *pos = 0;
+            host_log("probe %s %s", tag, line);
+        }
+    };
+
+    dump_at("DIRECT", p);
+    void* p2 = nullptr;
+    if (!IsBadReadPtr(p, sizeof(void*))) p2 = *(void**)p;
+    if (p2 && p2 != p) dump_at("DEREF1", p2);
+    return 0;
+}
+
+// Frame tick: hook user32!PeekMessageA so we run a Lua callback per Win32
+// frame even at title-menu state (where engine-tracked coroutines / Wait()
+// can't be used safely). Throttles to ~10Hz so we don't burn CPU. The
+// callback name is the global "MP_FRAME_TICK". A reentrancy guard avoids
+// double-entry if the callback itself causes another PeekMessageA call.
+typedef BOOL (WINAPI *PeekMessageAFn)(LPMSG, HWND, UINT, UINT, UINT);
+static PeekMessageAFn orig_PeekMessageA = nullptr;
+static volatile bool  g_frame_tick_armed = false;
+static volatile bool  g_in_frame_tick    = false;
+static DWORD          g_last_tick_ms     = 0;
+
+// When true, every ESC keypress arriving via PeekMessageA gets rewritten
+// to WM_NULL so the engine's native ESC handler doesn't toggle the
+// paused MP-disconnected user back into the running level.
+static volatile bool g_suppress_esc = false;
+// Counter: while > 0, the next ESC message is allowed through the
+// suppression filter (decrements per ESC seen). Used by inject_esc so
+// our forced pause keypress isn't swallowed by our own filter.
+static volatile int  g_pass_esc_count = 0;
+// When true, ESC keydown causes the hook to PostMessage WM_CLOSE to
+// our window — the engine then performs a clean shutdown. Used on the
+// mp_kicked notification page so the user can press ESC to exit
+// instead of clicking OK.
+static volatile bool g_esc_quits = false;
+// When true, an ESC keydown sets g_esc_pressed = true (and is
+// swallowed). The Lua tick polls this from check_esc_pressed() and
+// runs the lobby-leave action when on mp_waiting.
+static volatile bool g_esc_leaves_lobby = false;
+static volatile bool g_esc_pressed      = false;
+// Low-level keyboard hook handle. Required because Teleglitch reads
+// keyboard via DirectInput / GetAsyncKeyState — its key events never
+// arrive via PeekMessageA, so our existing hook can't see them.
+static HHOOK g_kbd_ll_hook = NULL;
+// Cached top-level HWND of our process. Populated by inject_esc /
+// hook_PeekMessageA on first use; reused by the ESC-quits path.
+static HWND g_our_hwnd = NULL;
+
+struct EnumOurWindow { DWORD pid; HWND hwnd; };
+static BOOL CALLBACK enum_our_window_cb(HWND hwnd, LPARAM lp) {
+    EnumOurWindow* ed = (EnumOurWindow*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == ed->pid && GetWindow(hwnd, GW_OWNER) == NULL && IsWindowVisible(hwnd)) {
+        ed->hwnd = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+static HWND find_our_hwnd() {
+    if (g_our_hwnd && IsWindow(g_our_hwnd)) return g_our_hwnd;
+    EnumOurWindow ed = { GetCurrentProcessId(), NULL };
+    EnumWindows(enum_our_window_cb, (LPARAM)&ed);
+    g_our_hwnd = ed.hwnd;
+    return g_our_hwnd;
+}
+
+static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
+                                     UINT wMsgFilterMin, UINT wMsgFilterMax,
+                                     UINT wRemoveMsg) {
+    BOOL r = orig_PeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    // Swallow ESC keydown/keyup while suppression is armed. Has to be
+    // done both for KEYDOWN (would trigger the pause toggle) and
+    // KEYUP/CHAR so the engine doesn't see a half-event.
+    if (r && lpMsg) {
+        bool esc = false;
+        if ((lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_KEYUP ||
+             lpMsg->message == WM_SYSKEYDOWN || lpMsg->message == WM_SYSKEYUP)
+            && lpMsg->wParam == VK_ESCAPE) {
+            esc = true;
+        }
+        if (esc) {
+            host_log("hook: ESC msg=%u wParam=%u pass=%d quits=%d leaves=%d suppress=%d",
+                     lpMsg->message, (unsigned)lpMsg->wParam,
+                     g_pass_esc_count, g_esc_quits ? 1 : 0,
+                     g_esc_leaves_lobby ? 1 : 0, g_suppress_esc ? 1 : 0);
+            if (g_pass_esc_count > 0) {
+                g_pass_esc_count--;        // injected ESC — let it through
+            } else if (g_esc_quits) {
+                // Translate ESC into a clean close request — engine
+                // performs its own shutdown via WM_CLOSE.
+                if (lpMsg->message == WM_KEYDOWN) {
+                    HWND h = find_our_hwnd();
+                    if (h) PostMessageA(h, WM_CLOSE, 0, 0);
+                }
+                lpMsg->message = WM_NULL;
+                lpMsg->wParam  = 0;
+                lpMsg->lParam  = 0;
+            } else if (g_esc_leaves_lobby) {
+                // Note the ESC for the Lua tick to consume and act on
+                // (it'll call lobby_leave_room when on mp_waiting).
+                if (lpMsg->message == WM_KEYDOWN) g_esc_pressed = true;
+                lpMsg->message = WM_NULL;
+                lpMsg->wParam  = 0;
+                lpMsg->lParam  = 0;
+            } else if (g_suppress_esc) {
+                lpMsg->message = WM_NULL;
+                lpMsg->wParam  = 0;
+                lpMsg->lParam  = 0;
+            }
+        }
+    }
+    // Only fire the tick when the queue is EMPTY (r == FALSE) AND the
+    // caller was draining with PM_REMOVE. That's the idle slot in the
+    // game's main loop — every message has been dispatched, the engine
+    // is about to render. Calling Lua during PM_NOREMOVE peeks (which
+    // happen mid-callback in many places) reenters Lua at an unsafe
+    // point and corrupts the stack → crash.
+    if (!r && wRemoveMsg == PM_REMOVE
+        && g_frame_tick_armed && !g_in_frame_tick && g_L
+        && api.pcall && api.getglobal) {
+        DWORD now = GetTickCount();
+        if ((now - g_last_tick_ms) >= 250) {
+            g_last_tick_ms = now;
+            g_in_frame_tick = true;
+            api.getglobal(g_L, "MP_FRAME_TICK");
+            if (api.pcall(g_L, 0, 0, 0, 0, nullptr) != 0) {
+                const char* err = api.tolstring(g_L, -1, nullptr);
+                host_log("MP_FRAME_TICK error: %s", err ? err : "?");
+                api.settop(g_L, -2);
+            }
+            g_in_frame_tick = false;
+        }
+    }
+    return r;
+}
+
+// Low-level keyboard hook. Per MSDN this must return quickly (within
+// the LowLevelHooksTimeout) or Windows silently unhooks us. The
+// callback also runs on whatever thread posted the key event, so any
+// file I/O here (host_log) risks races + slow paths. Keep it minimal:
+// check flags, set flag or post message, return.
+static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+        if (p && p->vkCode == VK_ESCAPE &&
+            (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            HWND fg  = GetForegroundWindow();
+            HWND own = g_our_hwnd;  // already cached; avoid EnumWindows here
+            if (own && fg == own) {
+                if (g_esc_quits) {
+                    PostMessageA(own, WM_CLOSE, 0, 0);
+                    return 1;
+                }
+                if (g_esc_leaves_lobby) {
+                    g_esc_pressed = true;
+                    return 1;
+                }
+                if (g_suppress_esc) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_kbd_ll_hook, nCode, wParam, lParam);
+}
+
+static int l_arm_frame_tick(lua_State* L) {
+    // Need both lua_pcallk and lua_getglobal exported by lua52.dll to
+    // invoke the Lua callback. If either is missing, refuse to arm —
+    // calling a null function pointer would crash on the first frame.
+    if (!api.pcall || !api.getglobal) {
+        host_log("arm_frame_tick: missing lua_pcallk or lua_getglobal symbol");
+        api.pushboolean(L, 0);
+        return 1;
+    }
+    if (!orig_PeekMessageA) {
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        if (!user32) user32 = LoadLibraryA("user32.dll");
+        if (!user32) { api.pushboolean(L, 0); return 1; }
+        void* target = (void*)GetProcAddress(user32, "PeekMessageA");
+        if (!target) { api.pushboolean(L, 0); return 1; }
+        MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_PeekMessageA, (LPVOID*)&orig_PeekMessageA);
+        host_log("MH_CreateHook(PeekMessageA @%p): status=%d", target, s);
+        if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+        s = MH_EnableHook(target);
+        host_log("MH_EnableHook(PeekMessageA): status=%d", s);
+        if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    }
+    // While we're arming the frame tick (called once at module init),
+    // also install a low-level keyboard hook so we can catch ESC
+    // presses the engine reads via DirectInput. Without this the
+    // suppression / leaves-lobby flags would never see user keys.
+    if (!g_kbd_ll_hook) {
+        // Cache the HWND before installing so the LL callback can
+        // skip the slow EnumWindows path. The callback runs hot
+        // (every keystroke) so we keep it free of file I/O too.
+        find_our_hwnd();
+        g_kbd_ll_hook = SetWindowsHookExA(WH_KEYBOARD_LL, kbd_ll_proc,
+                                          GetModuleHandleA(NULL), 0);
+        host_log("SetWindowsHookExA(WH_KEYBOARD_LL) -> %p", g_kbd_ll_hook);
+    }
+    g_frame_tick_armed = true;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+static int l_disarm_frame_tick(lua_State* L) {
+    g_frame_tick_armed = false;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// inject_esc() — post ESC keydown+keyup to OUR PROCESS's main window
+// via PostMessageA. PostMessage targets a specific HWND and bypasses
+// focus requirements, so when the host clicks Kick the resulting
+// injection on the joiner's process still lands in the joiner's
+// window (SendInput would route to whatever window has system focus,
+// usually the host's). Pass-through counter prevents our own
+// suppression hook from eating these events.
+static int l_inject_esc(lua_State* L) {
+    HWND h = find_our_hwnd();
+    if (!h) {
+        host_log("inject_esc: could not find our top-level window");
+        api.pushboolean(L, 0);
+        return 1;
+    }
+    g_pass_esc_count = 2;        // exactly: our keydown + keyup
+    PostMessageA(h, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+    PostMessageA(h, WM_KEYUP,   VK_ESCAPE, 0xC0010001);
+    host_log("inject_esc: posted ESC to hwnd=%p", h);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_esc_leaves_lobby(bool) — when true, the hook records ESC keydowns
+// into g_esc_pressed (and swallows the message). The Lua tick polls
+// via check_esc_pressed() and triggers lobby_leave_room.
+static int l_set_esc_leaves_lobby(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 0;
+    g_esc_leaves_lobby = (on != 0);
+    if (!g_esc_leaves_lobby) g_esc_pressed = false;
+    host_log("set_esc_leaves_lobby(%d)", g_esc_leaves_lobby ? 1 : 0);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// check_esc_pressed() — atomic read+clear. Returns true if ESC was
+// pressed since the last call. Used by the Lua tick to act on ESC in
+// the lobby waiting room.
+static int l_check_esc_pressed(lua_State* L) {
+    bool was = g_esc_pressed;
+    g_esc_pressed = false;
+    if (was) host_log("check_esc_pressed -> TRUE (leaves_lobby=%d quits=%d suppress=%d)",
+                      g_esc_leaves_lobby ? 1 : 0, g_esc_quits ? 1 : 0, g_suppress_esc ? 1 : 0);
+    api.pushboolean(L, was ? 1 : 0);
+    return 1;
+}
+
+// set_esc_quits(bool) — when true, ESC keypresses (after the
+// pass-through count has drained) get translated into WM_CLOSE so
+// the engine cleanly exits. Used for the mp_kicked notification page.
+static int l_set_esc_quits(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 0;
+    g_esc_quits = (on != 0);
+    host_log("set_esc_quits(%d)", g_esc_quits ? 1 : 0);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_suppress_esc(bool) — when true, the per-frame PeekMessageA hook
+// rewrites every VK_ESCAPE message to WM_NULL so the engine never sees
+// it. Used after MP Disconnect/kick to stop the user from toggling
+// back into the still-loaded MP level. Re-enable (pass false) when the
+// user genuinely enters a new game so they can pause normally again.
+static int l_set_suppress_esc(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 0;
+    g_suppress_esc = (on != 0);
+    // When enabling, hard-clear any leftover pass-through count so a
+    // stale inject_esc credit can't sneak a real ESC through after we
+    // arm suppression.
+    if (g_suppress_esc) g_pass_esc_count = 0;
+    host_log("set_suppress_esc(%d) pass_count=%d", g_suppress_esc ? 1 : 0, g_pass_esc_count);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 static int l_hello(lua_State* L) {
     api.pushstring(L, "hello from native (modloader dllhost)");
     return 1;
@@ -791,7 +1324,7 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // realloc the table's array repeatedly mid-population, and under full page heap
     // those guard-paged grows turn lua52's trailing TValue write into a hard fault
     // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
-    api.createtable(L, 0, 18);
+    api.createtable(L, 0, 27);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
@@ -806,10 +1339,14 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "addr_of");
     api.pushcclosure(L, l_install_central_hit_hook, 0);
     api.setfield(L, -2, "install_central_hit_hook");
+    api.pushcclosure(L, l_install_takedmg2_hook, 0);
+    api.setfield(L, -2, "install_takedmg2_hook");
     api.pushcclosure(L, l_consume_bullet, 0);
     api.setfield(L, -2, "consume_bullet");
     api.pushcclosure(L, l_kill_actor, 0);
     api.setfield(L, -2, "kill_actor");
+    api.pushcclosure(L, l_apply_damage, 0);
+    api.setfield(L, -2, "apply_damage");
     api.pushcclosure(L, l_set_frame, 0);
     api.setfield(L, -2, "set_frame");
     api.pushcclosure(L, l_set_capture, 0);
@@ -828,6 +1365,24 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "pin_hp");
     api.pushcclosure(L, l_set_invulnerable, 0);
     api.setfield(L, -2, "set_invulnerable");
+    api.pushcclosure(L, l_probe_memory, 0);
+    api.setfield(L, -2, "probe_memory");
+    api.pushcclosure(L, l_set_button_label, 0);
+    api.setfield(L, -2, "set_button_label");
+    api.pushcclosure(L, l_arm_frame_tick, 0);
+    api.setfield(L, -2, "arm_frame_tick");
+    api.pushcclosure(L, l_disarm_frame_tick, 0);
+    api.setfield(L, -2, "disarm_frame_tick");
+    api.pushcclosure(L, l_set_suppress_esc, 0);
+    api.setfield(L, -2, "set_suppress_esc");
+    api.pushcclosure(L, l_inject_esc, 0);
+    api.setfield(L, -2, "inject_esc");
+    api.pushcclosure(L, l_set_esc_quits, 0);
+    api.setfield(L, -2, "set_esc_quits");
+    api.pushcclosure(L, l_set_esc_leaves_lobby, 0);
+    api.setfield(L, -2, "set_esc_leaves_lobby");
+    api.pushcclosure(L, l_check_esc_pressed, 0);
+    api.setfield(L, -2, "check_esc_pressed");
     return 1;  // return the table
 }
 

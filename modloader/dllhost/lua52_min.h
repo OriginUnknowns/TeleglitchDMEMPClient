@@ -30,6 +30,10 @@ struct LuaApi {
     void (*setfield)(lua_State*, int, const char*);
     void (*createtable)(lua_State*, int, int);
     void (*setglobal)(lua_State*, const char*);
+    void (*getglobal)(lua_State*, const char*);
+    // lua_pcallk's full 6-arg signature: nargs, nresults, errfunc, ctx, k.
+    // We always call with ctx=0, k=nullptr (equivalent to lua_pcall macro).
+    int  (*pcall)(lua_State*, int nargs, int nresults, int errfunc, intptr_t ctx, void* k);
     int  (*next)(lua_State*, int);
 };
 
@@ -52,6 +56,13 @@ static inline int lua_resolve_api(struct LuaApi* api) {
     R(createtable, "lua_createtable");
     R(setglobal,    "lua_setglobal");
     R(next,         "lua_next");
+    // These two are used only by the per-frame tick hook. In Lua 5.2,
+    // lua_pcall is a MACRO over lua_pcallk; the linker symbol is the
+    // 'k' continuation-style function. lua_getglobal is exported as a
+    // real function. Missing symbols here must NOT fail the whole load
+    // — the rest of the native bridge is still usable without them.
+    api->pcall = (decltype(api->pcall))GetProcAddress(m, "lua_pcallk");
+    api->getglobal = (decltype(api->getglobal))GetProcAddress(m, "lua_getglobal");
     #undef R
     return 1;
 }

@@ -37,10 +37,9 @@ do
             -- counting). Removing them also shrinks the native code-patch
             -- surface while we chase the remaining heap corruptor. Only the
             -- bullet ctor hook (needed for the joiner bullet drain) stays.
-            if false and mp_native.install_central_hit_hook then
-                local ok = mp_native.install_central_hit_hook()
-                if mp_native.log then mp_native.log("install_central_hit_hook returned " .. tostring(ok)) end
-            end
+            -- central_hit + takedmg2 (0x4ee80, 0x4e3e0) hooks DISABLED —
+            -- signature was wrong (last call crashed host on bullet hit).
+            -- Direct damage on host parked for future RE session.
             _G.MP_NATIVE = mp_native
             local f = io.open("mp_client_native.txt", "w")
             if f then
@@ -296,6 +295,46 @@ if type(level) == "table" and type(level.Clear) == "function" then
     logf("wrapped level.Clear to reset MP tracking on level retries")
 end
 
+-- ============ MENU PAUSE OVERRIDE ============
+-- The engine's ESC handler likely resets the active page back to
+-- "mainmenu". Two complementary intercepts:
+--   1) Wrap menu.SetPage so any call to switch to "mainmenu" while we're
+--      in an MP game gets redirected to "mp_pause". A bypass flag lets
+--      our own Exit-to-Title button reach the real mainmenu.
+--   2) Wrap menu.SetState as a backup (in case the engine does call it).
+-- Both wraps also log so we can tell which path the engine uses.
+mp._pause_bypass = false   -- set true by Exit-to-Title to allow real mainmenu
+if type(menu) == "table" and type(menu.SetPage) == "function" then
+    local orig_SetPage = menu.SetPage
+    menu.SetPage = function(name, ...)
+        -- Defensive: callers occasionally invoke this with a button
+        -- userdata instead of a page name (engine internals or a Lua
+        -- typo). Just pass through unmodified — never try to compare
+        -- a userdata against the "mainmenu" string or our redirect
+        -- logic, and never log it (the verbose log was hammering
+        -- mp_client.log at >1Hz).
+        if type(name) ~= "string" then
+            return orig_SetPage(name, ...)
+        end
+        if name == "mainmenu" and mp.in_game and not mp._pause_bypass then
+            name = "mp_pause"
+        end
+        return orig_SetPage(name, ...)
+    end
+    logf("wrapped menu.SetPage (intercepts mainmenu→mp_pause in MP)")
+end
+if type(menu) == "table" and type(menu.SetState) == "function" then
+    local orig_SetState = menu.SetState
+    menu.SetState = function(state, val, ...)
+        if state == "game" and val == false and mp.in_game then
+            logf("SetState('game', false) in MP — pre-targeting mp_pause")
+            pcall(function() menu.SetPage("mp_pause") end)
+        end
+        return orig_SetState(state, val, ...)
+    end
+    logf("wrapped menu.SetState")
+end
+
 -- ============ DETERMINISTIC LEVEL GEN ============
 -- C-side cstartfrom() consumes math.random before reaching GenerateLevel, so
 -- our pre-StartFrom math.randomseed() drifts. Re-apply session_seed inside
@@ -548,8 +587,18 @@ local function apply_item_list(items)
     mp.item_obj_to_id = {}
     mp.item_snapshot_received = true
 
-    -- 3. For each host item, find best matching local item by position.
-    local adopted, created, errors = 0, 0, 0
+    -- 3. For each host item, find best matching local item by position and
+    --    ADOPT it (claim with host's id). This is the only step that runs
+    --    now: Create (for host-only items) and Delete (for joiner-only
+    --    orphans) are SKIPPED — both touched the engine item table in ways
+    --    that intermittently corrupted the heap a few seconds later
+    --    (Task #2). Cost of skipping:
+    --      * Host-only items (chest drops, etc.) are invisible to joiner.
+    --      * Joiner-only items (level-gen divergence) clutter the joiner's
+    --        view but the host doesn't know about them.
+    --    Adoption alone is enough for joiner to pick up the items it CAN
+    --    see in sync with host — that's the main goal here.
+    local adopted = 0
     for _, it in ipairs(items or {}) do
         local bucket = local_by_type[it.type]
         local best_idx, best_d2 = nil, 1e9
@@ -565,74 +614,20 @@ local function apply_item_list(items)
             end
         end
         if best_idx then
-            -- ADOPT: claim this local item with the host's id
             local cand = bucket[best_idx]
             cand.taken = true
             mp.items[it.id] = { obj = cand.obj, type = it.type, x = it.x, y = it.y }
             mp.item_obj_to_id[cand.obj] = it.id
             adopted = adopted + 1
-        else
-            -- No local match — must be host-specific (chest drop, etc.). Spawn.
-            local ok, obj = pcall(function() return CreateItem(it.x, it.y, it.type) end)
-            if not ok then
-                errors = errors + 1
-                logf("CreateItem ERROR id=%d type=%s: %s",
-                    it.id, tostring(it.type), tostring(obj))
-            else
-                local store_obj = (type(obj) == "table") and obj or nil
-                mp.items[it.id] = { obj = store_obj, type = it.type, x = it.x, y = it.y }
-                if store_obj then mp.item_obj_to_id[store_obj] = it.id end
-                created = created + 1
-                Wait(0.1)  -- only when actually creating
-            end
-        end
-    end
-
-    -- 4. Delete any local items that nothing claimed (host doesn't know about
-    --    them). Two hazards to respect at once:
-    --      * Deleting a freed/recycled handle = native abort / heap scribble, so
-    --        re-scan liveness FRESH and only Delete a pointer still in the world.
-    --      * A big ATOMIC Delete burst can itself heap-corrupt the engine (the
-    --        original wipe+respawn bug), so spread Deletes across frames with a
-    --        Wait, and re-scan after each yield (the yield can free more items).
-    local orphan_objs = {}
-    for _, bucket in pairs(local_by_type) do
-        for _, cand in ipairs(bucket) do
-            if not cand.taken and cand.obj and type(cand.obj) == "table"
-               and cand.obj.pointer and type(cand.obj.Delete) == "function" then
-                table.insert(orphan_objs, cand.obj)
-            end
-        end
-    end
-    local function rescan_alive()
-        local fa = {}
-        local fpx, fpy = 0, 0
-        if pl then pcall(function() fpx, fpy = pl:GetPosition() end) end
-        local objs2 = GetObjectsInCircle(fpx, fpy, 1000)
-        if type(objs2) == "table" then
-            for _, o in ipairs(objs2) do
-                if type(o) == "table" and o.pointer then fa[tostring(o.pointer)] = true end
-            end
-        end
-        return fa
-    end
-    local orphaned = 0
-    local fresh_alive = rescan_alive()
-    for _, obj in ipairs(orphan_objs) do
-        if obj.pointer and fresh_alive[tostring(obj.pointer)] == true then
-            pcall(function() obj:Delete() end)
-            orphaned = orphaned + 1
-            if orphaned % 4 == 0 then Wait(0.1); fresh_alive = rescan_alive() end
         end
     end
 
     joiner_pre_snapshot_items = {}
     joiner_pre_snapshot_objs = {}
 
-    Wait(0.3)
     pcall(function() if SetVolume then SetVolume(100) end end)
-    logf("apply_item_list (adopt) DONE: adopted=%d created=%d orphan_del=%d errors=%d",
-        adopted, created, orphaned, errors)
+    logf("apply_item_list (adopt-only) DONE: adopted=%d of %d host items (Create/Delete skipped — Task #2)",
+        adopted, #(items or {}))
 end
 
 -- Host: build & send item_list snapshot once after level populates.
@@ -1005,7 +1000,9 @@ local function refresh_objective_string()
     end
 
     local line
-    if nearest and nearest_dist <= PROXIMITY_RANGE then
+    if mp.is_dead then
+        line = string.format("*** YOU ARE DEAD ***  spectating — revive at next level exit")
+    elseif nearest and nearest_dist <= PROXIMITY_RANGE then
         line = string.format(">> %s <<  %s   HP:%d   dist:%.1f",
             role, nearest.name, nearest.hp or 0, nearest_dist)
     else
@@ -1081,15 +1078,37 @@ handle_join = function(p)
     refresh_objective_string()
 end
 
+-- Defined in the menu integration block. game_started / late-join welcome
+-- handlers call into it; forward-declared so they can reach it.
+local begin_game
+local apply_waiting_labels   -- set by the menu integration; updates the
+                             -- player-slot button labels on the waiting page
+local apply_pause_labels     -- updates the in-game ESC menu player slots
+
 local function handle_welcome(msg)
     mp.my_id = msg.id
-    logf("welcomed my_id=%s host_id=%s is_host=%s", tostring(mp.my_id), tostring(msg.host_id), tostring(mp.is_host))
-    if msg.players then
-        for _, p in ipairs(msg.players) do
-            if p.id ~= mp.my_id then handle_join(p) end
+    mp.room_id = msg.room_id
+    mp.room_name = msg.room_name
+    mp.host_id = msg.host_id
+    mp.is_host = (msg.host_id == msg.id)
+    mp.session_seed = msg.seed
+    mp.pending_initial_players = msg.players or {}
+    -- Live room roster (excludes self — UI prepends self when drawing).
+    mp.room_players = {}
+    for _, p in ipairs(msg.players or {}) do
+        if p.id ~= mp.my_id then
+            table.insert(mp.room_players, { id = p.id, name = p.name })
         end
     end
-    refresh_objective_string()
+    if not mp.is_host and type(msg.item_list) == "table" and #msg.item_list > 0 then
+        mp.pending_item_list = msg.item_list
+    end
+    logf("welcome async: my_id=%s room='%s' host_id=%s is_host=%s status=%s players=%d",
+        tostring(mp.my_id), tostring(msg.room_name), tostring(msg.host_id),
+        tostring(mp.is_host), tostring(msg.status), #(msg.players or {}))
+    if apply_waiting_labels then pcall(apply_waiting_labels) end
+    -- Late join (host already started before we joined) — drop straight in.
+    if msg.status == "in_game" and begin_game then begin_game() end
 end
 
 -- Liveness cache: scan world ONCE per tick, reuse for all puppet checks.
@@ -1166,6 +1185,21 @@ local function handle_snapshot(msg)
                     entry = mp.puppets[p.id]
                 end
                 if entry and entry.obj then
+                    -- If this peer is marked dead (server forwarded
+                    -- player_died → handle_peer_died), pin their puppet
+                    -- far off-map so the host's mob AI's nearest-target
+                    -- scan never picks them. The dying peer is in
+                    -- spectate and may keep sending state from on top of
+                    -- a teammate; without this their puppet would cluster
+                    -- mob aggro on the spectated player.
+                    local DEAD_HIDE = -9999
+                    if entry.is_dead then
+                        pcall(function() entry.obj:SetPosition(DEAD_HIDE, DEAD_HIDE) end)
+                        entry.last_x = p.x  -- still track reported pos for spectate-target picks
+                        entry.last_y = p.y
+                        if p.hp then entry.hp = p.hp end
+                        goto continue_puppet
+                    end
                     pcall(function() entry.obj:SetPosition(p.x, p.y) end)
                     if p.angle then
                         pcall(function() entry.obj:SetAngle(p.angle) end)
@@ -1199,6 +1233,7 @@ local function handle_snapshot(msg)
                     entry.last_x = p.x
                     entry.last_y = p.y
                     if p.hp then entry.hp = p.hp end
+                    ::continue_puppet::
                 end
             end
         end
@@ -1447,16 +1482,30 @@ local function handle_mob_damage(msg)
     if not mp.is_host or type(msg.id) ~= "number" or type(msg.dmg) ~= "number" then return end
     for ptr, info in pairs(mp.host_mobs) do
         if info.id == msg.id and info.obj then
-            -- Liveness gate: this path now drives joiner melee, so guard the
-            -- GetHealth/SetHealth — calling them on a freed mob is an
-            -- uncatchable native abort.
-            if not entity_alive(info.obj) then return end
-            local h
-            pcall(function() if info.obj.GetHealth then h = info.obj:GetHealth() end end)
-            if h then
-                local new_h = h - msg.dmg
-                pcall(function() info.obj:SetHealth(new_h, 1) end)
-                logf("mob_damage RX id=%d dmg=%s hp %.0f->%.0f", msg.id, tostring(msg.dmg), h, new_h)
+            -- Try the native HP poke (works for Soldat subclasses). For mob
+            -- classes whose visible HP isn't at +0xBC the poke is harmless
+            -- but ineffective — accumulate joiner damage and once it crosses
+            -- a generous threshold, DROP the mob from host_mobs. Removal
+            -- stops sending it in snapshots; the joiner's puppet then
+            -- despawns and stops "reviving". Mob may still be alive on the
+            -- host's screen, but the joiner sees its kill stick — which is
+            -- the visible behavior the joiner-authoritative path promises.
+            if _G.MP_NATIVE and _G.MP_NATIVE.apply_damage and info.obj.pointer then
+                local ok, new_hp = _G.MP_NATIVE.apply_damage(info.obj.pointer, msg.dmg)
+                info.joiner_damage = (info.joiner_damage or 0) + msg.dmg
+                local KILL_THRESHOLD = 100  -- ~3 stabs at 35 dmg
+                if info.joiner_damage >= KILL_THRESHOLD then
+                    logf("mob_damage RX id=%d type=%s acc=%d >= %d -> dropping from snapshot",
+                        msg.id, tostring(info.type), info.joiner_damage, KILL_THRESHOLD)
+                    -- Inform peers via the normal mob_died channel.
+                    if mp.sock then
+                        pcall(function() send_msg({ type = "mob_died", id = info.id }) end)
+                    end
+                    mp.host_mobs[ptr] = nil
+                else
+                    logf("mob_damage RX id=%d type=%s dmg=%s acc=%d new_hp=%s",
+                        msg.id, tostring(info.type), tostring(msg.dmg), info.joiner_damage, tostring(new_hp))
+                end
             end
             return
         end
@@ -1569,11 +1618,116 @@ local function handle_mob_died(msg)
     logf("mob_died: id=%d hidden (corpse disabled — was crash source)", msg.id)
 end
 
+-- Async lobby messages. The synchronous handshake reads its own welcome /
+-- room_created / game_started; if any straggler arrives later (extra room
+-- update, late hello_ack), the async dispatcher routes through these.
+local function apply_lobby_stats_labels()
+    if not (_G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
+    local lc = tonumber(mp.lobby_count) or 0
+    local ic = tonumber(mp.in_game_count) or 0
+    if mp.lobby_stats_lobby_btn and mp.lobby_stats_lobby_btn.pointer then
+        pcall(function() _G.MP_NATIVE.set_button_label(
+            mp.lobby_stats_lobby_btn.pointer,
+            string.format("Lobby: %d", lc)) end)
+    end
+    if mp.lobby_stats_active_btn and mp.lobby_stats_active_btn.pointer then
+        pcall(function() _G.MP_NATIVE.set_button_label(
+            mp.lobby_stats_active_btn.pointer,
+            string.format("Active: %d", ic)) end)
+    end
+end
+
+local function handle_room_list(m)
+    mp.lobby_rooms = m.rooms or {}
+    mp.lobby_count    = m.lobby_count
+    mp.in_game_count  = m.in_game_count
+    apply_lobby_stats_labels()
+    logf("room_list: %d lobby, %d active (sent %d entries)",
+        tonumber(mp.lobby_count) or 0, tonumber(mp.in_game_count) or 0,
+        #mp.lobby_rooms)
+end
+local function handle_room_updated(m)
+    mp.last_room_update = m.room
+end
+local function handle_left_room(_)
+    logf("left_room ack")
+end
+local function handle_join_failed(m)
+    if m.reason == "room_full" then
+        logf("Join failed: room is FULL (4/4 players already in).")
+    elseif m.reason == "no_such_room" then
+        logf("Join failed: that room no longer exists. Click Refresh List.")
+    else
+        logf("Join failed: %s", tostring(m.reason))
+    end
+end
+
+local function handle_kicked(m)
+    local reason = tostring(m.reason or "")
+    logf("KICKED from room (by id=%s reason=%s in_game=%s)",
+        tostring(m.by), reason, tostring(mp.in_game))
+    mp.was_kicked = true
+    mp.kicked_reason = reason
+    if mp.sock then pcall(function() mp.sock:close() end); mp.sock = nil end
+    if mp.in_game then
+        -- Mid-game disconnect: need the full "Disconnected from Room"
+        -- notification + restart Teleglitch path (level + puppet state
+        -- can't be safely unwound here).
+        mp.pending_kick_cleanup = true
+    else
+        -- Still in lobby/waiting room → no level loaded, no MP entities
+        -- to leak. Just go back to mp_lobby so the joiner can join
+        -- another room or create one.
+        mp.room_id = nil
+        mp.is_host = false
+        mp.room_players = {}
+        mp.game_started_pending = false
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_leaves_lobby then
+            pcall(function() _G.MP_NATIVE.set_esc_leaves_lobby(false) end)
+        end
+        pcall(function() menu.SetPage("mp_lobby") end)
+    end
+end
+local function handle_game_started(m)
+    if m.seed then mp.session_seed = m.seed end
+    mp.game_started_pending = true   -- caller drains & checks; we do NOT call
+                                     -- begin_game from inside a sock receive
+                                     -- loop (state change mid-loop crashes).
+    logf("game_started async: seed=%s (flagged for caller)", tostring(m.seed))
+end
+local function handle_room_created(m)
+    -- Echo only — handshake captured the canonical create. Log for visibility.
+    logf("room_created async: room_id=%s", tostring(m.room_id))
+end
+local function handle_hello_ack(m)
+    logf("hello_ack async: client_id=%s", tostring(m.client_id))
+end
+
+-- Peer reported dead via server forward of player_died. Mark the puppet
+-- so spectate target selection skips them. Reset on level transition
+-- (task #10) and on handle_leave (puppet vanishes anyway).
+local function handle_peer_died(m)
+    if not m or not m.id then return end
+    local entry = mp.puppets[m.id]
+    if entry then
+        entry.is_dead = true
+        -- Hide the puppet immediately so the host's mob AI deaggros this
+        -- frame, without waiting for the next state snapshot to arrive.
+        if entry.obj then
+            pcall(function() entry.obj:SetPosition(-9999, -9999) end)
+        end
+        logf("peer_died id=%s name=%s — puppet hidden off-map", tostring(m.id), tostring(entry.name))
+    else
+        logf("peer_died for unknown id=%s (puppet not tracked yet)", tostring(m.id))
+    end
+end
+
 local handlers = {
     welcome = handle_welcome,
     join = function(m) handle_join(m) end,
     leave = handle_leave,
     snapshot = handle_snapshot,
+    peer_died = handle_peer_died,
     host_changed = handle_host_changed,
     mob_snapshot = handle_mob_snapshot,
     mob_died = handle_mob_died,
@@ -1584,6 +1738,15 @@ local handlers = {
     item_list = handle_item_list,
     item_spawned = handle_item_spawned,
     inventory = handle_inventory,
+    -- New lobby / multi-room messages.
+    hello_ack    = handle_hello_ack,
+    room_list    = handle_room_list,
+    room_created = handle_room_created,
+    room_updated = handle_room_updated,
+    left_room    = handle_left_room,
+    join_failed  = handle_join_failed,
+    game_started = handle_game_started,
+    kicked       = handle_kicked,
 }
 
 -- Build a mob snapshot from the host's tracked mobs. Filters out dead/invalid entries.
@@ -1666,35 +1829,38 @@ local function build_mob_snapshot()
 end
 
 -- ============ CONNECTION ============
-local function connect_and_handshake(proposed_seed)
-    logf("connecting to %s:%d as '%s'…", config.host, config.port, config.name)
-    local sock = socket.tcp()
-    sock:settimeout(3)
-    local ok, err = sock:connect(config.host, config.port)
-    if not ok then logf("connect failed: %s", tostring(err)); return false, err end
-    -- Disable Nagle's algorithm. Without this, small frames (bullet_fire,
-    -- mob_died, mob_damage) get coalesced and held up to ~40ms before the
-    -- OS sends them — the single biggest source of perceived MP lag. The
-    -- relay already sets setNoDelay on its side; this is the client half.
-    pcall(function() sock:setoption("tcp-nodelay", true) end)
-
-    local hello = { type = "hello", name = config.name }
-    if proposed_seed then hello.seed = proposed_seed end
-    local body = json.encode(hello)
-    local ok2, err2 = sock:send(pack_u32_be(#body) .. body)
-    if not ok2 then sock:close(); logf("send hello failed: %s", tostring(err2)); return false, err2 end
-
-    local len_bytes, rerr = sock:receive(4)
-    if not len_bytes then sock:close(); logf("no welcome length: %s", tostring(rerr)); return false, rerr end
+-- Synchronous frame send/recv used during the handshake. After handshake
+-- completes, net_tick_loop owns the socket and parses frames asynchronously.
+local function _send_frame(sock, msg)
+    local body = json.encode(msg)
+    return sock:send(pack_u32_be(#body) .. body)
+end
+local function _recv_frame(sock)
+    local len_bytes, e1 = sock:receive(4)
+    if not len_bytes then return nil, e1 end
     local body_len = unpack_u32_be(len_bytes)
-    local body_str, rerr2 = sock:receive(body_len)
-    if not body_str then sock:close(); logf("no welcome body: %s", tostring(rerr2)); return false, rerr2 end
-    local ok3, welcome = pcall(json.decode, body_str)
-    if not ok3 or welcome.type ~= "welcome" then sock:close(); logf("bad welcome"); return false, "bad welcome" end
+    local body_str, e2 = sock:receive(body_len)
+    if not body_str then return nil, e2 end
+    local ok, m = pcall(json.decode, body_str)
+    if not ok then return nil, "bad json" end
+    return m
+end
+-- Read until we get the message type we want. Other messages (room_list,
+-- room_updated, etc.) get queued for the post-handshake dispatcher to handle.
+-- Bounded by a wall-clock deadline so a missing message can't hang us.
+local function _recv_until(sock, want_type, deadline_s, queue)
+    local deadline = (socket.gettime and socket.gettime() or os.time()) + (deadline_s or 8)
+    while true do
+        local now = socket.gettime and socket.gettime() or os.time()
+        if now > deadline then return nil, "timeout waiting for " .. want_type end
+        local m, err = _recv_frame(sock)
+        if not m then return nil, err end
+        if m.type == want_type then return m end
+        if queue then table.insert(queue, m) end
+    end
+end
 
-    sock:settimeout(0)
-    mp.sock = sock
-    mp.rx_buf = ""
+local function _apply_welcome(welcome)
     mp.puppets = {}
     mp.items = {}
     mp.item_obj_to_id = {}
@@ -1705,21 +1871,108 @@ local function connect_and_handshake(proposed_seed)
     joiner_pre_snapshot_items = {}
     joiner_pre_snapshot_objs = {}
     mp.my_id = welcome.id
+    mp.room_id = welcome.room_id
+    mp.room_name = welcome.room_name
     mp.host_id = welcome.host_id
     mp.is_host = (welcome.host_id == welcome.id)
-    mp.session_seed = welcome.seed  -- save so GenerateLevel wrap can re-apply it
+    mp.session_seed = welcome.seed
     mp.pending_initial_players = welcome.players or {}
-    -- Joiners may receive an item_list inline with welcome (server-cached host snapshot
-    -- minus already-picked ids). Stash for application after level loads.
-    -- json decoder turns null into {}, so check #table > 0, not just truthy.
+    -- Live roster for the waiting-room UI (excludes self).
+    mp.room_players = {}
+    for _, p in ipairs(welcome.players or {}) do
+        if p.id ~= mp.my_id then
+            table.insert(mp.room_players, { id = p.id, name = p.name })
+        end
+    end
     if not mp.is_host and type(welcome.item_list) == "table" and #welcome.item_list > 0 then
         mp.pending_item_list = welcome.item_list
         logf("welcome: stashed pending_item_list n=%d", #welcome.item_list)
     end
-    logf("connected my_id=%d seed=%s host_id=%s is_host=%s initial_players=%d item_list=%d",
-        welcome.id, tostring(welcome.seed), tostring(welcome.host_id), tostring(mp.is_host),
-        #(welcome.players or {}), #(welcome.item_list or {}))
-    return true, welcome.seed
+    logf("welcome: room_id=%s room='%s' my_id=%d seed=%s host_id=%s is_host=%s status=%s players=%d",
+        tostring(welcome.room_id), tostring(welcome.room_name),
+        welcome.id, tostring(welcome.seed), tostring(welcome.host_id),
+        tostring(mp.is_host), tostring(welcome.status), #(welcome.players or {}))
+    if apply_waiting_labels then pcall(apply_waiting_labels) end
+end
+
+-- New-protocol handshake. Connects to the relay, sends `hello`, then either
+-- create_room (host) or list_rooms + join_room (joiner). Phase 1 keeps the
+-- 'click-and-play' feel by auto-sending start_game after a host's create.
+-- Phase 2 will route through the lobby UI (mp_lobby page) and let the host
+-- decide when to start.
+local function connect_and_handshake(proposed_seed)
+    logf("connecting to %s:%d as '%s'…", config.host, config.port, config.name)
+    local sock = socket.tcp()
+    sock:settimeout(5)
+    local ok, err = sock:connect(config.host, config.port)
+    if not ok then logf("connect failed: %s", tostring(err)); return false, err end
+    pcall(function() sock:setoption("tcp-nodelay", true) end)
+
+    -- Catch any out-of-band messages (room_list pushes etc.) that arrive
+    -- between the messages we explicitly expect. After handshake we replay
+    -- them through the main dispatcher.
+    local queued = {}
+
+    -- Server sends hello_ack on connect.
+    local ack, err1 = _recv_until(sock, "hello_ack", 5, queued)
+    if not ack then sock:close(); logf("no hello_ack: %s", tostring(err1)); return false, err1 end
+    logf("hello_ack: client_id=%s", tostring(ack.client_id))
+
+    -- Send our hello (just name now — no auto-session).
+    local ok2, err2 = _send_frame(sock, { type = "hello", name = config.name })
+    if not ok2 then sock:close(); return false, err2 end
+
+    local is_host = proposed_seed ~= nil
+    local welcome
+    if is_host then
+        -- Host: create the room. Server auto-joins us and sends welcome.
+        local room_name = (config.name or "Player") .. "'s game"
+        _send_frame(sock, { type = "create_room", name = room_name, seed = proposed_seed })
+        local rc, e3 = _recv_until(sock, "room_created", 5, queued)
+        if not rc then sock:close(); return false, "no room_created: " .. tostring(e3) end
+        logf("room_created: room_id=%d", rc.room_id)
+        local w, e4 = _recv_until(sock, "welcome", 5, queued)
+        if not w then sock:close(); return false, "no welcome (host): " .. tostring(e4) end
+        welcome = w
+        _apply_welcome(welcome)
+        -- Phase 1 auto-start. Phase 2 will defer this to a Start button.
+        _send_frame(sock, { type = "start_game" })
+        local gs, e5 = _recv_until(sock, "game_started", 5, queued)
+        if not gs then sock:close(); return false, "no game_started (host): " .. tostring(e5) end
+        mp.session_seed = gs.seed  -- canonical post-start seed
+    else
+        -- Joiner: list, pick the first available room, join, wait for start.
+        _send_frame(sock, { type = "list_rooms" })
+        local rl, e3 = _recv_until(sock, "room_list", 5, queued)
+        if not rl then sock:close(); return false, "no room_list: " .. tostring(e3) end
+        if not rl.rooms or #rl.rooms == 0 then
+            sock:close()
+            logf("no rooms available to join")
+            return false, "no rooms"
+        end
+        local target = rl.rooms[1]
+        logf("joining room id=%d name='%s' host_id=%s", target.room_id, tostring(target.name), tostring(target.host_id))
+        _send_frame(sock, { type = "join_room", room_id = target.room_id })
+        local w, e4 = _recv_until(sock, "welcome", 5, queued)
+        if not w then sock:close(); return false, "no welcome (joiner): " .. tostring(e4) end
+        welcome = w
+        _apply_welcome(welcome)
+        if welcome.status ~= "in_game" then
+            -- Host hasn't started yet — block until they do (up to 60s).
+            local gs, e5 = _recv_until(sock, "game_started", 60, queued)
+            if not gs then sock:close(); return false, "no game_started (joiner): " .. tostring(e5) end
+            mp.session_seed = gs.seed
+        end
+    end
+
+    -- Hand the socket off to the async dispatcher and replay anything that
+    -- arrived out-of-order during the handshake.
+    sock:settimeout(0)
+    mp.sock = sock
+    mp.rx_buf = ""
+    mp.handshake_queued = queued  -- net_tick_loop drains this first
+
+    return true, mp.session_seed
 end
 
 local function disconnect_only()
@@ -1749,24 +2002,21 @@ end
 -- ============ NETWORK COROUTINE ============
 local function net_tick_loop()
     local send_interval = 1.0 / config.send_rate_hz
-    while true do
-        -- Install TakeDamage hook as soon as a player exists.
-        if _G.MP_INSTALL_TAKEDMG_DEFERRED and _G.MP_NATIVE then
-            local pl = player.GetPlayer()
-            if not _G.MP_TICK_LOGGED then
-                _G.MP_TICK_LOGGED = true
-                if _G.MP_NATIVE.log then
-                    _G.MP_NATIVE.log(string.format(
-                        "deferred installer tick: pl=%s pl.pointer=%s ptype=%s",
-                        tostring(pl), tostring(pl and pl.pointer), type(pl and pl.pointer)))
-                end
-            end
-            if pl and pl.pointer then
-                local ok = _G.MP_NATIVE.install_takedamage_hook(pl.pointer)
-                if _G.MP_NATIVE.log then _G.MP_NATIVE.log("install_takedamage_hook -> " .. tostring(ok)) end
-                _G.MP_INSTALL_TAKEDMG_DEFERRED = nil
-            end
+    -- Drain any messages the handshake queued (lobby pushes that arrived
+    -- between expected handshake replies). Routed through the normal
+    -- handlers table before the socket loop starts pulling new frames.
+    if mp.handshake_queued and #mp.handshake_queued > 0 then
+        for _, m in ipairs(mp.handshake_queued) do
+            local h = handlers[m.type]
+            if h then pcall(h, m) else logf("handshake-queue unknown type=%s", tostring(m.type)) end
         end
+        mp.handshake_queued = nil
+    end
+    while true do
+        -- Mob-class vtable takedmg hook DISABLED — signature mismatch on
+        -- non-Soldat classes crashed the host on first bullet hit. Direct
+        -- damage on host is parked (Task: joiner melee). The accumulator
+        -- snapshot-drop in handle_mob_damage keeps the joiner-side feel.
         if mp.sock then
             local chunk, err, partial = mp.sock:receive(4096)
             if chunk then
@@ -2035,9 +2285,11 @@ local function setup_test_room()
     logf("test_room: setup DONE host_items=%d", (function() local n=0; for _ in pairs(mp.items) do n=n+1 end; return n end)())
 end
 
--- ============ DEV MENU (host-only item spawner) ============
--- Numpad +/- cycle item, Numpad Enter spawn at player pos, Numpad * toggle visibility.
-local DEV_ITEMS = {
+-- ============ DEV MENU (multi-category) ============
+-- KP+ toggle, KP4/KP6 switch category, Up/Down cycle action, Enter run.
+-- Available on BOTH host and joiner so the joiner can test their own death
+-- intercept without being shot first.
+local ITEM_TYPES = {
     "pystol", "pump", "agl", "revolver",
     "pyammo", "ppammo", "auammo", "pexpammo",
     "smtimebomb", "nailbomb", "rocketitem",
@@ -2045,35 +2297,203 @@ local DEV_ITEMS = {
     "armor", "smarmor",
     "emptycan", "tube", "metalplate", "hardware", "nailbox",
 }
-dev_menu = { visible = false, index = 1 }  -- fills the forward-declared local
-
-local function dev_menu_render()
-    if not (level and level.IsLoaded and level.IsLoaded()) then return end
-    if not dev_menu.visible then return end
-    local item = DEV_ITEMS[dev_menu.index] or "?"
-    local txt = string.format("[DEV %d/%d] <%s>  KP+/- cycle, KPEnter spawn, KP* close",
-        dev_menu.index, #DEV_ITEMS, item)
-    pcall(function() level.SetObjectiveString(txt) end)
-end
 
 local dev_spawn_counter = 0
-local function dev_menu_spawn_current()
+local function spawn_at_player(name)
     local pl = player.GetPlayer()
-    if not pl then return end
+    if not pl then return false, "no player" end
     local px, py = pl:GetPosition()
-    local name = DEV_ITEMS[dev_menu.index]
-    if not name then return end
-    -- Stagger positions in a circle around the player so items don't stack.
     dev_spawn_counter = dev_spawn_counter + 1
-    local angle = (dev_spawn_counter * 0.7)  -- ~40deg per spawn
+    local angle = dev_spawn_counter * 0.7
     local radius = 1.2 + (dev_spawn_counter % 4) * 0.4
     local ix = px + math.cos(angle) * radius
     local iy = py + math.sin(angle) * radius
     mp.spawn_test_scene = true
     local ok, err = pcall(function() Create{ type = name, x = ix, y = iy, angle = 0 } end)
     mp.spawn_test_scene = false
-    logf("dev_menu: spawn %s at (%.2f,%.2f) ok=%s err=%s",
-        name, ix, iy, tostring(ok), tostring(err))
+    return ok, err
+end
+
+-- Categories: each = { name, actions = { {label, run}, ... } }.
+-- Built lazily so it can reference functions defined later in this file
+-- (refresh_objective_string, send_msg, etc. are already in scope here).
+local DEV_CATEGORIES
+local function build_dev_categories()
+    if DEV_CATEGORIES then return DEV_CATEGORIES end
+
+    -- Test triggers — available on both host and joiner.
+    local test_actions = {
+        { label = "Kill self (enter spectate)", run = function()
+            if mp.is_dead then logf("dev: already dead"); return end
+            mp.is_dead = true
+            mp.death_announced_at = nil  -- frame_tick will pin + announce
+            logf("dev: kill_self → mp.is_dead = true")
+        end },
+        { label = "Revive (clear dead state)", run = function()
+            mp.is_dead = false
+            mp.death_announced_at = nil
+            local pl = player.GetPlayer()
+            if pl and pl.pointer and _G.MP_NATIVE and _G.MP_NATIVE.set_invulnerable then
+                pcall(function() _G.MP_NATIVE.set_invulnerable(pl.pointer, false) end)
+            end
+            pcall(refresh_objective_string)
+            logf("dev: revive")
+        end },
+        { label = "Dump MP state", run = function()
+            local n_puppets = 0
+            for _, e in pairs(mp.puppets or {}) do
+                n_puppets = n_puppets + 1
+                logf("  puppet id=? name=%s is_dead=%s pos=(%.1f,%.1f)",
+                    tostring(e.name), tostring(e.is_dead),
+                    e.last_x or 0, e.last_y or 0)
+            end
+            logf("MP STATE: in_game=%s is_host=%s is_dead=%s puppets=%d room='%s'",
+                tostring(mp.in_game), tostring(mp.is_host),
+                tostring(mp.is_dead), n_puppets, tostring(mp.room_name))
+        end },
+        { label = "Force send player_died", run = function()
+            if mp.sock then
+                pcall(function() send_msg({ type = "player_died" }) end)
+                logf("dev: forced player_died send")
+            end
+        end },
+    }
+
+    -- Items category — host-only spawn (joiner spawn would desync).
+    local item_actions = {}
+    for _, name in ipairs(ITEM_TYPES) do
+        local n = name
+        table.insert(item_actions, { label = "Spawn " .. n, run = function()
+            if not mp.is_host then logf("dev: items host-only"); return end
+            local ok, err = spawn_at_player(n)
+            logf("dev: spawn %s ok=%s err=%s", n, tostring(ok), tostring(err))
+        end })
+    end
+
+    -- Debug probes — survives from old kp_1/2/3 inline code.
+    local debug_actions = {
+        { label = "TextObj probe (spawn HELLO MP)", run = function()
+            local pl = player.GetPlayer()
+            local px, py = 0, 0
+            if pl then pcall(function() px, py = pl:GetPosition() end) end
+            local ok, res = pcall(function() return CreateTextObj(px, py + 1.5, "HELLO MP") end)
+            logf("dev: TextObj probe ok=%s value=%s", tostring(ok), tostring(res))
+            if ok and type(res) == "table" then mp._probe_textobj = res end
+        end },
+        { label = "TextObj follow player", run = function()
+            if not mp._probe_textobj then logf("dev: no probe yet"); return end
+            local pl = player.GetPlayer()
+            if not pl then return end
+            local px, py = pl:GetPosition()
+            pcall(function() mp._probe_textobj:SetPosition(px, py + 1.5) end)
+        end },
+        { label = "Print local player HP", run = function()
+            local pl = player.GetPlayer()
+            if not pl then return end
+            local hp = nil
+            pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
+            logf("dev: local HP = %s", tostring(hp))
+        end },
+    }
+
+    DEV_CATEGORIES = {
+        { name = "Test",  actions = test_actions  },
+        { name = "Items", actions = item_actions  },
+        { name = "Debug", actions = debug_actions },
+    }
+    return DEV_CATEGORIES
+end
+
+-- World-space multi-line menu rendered via CreateTextObj (same path as
+-- nameplates). Lines follow the player so the menu is always on screen.
+-- Text objects are CACHED — only recreated when content changes, to
+-- avoid per-frame allocation churn that hammered the engine.
+dev_menu = {
+    visible    = false,
+    cat        = 1,
+    idx        = 1,
+    text_objs  = {},   -- array of CreateTextObj handles
+    text_cache = {},   -- last-set text per line — skip recreate if unchanged
+}
+
+local DEV_LINE_DY    = 0.35   -- world-units between menu rows (top to bottom)
+local DEV_TOP_OFFSET = 3.5    -- world-units above player for the first line
+local DEV_HIDE_POS   = -9999
+
+local function dev_menu_clear_lines()
+    for _, t in ipairs(dev_menu.text_objs) do
+        if t then pcall(function() t:Delete() end) end
+    end
+    dev_menu.text_objs  = {}
+    dev_menu.text_cache = {}
+end
+
+local function dev_menu_build_lines()
+    local cats = build_dev_categories()
+    local cat  = cats[dev_menu.cat]
+    if not cat then return {} end
+    local lines = {}
+    -- Header (with simple ASCII frame to fake a "panel" without a sprite).
+    table.insert(lines, "================================")
+    table.insert(lines, string.format("  DEV  [%s]  (KP4/6=cat)", cat.name))
+    table.insert(lines, "--------------------------------")
+    for i, act in ipairs(cat.actions) do
+        local marker = (i == dev_menu.idx) and ">> " or "   "
+        table.insert(lines, marker .. act.label)
+    end
+    table.insert(lines, "--------------------------------")
+    table.insert(lines, "Up/Dn=move  Enter=run  KP+=close")
+    table.insert(lines, "================================")
+    return lines
+end
+
+local function dev_menu_render()
+    if not (level and level.IsLoaded and level.IsLoaded()) then return end
+    if not dev_menu.visible then
+        if #dev_menu.text_objs > 0 then dev_menu_clear_lines() end
+        return
+    end
+    local pl = player.GetPlayer()
+    if not pl then return end
+    local px, py = pl:GetPosition()
+    local lines = dev_menu_build_lines()
+    -- Grow/shrink text_objs to match lines.
+    while #dev_menu.text_objs < #lines do
+        local idx = #dev_menu.text_objs + 1
+        local ty = py + DEV_TOP_OFFSET - (idx - 1) * DEV_LINE_DY
+        local obj
+        pcall(function() obj = CreateTextObj(px, ty, lines[idx]) end)
+        table.insert(dev_menu.text_objs,  obj)
+        table.insert(dev_menu.text_cache, lines[idx])
+    end
+    while #dev_menu.text_objs > #lines do
+        local last = table.remove(dev_menu.text_objs)
+        table.remove(dev_menu.text_cache)
+        if last then pcall(function() last:Delete() end) end
+    end
+    -- Update each line: reposition every frame, only recreate when text changes.
+    for i, txt in ipairs(lines) do
+        local ty  = py + DEV_TOP_OFFSET - (i - 1) * DEV_LINE_DY
+        local obj = dev_menu.text_objs[i]
+        if dev_menu.text_cache[i] ~= txt then
+            if obj then pcall(function() obj:Delete() end) end
+            local newobj
+            pcall(function() newobj = CreateTextObj(px, ty, txt) end)
+            dev_menu.text_objs[i]  = newobj
+            dev_menu.text_cache[i] = txt
+        elseif obj then
+            pcall(function() obj:SetPosition(px, ty) end)
+        end
+    end
+end
+
+local function dev_menu_run_current()
+    local cats = build_dev_categories()
+    local cat = cats[dev_menu.cat]
+    local act = cat and cat.actions[dev_menu.idx]
+    if not act then return end
+    logf("dev: run [%s] %s", cat.name, act.label)
+    pcall(act.run)
 end
 
 local function kp(name)
@@ -2130,14 +2550,22 @@ local function dev_menu_tick()
             local x, y, vx, vy, dmg, force, btype = _G.MP_NATIVE.consume_bullet()
             if not x then break end
             local angle = math.atan2(vy, vx)
-            local speed = math.sqrt(vx * vx + vy * vy)
+            -- Engine ctor gives vx/vy in PER-TICK world units (very small;
+            -- sqrt -> ~1-3). Lua CreateBullet's `speed` arg is in the larger
+            -- per-second scale (typical weapon defs use 12-25). Re-fire with
+            -- a stable 15 — the value the old itemtable-lookup path fell back
+            -- to and that visibly worked. dmg/force come straight from the
+            -- ctor (real per-weapon values). btype (a6) is actually the owner
+            -- pointer, not a bullet-type id — drop it.
+            local raw_speed = math.sqrt(vx * vx + vy * vy)
+            local speed = 15
             if not _G.MP_LOGGED_BSTATS then
                 _G.MP_LOGGED_BSTATS = true
-                logf("bullet stats (from ctor): dmg=%s force=%s type=%s speed=%.2f",
-                    tostring(dmg), tostring(force), tostring(btype), speed)
+                logf("bullet stats (from ctor): dmg=%s force=%s raw_speed=%.2f -> tx_speed=%d",
+                    tostring(dmg), tostring(force), raw_speed, speed)
             end
             send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = speed,
-                       dmg = dmg or 10, force = force, btype = btype or 0 })
+                       dmg = dmg or 10, force = force })
         end
     end
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
@@ -2186,82 +2614,51 @@ local function dev_menu_tick()
         logf("manual pickup key pressed")
         manual_pickup_nearest()
     end
-    -- TEXTOBJ PROBE: Numpad / spawns a CreateTextObj near the player and logs
-    -- everything we can learn about the returned handle.
-    if kp("kp_1") then
-        local pl = player.GetPlayer()
-        local px, py = 0, 0
-        if pl then pcall(function() px, py = pl:GetPosition() end) end
-        local ok, res = pcall(function() return CreateTextObj(px, py + 1.5, "HELLO MP") end)
-        logf("TEXTOBJ probe: ok=%s type=%s value=%s", tostring(ok), type(res), tostring(res))
-        if ok and type(res) == "table" then
-            local methods = {}
-            for k, v in pairs(res) do methods[#methods+1] = string.format("%s=%s", tostring(k), type(v)) end
-            logf("TEXTOBJ fields: %s", table.concat(methods, ", "))
-            local mt = getmetatable(res)
-            if mt then
-                local mtm = {}
-                for k, v in pairs(mt) do mtm[#mtm+1] = string.format("%s=%s", tostring(k), type(v)) end
-                logf("TEXTOBJ metatable: %s", table.concat(mtm, ", "))
-                if type(mt.__index) == "table" then
-                    local idxm = {}
-                    for k, v in pairs(mt.__index) do idxm[#idxm+1] = string.format("%s=%s", tostring(k), type(v)) end
-                    logf("TEXTOBJ __index: %s", table.concat(idxm, ", "))
-                end
-            end
-            mp._probe_textobj = res  -- keep ref so engine doesn't GC it
-        end
-    end
-    -- TEXTOBJ FOLLOW: Numpad * moves the probe text to follow the player so
-    -- we can tell if coords are world-space (follows) or screen-space (fixed).
-    if kp("kp_2") and mp._probe_textobj then
-        local pl = player.GetPlayer()
-        if pl then
-            local px, py = pl:GetPosition()
-            local ok1 = pcall(function() mp._probe_textobj:SetPosition(px, py + 1.5) end)
-            local ok2 = pcall(function() mp._probe_textobj:SetStartPos(px, py + 1.5) end)
-            local cpx, cpy
-            pcall(function() cpx, cpy = mp._probe_textobj:GetPosition() end)
-            local spx, spy
-            pcall(function() spx, spy = mp._probe_textobj:GetStartPos() end)
-            logf("TEXTOBJ follow SetPos=%s SetStartPos=%s player=(%.2f,%.2f) GetPos=(%s,%s) GetStartPos=(%s,%s)",
-                tostring(ok1), tostring(ok2), px, py,
-                tostring(cpx), tostring(cpy), tostring(spx), tostring(spy))
-        end
-    end
-    -- Numpad 3: spawn another text far away in world coords (50, 50) — if
-    -- text is world-space we'll see it disappear off the screen.
-    if kp("kp_3") then
-        local ok, res = pcall(function() return CreateTextObj(50, 50, "FAR AWAY") end)
-        logf("TEXTOBJ far probe: ok=%s value=%s", tostring(ok), tostring(res))
-        if ok then mp._probe_textobj_far = res end
-    end
-    -- Keep dev menu text on screen against any other writers (handle_join,
-    -- handle_leave, etc. all call refresh_objective_string).
+
+    -- Keep dev menu text on screen against any other writers
+    -- (refresh_objective_string overwrites it each tick).
     if dev_menu.visible then dev_menu_render() end
-    if not mp.is_host then return end
+
+    -- KP+ toggle — works on BOTH host and joiner so joiners can trigger
+    -- the death intercept on themselves without being shot first.
     if kp("kp_plus") then
         dev_menu.visible = not dev_menu.visible
         logf("dev_menu: toggle visible=%s", tostring(dev_menu.visible))
         if not dev_menu.visible then
-            pcall(function() level.SetObjectiveString("") end)
+            dev_menu_clear_lines()
+            pcall(refresh_objective_string)
         else
             dev_menu_render()
         end
     end
     if not dev_menu.visible then return end
-    if kp("down") then
-        dev_menu.index = (dev_menu.index % #DEV_ITEMS) + 1
-        logf("dev_menu: down -> %d (%s)", dev_menu.index, DEV_ITEMS[dev_menu.index])
+
+    local cats = build_dev_categories()
+    local cat  = cats[dev_menu.cat]
+    if not cat then return end
+
+    -- KP4/KP6 switch category, wraps around. Reset action index.
+    if kp("kp_4") then
+        dev_menu.cat = ((dev_menu.cat - 2) % #cats) + 1
+        dev_menu.idx = 1
         dev_menu_render()
-    elseif kp("up") then
-        dev_menu.index = ((dev_menu.index - 2) % #DEV_ITEMS) + 1
-        logf("dev_menu: up -> %d (%s)", dev_menu.index, DEV_ITEMS[dev_menu.index])
+    elseif kp("kp_6") then
+        dev_menu.cat = (dev_menu.cat % #cats) + 1
+        dev_menu.idx = 1
         dev_menu_render()
     end
+
+    -- Up/Down cycle action within category.
+    if kp("down") then
+        dev_menu.idx = (dev_menu.idx % #cat.actions) + 1
+        dev_menu_render()
+    elseif kp("up") then
+        dev_menu.idx = ((dev_menu.idx - 2) % #cat.actions) + 1
+        dev_menu_render()
+    end
+
     if kp("return") or kp("kp_enter") then
-        logf("dev_menu: ENTER, spawning")
-        dev_menu_spawn_current()
+        dev_menu_run_current()
     end
 end
 
@@ -2275,86 +2672,1106 @@ local function start_dev_menu_coro()
     coroutine.resume(co)
 end
 
--- ============ MENU INTEGRATION ============
-pcall(function()
-    if not (menu and menu.GetPage) then return end
-    local page = menu.GetPage("mainmenu")
-    if not page then return end
+-- ============ MENU INTEGRATION (Phase 2 lobby) ============
+local _mp_integration_ok, _mp_integration_err = pcall(function()
+    if not (menu and menu.GetPage and menu.AddPage and menu.SetPage) then
+        logf("menu API missing — skipping MP menu integration")
+        return
+    end
+    local mainmenu_page = menu.GetPage("mainmenu")
+    if not mainmenu_page or not mainmenu_page.AddButton then
+        logf("mainmenu page missing — skipping MP menu integration")
+        return
+    end
+    logf("MP menu integration: starting")
 
-    if page.AddButton then
-        pcall(function() page:AddButton(21, 82, "- MP MOD -", "by OriginUnknowns", function() end) end)
-        local function enter_mp(is_host, test_mode)
-            -- Hardcoded seed for repeatable testing. Set to nil to use os.time().
-            local FIXED_SEED = 1779843477
-            local proposed_seed = is_host and (FIXED_SEED or os.time()) or nil
-            local ok, seed = connect_and_handshake(proposed_seed)
-            if not ok then return end
-            mp.test_mode = test_mode and true or false
-            logf("enter_mp: test_mode=%s step=randomseed seed=%s", tostring(mp.test_mode), tostring(seed))
-            math.randomseed(seed)
-            logf("enter_mp: step=StartFrom level1")
-            local lok, lerr = pcall(function() level.StartFrom("level1", 0) end)
-            if not lok then logf("enter_mp: StartFrom CRASH: %s", tostring(lerr)) end
-            logf("enter_mp: step=SetState game")
-            pcall(function() menu.SetState("game", true) end)
-            for _, p in ipairs(mp.pending_initial_players or {}) do
-                if p.id ~= mp.my_id then handle_join(p) end
-            end
-            mp.pending_initial_players = nil
-            pcall(refresh_objective_string)
-            mp.pickup_scan_start_after = socket.gettime() + 2.5
-            start_net_coro()
-            start_dev_menu_coro()  -- both sides — manual pickup key works for everyone
-            if mp.test_mode then
-                -- Test mode: skip normal joiner-mob-cleanup + host-snapshot coros.
-                -- setup_test_room handles both sides' cleanup + host's item spawn/send.
-                local co = coroutine.create(function()
-                    local sok, serr = pcall(setup_test_room)
-                    if not sok then logf("test_room CRASH: %s", tostring(serr)) end
+    pcall(function() mainmenu_page:AddButton(21, 82, "- MP MOD -", "by OriginUnknowns", function() end) end)
+
+    -- ------------------------------------------------------------------
+    -- begin_game: triggered when game_started arrives (or when joining a
+    -- room already in_game). Does the post-handshake work the old
+    -- enter_mp did inline. Forward-declared above so message handlers
+    -- can reach it.
+    -- ------------------------------------------------------------------
+    begin_game = function()
+        if mp.in_game then return end
+        mp.in_game = true
+        mp.test_mode = false
+        -- Restore normal ESC behavior — a previous Disconnect may have
+        -- left it suppressed or in quits-mode.
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_suppress_esc then
+            pcall(function() _G.MP_NATIVE.set_suppress_esc(false) end)
+        end
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_quits then
+            pcall(function() _G.MP_NATIVE.set_esc_quits(false) end)
+        end
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_leaves_lobby then
+            pcall(function() _G.MP_NATIVE.set_esc_leaves_lobby(false) end)
+        end
+        -- Just clear our own force flag. The Lua-side puppet / mob /
+        -- item maps are reset by the level.Clear wrap that level.StartFrom
+        -- below invokes internally — re-clearing them here would race
+        -- with that and could leave the engine and our Lua state out
+        -- of sync mid-frame.
+        mp.force_kicked_page = false
+        -- Death intercept (task #8): cleared at level start; per-frame
+        -- HP polling in MP_FRAME_TICK drives the dead state.
+        mp.is_dead = false
+        mp.death_announced_at = nil
+        local seed = mp.session_seed or 1779843477
+        logf("begin_game: seed=%s is_host=%s room='%s'",
+            tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
+        math.randomseed(seed)
+        local lok, lerr = pcall(function() level.StartFrom("level1", 0) end)
+        if not lok then logf("begin_game: StartFrom CRASH: %s", tostring(lerr)) end
+        pcall(function() menu.SetState("game", true) end)
+        -- Pre-select the pause/ESC menu so it shows up if the user hits
+        -- ESC mid-game. The engine remembers the most recently set page
+        -- when bouncing in/out of game state.
+        pcall(function() menu.SetPage("mp_pause") end)
+        for _, p in ipairs(mp.pending_initial_players or {}) do
+            if p.id ~= mp.my_id then handle_join(p) end
+        end
+        mp.pending_initial_players = nil
+        pcall(refresh_objective_string)
+        mp.pickup_scan_start_after = socket.gettime() + 2.5
+        start_net_coro()      -- safe here — we're now in game state
+        start_dev_menu_coro()
+        start_joiner_cleanup_coro()
+        if mp.is_host then
+            local co = coroutine.create(function()
+                pcall(function()
+                    Wait(1.5)
+                    host_send_item_list()
                 end)
-                coroutine.resume(co)
-            else
-                start_joiner_cleanup_coro()
-                if mp.is_host then
-                    local co = coroutine.create(function()
-                        pcall(function()
-                            Wait(1.5)
-                            host_send_item_list()
-                        end)
-                    end)
-                    coroutine.resume(co)
+            end)
+            coroutine.resume(co)
+        end
+        logf("begin_game: DONE")
+    end
+
+    -- ------------------------------------------------------------------
+    -- Lobby helpers. Phase 3 design:
+    --
+    -- Coroutine-based async is OUT at title-menu state — Wait() called
+    -- inside an engine-untracked coroutine hard-crashes the host (the
+    -- probe confirmed: "coro started" logs but resume never returns and
+    -- the process dies). So everything here is synchronous.
+    --
+    -- Flow:
+    --   Create Room → connect + create_room + read welcome → mp_waiting
+    --     (host).
+    --     Host clicks "Start Game" → send start_game + read game_started
+    --     → begin_game.
+    --   Join Open Room → connect + list_rooms + read room_list + send
+    --     join_room + read welcome.
+    --     If room is in_game → begin_game (late join).
+    --     If lobby → mp_waiting (joiner) with a "Check Status" button
+    --     the joiner clicks to drain the socket; when game_started
+    --     arrives, begin_game.
+    --
+    -- Manual Check is klunky but reliable; the alternative (block-on
+    -- sock:receive) freezes the menu indefinitely.
+    -- ------------------------------------------------------------------
+
+    -- Lobby-state handlers. Distinct from the global `handlers` table:
+    -- those spawn entities (puppets, mobs) and would hard-crash at
+    -- title-menu state where no level is loaded. The lobby variants
+    -- only touch mp state used by the waiting-room UI.
+    local lobby_handlers = {
+        welcome      = function(m) handle_welcome(m) end,
+        hello_ack    = function(m) end,
+        room_list    = function(m)
+            mp.lobby_rooms = m.rooms or {}
+            mp.lobby_count   = m.lobby_count
+            mp.in_game_count = m.in_game_count
+            pcall(apply_lobby_stats_labels)
+        end,
+        room_created = function(m) end,
+        room_updated = function(m) mp.last_room_update = m.room end,
+        left_room    = function(m) end,
+        join_failed  = function(m) handle_join_failed(m) end,
+        host_changed = function(m)
+            mp.host_id = m.host_id
+            mp.is_host = (m.host_id == mp.my_id)
+            logf("lobby host_changed: host_id=%s is_host=%s", tostring(m.host_id), tostring(mp.is_host))
+            if apply_waiting_labels then pcall(apply_waiting_labels) end
+        end,
+        game_started = function(m)
+            if m.seed then mp.session_seed = m.seed end
+            mp.game_started_pending = true
+            logf("lobby game_started: seed=%s (flagged)", tostring(m.seed))
+        end,
+        join = function(m)
+            mp.room_players = mp.room_players or {}
+            for _, p in ipairs(mp.room_players) do
+                if p.id == m.id then p.name = m.name; return end
+            end
+            table.insert(mp.room_players, { id = m.id, name = m.name })
+            logf("lobby join: id=%s name='%s'", tostring(m.id), tostring(m.name))
+            if apply_waiting_labels then pcall(apply_waiting_labels) end
+        end,
+        leave = function(m)
+            if mp.room_players then
+                for i, p in ipairs(mp.room_players) do
+                    if p.id == m.id then table.remove(mp.room_players, i); break end
                 end
             end
-            logf("enter_mp: DONE")
+            -- Also mirror to mp.puppets so the in-game pause UI
+            -- (which reads mp.puppets via apply_pause_labels) sees
+            -- the player drop off without waiting for the net
+            -- coroutine to resume.
+            if mp.puppets and mp.puppets[m.id] then
+                pcall(function() safe_delete(mp.puppets[m.id].obj) end)
+                if mp.puppets[m.id].nameplate then
+                    pcall(function() mp.puppets[m.id].nameplate:Delete() end)
+                end
+                mp.puppets[m.id] = nil
+            end
+            logf("lobby leave: id=%s", tostring(m.id))
+            if apply_waiting_labels then pcall(apply_waiting_labels) end
+        end,
+        kicked = function(m) handle_kicked(m) end,
+    }
+
+    -- Pull frames from mp.sock at title-menu state. Lobby-known messages
+    -- dispatch through lobby_handlers; anything else is queued for the
+    -- normal net coroutine (started by begin_game) to replay once we're
+    -- actually in the game.
+    --
+    -- Fully non-blocking + hard cap of 16 messages per call. We're invoked
+    -- from a Win32 PeekMessageA hook on the engine's main thread — any
+    -- sock:receive that blocks freezes the entire game. The cap also
+    -- guarantees the tick can never starve other Windows messages.
+    local function drain_sock_sync()
+        if not mp.sock then return 0 end
+        mp.handshake_queued = mp.handshake_queued or {}
+        local drained = 0
+        for _ = 1, 16 do
+            mp.sock:settimeout(0)
+            local len_bytes = mp.sock:receive(4)
+            if not len_bytes then break end
+            local body_len = unpack_u32_be(len_bytes)
+            -- Header arrived → body is virtually certain to be right after
+            -- (TCP segments are typically together). Use a tiny timeout so
+            -- we don't spin if the body trails the header by microseconds.
+            mp.sock:settimeout(0.05)
+            local body = mp.sock:receive(body_len)
+            mp.sock:settimeout(0)
+            if not body then break end
+            local ok, msg = pcall(json.decode, body)
+            if ok and msg then
+                drained = drained + 1
+                local lh = lobby_handlers[msg.type]
+                if lh then
+                    pcall(lh, msg)
+                else
+                    table.insert(mp.handshake_queued, msg)
+                end
+            end
         end
-        local host_btn = page:AddButton(144, 104, "Host MP",
-            "Start hosting on " .. config.host .. ":" .. config.port,
-            function() enter_mp(true, false) end)
-        local join_btn = page:AddButton(144, 126, "Join MP",
-            "Join " .. config.host .. ":" .. config.port,
-            function() enter_mp(false, false) end)
-        local thost_btn = page:AddButton(144, 148, "Test Host",
-            "Host test room: 2 items + 1 mob, known positions",
-            function() enter_mp(true, true) end)
-        local tjoin_btn = page:AddButton(144, 170, "Test Join",
-            "Join the test room",
-            function() enter_mp(false, true) end)
+        return drained
+    end
+
+    local function arm_esc_leaves_lobby()
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_leaves_lobby then
+            pcall(function() _G.MP_NATIVE.set_esc_leaves_lobby(true) end)
+        end
+    end
+    local function disarm_esc_leaves_lobby()
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_leaves_lobby then
+            pcall(function() _G.MP_NATIVE.set_esc_leaves_lobby(false) end)
+        end
+    end
+
+    local function lobby_create_room_flow()
+        logf("lobby: Create flow")
+        -- Open the socket and finish hello/hello_ack synchronously so
+        -- mp.sock is live and ready for room ops without any coroutine.
+        local sock = socket.tcp()
+        sock:settimeout(5)
+        local cok, cerr = sock:connect(config.host, config.port)
+        if not cok then logf("Create: connect failed: %s", tostring(cerr)); return end
+        pcall(function() sock:setoption("tcp-nodelay", true) end)
+        local ack = _recv_frame(sock)
+        if not ack or ack.type ~= "hello_ack" then sock:close(); logf("Create: no hello_ack"); return end
+        mp.my_id = ack.client_id
+        _send_frame(sock, { type = "hello", name = config.name })
+        -- Create the room and wait for welcome.
+        local room_name = (config.name or "Player") .. "'s Game"
+        _send_frame(sock, { type = "create_room", name = room_name, seed = 1779843477 })
+        local queued = {}
+        local rc = _recv_until(sock, "room_created", 5, queued)
+        if not rc then sock:close(); logf("Create: no room_created"); return end
+        local welcome = _recv_until(sock, "welcome", 5, queued)
+        if not welcome then sock:close(); logf("Create: no welcome"); return end
+        _apply_welcome(welcome)
+        sock:settimeout(0)
+        mp.sock = sock
+        mp.rx_buf = ""
+        mp.handshake_queued = queued
+        logf("Create: in lobby — room_id=%d, navigating to mp_waiting", welcome.room_id)
+        arm_esc_leaves_lobby()
+        menu.SetPage("mp_waiting")
+    end
+
+    -- Open a fresh socket and run the hello handshake. Returns the live
+    -- non-blocking socket on success (or nil + err). Shared by the lobby
+    -- "list rooms" probe and the actual create/join flows.
+    local function lobby_handshake_socket()
+        local sock = socket.tcp()
+        sock:settimeout(5)
+        local cok, cerr = sock:connect(config.host, config.port)
+        if not cok then return nil, "connect: " .. tostring(cerr) end
+        pcall(function() sock:setoption("tcp-nodelay", true) end)
+        local ack = _recv_frame(sock)
+        if not ack or ack.type ~= "hello_ack" then sock:close(); return nil, "no hello_ack" end
+        mp.my_id = ack.client_id
+        _send_frame(sock, { type = "hello", name = config.name })
+        return sock
+    end
+
+    -- Refresh the room list. Connects to relay, asks, logs results,
+    -- closes. Repopulates mp.lobby_rooms (kept across clicks). Called
+    -- when the user clicks "Refresh List" or whenever a slot button
+    -- is clicked (so the slot resolves a fresh room id).
+    -- Build a compact 15-char-max label for one slot. Slot label fits the
+    -- C++ button's std::string SSO buffer (max 15 chars). Format:
+    --   "1:Kito 1/4"  (room index, short host name, count/max)
+    --   "(empty)"     (no room at that slot)
+    local function format_slot_label(idx, room)
+        if not room then return "(empty)" end
+        local host = tostring(room.host_name or "?"):sub(1, 6)
+        local cnt  = tonumber(room.count) or 0
+        local mx   = tonumber(room.max)   or 4
+        return string.format("%d:%s %d/%d", idx, host, cnt, mx)
+    end
+
+    local function total_pages()
+        local n = (mp.lobby_rooms and #mp.lobby_rooms) or 0
+        if n == 0 then return 1 end
+        return math.ceil(n / 4)
+    end
+
+    local function apply_slot_labels()
+        if not (mp.lobby_slot_btns and _G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
+        mp.lobby_page = mp.lobby_page or 1
+        -- Clamp page to current room count (rooms may have closed since
+        -- last paint; never strand the user on an empty page).
+        local tp = total_pages()
+        if mp.lobby_page > tp then mp.lobby_page = tp end
+        if mp.lobby_page < 1 then mp.lobby_page = 1 end
+        local offset = (mp.lobby_page - 1) * 4
+        for i = 1, 4 do
+            local btn = mp.lobby_slot_btns[i]
+            local room = mp.lobby_rooms and mp.lobby_rooms[offset + i]
+            if btn and btn.pointer then
+                local label = format_slot_label(i, room)
+                pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, label) end)
+            end
+        end
+        if mp.lobby_page_btn and mp.lobby_page_btn.pointer then
+            local label = string.format("Page %d/%d", mp.lobby_page, tp)
+            pcall(function() _G.MP_NATIVE.set_button_label(mp.lobby_page_btn.pointer, label) end)
+        end
+    end
+
+    local function lobby_refresh_rooms()
+        local sock, err = lobby_handshake_socket()
+        if not sock then logf("==== LOBBY ROOMS ==== refresh failed: %s", tostring(err)); return end
+        _send_frame(sock, { type = "list_rooms" })
+        local rl = _recv_until(sock, "room_list", 5, nil)
+        sock:close()
+        if not rl then logf("==== LOBBY ROOMS ==== no room_list reply"); return end
+        mp.lobby_rooms = rl.rooms or {}
+        mp.lobby_count = rl.lobby_count
+        mp.in_game_count = rl.in_game_count
+        pcall(apply_lobby_stats_labels)
+        logf("==== LOBBY ROOMS (%d) ====", #mp.lobby_rooms)
+        for i = 1, 4 do
+            local r = mp.lobby_rooms[i]
+            if r then
+                logf("  Slot %d │ %s │ host: %s │ %d/%d players │ %s",
+                    i, tostring(r.name), tostring(r.host_name),
+                    tonumber(r.count) or 0, tonumber(r.max) or 4,
+                    tostring(r.status))
+            else
+                logf("  Slot %d │ (empty)", i)
+            end
+        end
+        if #mp.lobby_rooms > 4 then
+            logf("  (%d more rooms not shown — only first 4 fit in slots)", #mp.lobby_rooms - 4)
+        end
+        apply_slot_labels()
+    end
+
+    -- Join a specific room by 1-based slot index on the current page.
+    -- Re-fetches the list first so a slot click is always against fresh
+    -- data (handles the case where a room closed since last paint).
+    local function lobby_join_slot(idx)
+        lobby_refresh_rooms()
+        local page   = mp.lobby_page or 1
+        local offset = (page - 1) * 4
+        local target = mp.lobby_rooms and mp.lobby_rooms[offset + idx]
+        if not target then
+            logf("Join Slot %d (page %d): no room at that slot", idx, page)
+            return
+        end
+        logf("Join Slot %d: room_id=%d name='%s' status=%s",
+            idx, target.room_id, tostring(target.name), tostring(target.status))
+        local sock, err = lobby_handshake_socket()
+        if not sock then logf("Join Slot %d: %s", idx, tostring(err)); return end
+        _send_frame(sock, { type = "join_room", room_id = target.room_id })
+        local queued = {}
+        local welcome = _recv_until(sock, "welcome", 5, queued)
+        if not welcome then sock:close(); logf("Join Slot %d: no welcome", idx); return end
+        _apply_welcome(welcome)
+        sock:settimeout(0)
+        mp.sock = sock
+        mp.rx_buf = ""
+        mp.handshake_queued = queued
+        if welcome.status == "in_game" then
+            logf("Join Slot %d: room already in_game — entering directly", idx)
+            if begin_game then begin_game() end
+        else
+            logf("Join Slot %d: room in lobby — navigating to mp_waiting", idx)
+            arm_esc_leaves_lobby()
+            menu.SetPage("mp_waiting")
+        end
+    end
+
+    -- Legacy "Join first" (kept for ergonomics). Just an alias for slot 1
+    -- after a refresh.
+    local function lobby_join_flow()
+        lobby_join_slot(1)
+    end
+
+    local function lobby_start_game()
+        if not mp.sock then logf("Start: no socket"); return end
+        if not mp.is_host then logf("Start: not host, ignoring"); return end
+        mp.game_started_pending = false
+        send_msg({ type = "start_game" })
+        -- Drain until we see our own game_started broadcast back.
+        for _ = 1, 50 do
+            drain_sock_sync()
+            if mp.game_started_pending then break end
+        end
+        if not mp.game_started_pending then
+            logf("Start: never saw game_started echo")
+            return
+        end
+        if begin_game then begin_game() end
+    end
+
+    local function lobby_refresh_status()
+        if not mp.sock then logf("Refresh: no socket"); return end
+        mp.game_started_pending = false
+        local n = drain_sock_sync()
+        -- Re-label the waiting room (player slots + start button) from the
+        -- mp state that drain_sock_sync's handlers just updated.
+        if apply_waiting_labels then pcall(apply_waiting_labels) end
+        -- Log the roster for visibility (slot buttons show first 15 chars).
+        local roster = {}
+        if mp.my_id then
+            table.insert(roster, (config.name or "?")
+                .. (mp.is_host and " (host,me)" or " (me)"))
+        end
+        for _, p in ipairs(mp.room_players or {}) do
+            if p.id ~= mp.my_id then
+                table.insert(roster, tostring(p.name or "?")
+                    .. (p.id == mp.host_id and " (host)" or ""))
+            end
+        end
+        logf("Refresh: room='%s' players=%d  ── roster: %s  ── drained=%d  game_started=%s",
+            tostring(mp.room_name), #roster, table.concat(roster, ", "),
+            n, tostring(mp.game_started_pending))
+        if mp.game_started_pending and begin_game then begin_game() end
+    end
+
+    local function lobby_leave_room()
+        logf("lobby_leave_room: entry — was_host=%s, mp.sock=%s",
+            tostring(mp.is_host), tostring(mp.sock ~= nil))
+        if mp.sock then
+            pcall(function() send_msg({ type = "leave_room" }) end)
+            pcall(function() mp.sock:close() end)
+            mp.sock = nil
+            mp.rx_buf = ""
+        end
+        mp.is_host = false
+        disarm_esc_leaves_lobby()
+        menu.SetPage("mp_lobby")
+    end
+
+    -- ------------------------------------------------------------------
+    -- Lobby page. Phase 2: only Create / Join First / Back. No waiting
+    -- room — host auto-starts, joiner late-joins straight into the
+    -- running game.
+    -- ------------------------------------------------------------------
+    -- ------------------------------------------------------------------
+    -- mp_lobby = entry page. Just two actions + Back. Clean.
+    -- ------------------------------------------------------------------
+    local mp_lobby_page
+    local pok1, perr1 = pcall(function()
+        mp_lobby_page = menu.AddPage("mp_lobby", "mainmenu")
+        if not mp_lobby_page then error("AddPage('mp_lobby') returned nil") end
+        pcall(function() mp_lobby_page:AddBackground("gfx/menubg.bmp") end)
+
+        -- Stats line at the top, auto-updated by handle_room_list as the
+        -- server's auto-pushed room_list (or any explicit list_rooms reply)
+        -- comes in. Two side-by-side info buttons (each fits the 15-char
+        -- SSO label budget). Empty tooltips so nothing pops on hover.
+        local stats_lobby = mp_lobby_page:AddButton(40,  84, "Lobby: 0",  "", function() end)
+        local stats_active = mp_lobby_page:AddButton(140, 84, "Active: 0", "", function() end)
+        mp.lobby_stats_lobby_btn  = stats_lobby
+        mp.lobby_stats_active_btn = stats_active
+
+        local create_btn = mp_lobby_page:AddButton(60, 110, "Create Room",
+            "Host a new multiplayer game (up to 4 players)",
+            function()
+                local cok, cerr = pcall(lobby_create_room_flow)
+                if not cok then logf("Create Room crash: %s", tostring(cerr)) end
+            end)
+        local browse_btn = mp_lobby_page:AddButton(60, 132, "Browse Rooms",
+            "See open rooms and join one",
+            function()
+                pcall(lobby_refresh_rooms)   -- pre-populate before page render
+                menu.SetPage("mp_browse")
+            end)
         pcall(function()
-            local continue_btn = page:GetButton("Continue")
-            local newgame_btn  = page:GetButton("New Game")
-            if continue_btn and host_btn then
-                continue_btn:SetNext("right", host_btn)
-                host_btn:SetNext("left", continue_btn)
-                host_btn:SetNext("down", join_btn)
-                join_btn:SetNext("up", host_btn)
-                join_btn:SetNext("down", thost_btn)
-                thost_btn:SetNext("up", join_btn)
-                thost_btn:SetNext("down", tjoin_btn)
-                tjoin_btn:SetNext("up", thost_btn)
-                if newgame_btn then join_btn:SetNext("left", newgame_btn) end
+            local back = mp_lobby_page:GetButton("BACK")
+            create_btn:SetNext("down", browse_btn); browse_btn:SetNext("up", create_btn)
+            if back then
+                browse_btn:SetNext("down", back); back:SetNext("up", browse_btn)
             end
         end)
+    end)
+    logf("MP page mp_lobby: ok=%s err=%s", tostring(pok1), tostring(perr1))
+
+    -- ------------------------------------------------------------------
+    -- mp_browse = room slot picker. 4 slot buttons + Refresh + Back.
+    -- Slot labels are static ("Join Slot N") because the title-menu
+    -- button API has no runtime caption update (probe confirmed: only
+    -- pointer/objtype/SetNext exposed). Per-room details are logged
+    -- by Refresh into mp_client.log so the player can pick the right
+    -- slot. Real label updates require a native bridge to poke the C++
+    -- button struct directly — parked for now.
+    -- ------------------------------------------------------------------
+    local mp_browse_page
+    local pok1b, perr1b = pcall(function()
+        mp_browse_page = menu.AddPage("mp_browse", "mp_lobby")
+        if not mp_browse_page then error("AddPage('mp_browse') returned nil") end
+        pcall(function() mp_browse_page:AddBackground("gfx/menubg.bmp") end)
+
+        -- Top: page indicator (read-only — clicking refreshes manually
+        -- which is essentially free with the existing list connection).
+        local page_btn = mp_browse_page:AddButton(60, 88, "Page 1/1",
+            "Current page of the room list (auto-updates on navigation)",
+            function() pcall(lobby_refresh_rooms) end)
+        mp.lobby_page_btn = page_btn
+
+        local prev_btn = mp_browse_page:AddButton(60, 108, "< Prev Page",
+            "Previous page of rooms",
+            function()
+                mp.lobby_page = math.max(1, (mp.lobby_page or 1) - 1)
+                pcall(lobby_refresh_rooms)
+            end)
+
+        local slot_btns = {}
+        for i = 1, 4 do
+            slot_btns[i] = mp_browse_page:AddButton(60, 128 + (i-1)*14,
+                "(empty)",
+                "Join the room shown in this slot",
+                function()
+                    local sok, serr = pcall(function() lobby_join_slot(i) end)
+                    if not sok then logf("Join Slot %d crash: %s", i, tostring(serr)) end
+                end)
+        end
+        mp.lobby_slot_btns = slot_btns
+
+        local next_btn = mp_browse_page:AddButton(60, 188, "Next Page >",
+            "Next page of rooms",
+            function()
+                local tp = 1
+                local n = (mp.lobby_rooms and #mp.lobby_rooms) or 0
+                if n > 0 then tp = math.ceil(n / 4) end
+                mp.lobby_page = math.min(tp, (mp.lobby_page or 1) + 1)
+                pcall(lobby_refresh_rooms)
+            end)
+
+        pcall(function()
+            local back = mp_browse_page:GetButton("BACK")
+            page_btn:SetNext("down", prev_btn);  prev_btn:SetNext("up", page_btn)
+            prev_btn:SetNext("down", slot_btns[1]); slot_btns[1]:SetNext("up", prev_btn)
+            for i = 1, 3 do
+                slot_btns[i]:SetNext("down", slot_btns[i+1])
+                slot_btns[i+1]:SetNext("up", slot_btns[i])
+            end
+            slot_btns[4]:SetNext("down", next_btn); next_btn:SetNext("up", slot_btns[4])
+            if back then
+                next_btn:SetNext("down", back); back:SetNext("up", next_btn)
+            end
+        end)
+    end)
+    logf("MP page mp_browse: ok=%s err=%s", tostring(pok1b), tostring(perr1b))
+
+    -- ------------------------------------------------------------------
+    -- Waiting room page. Reached after Create (host) or Join into a
+    -- lobby-status room (joiner). Buttons differ by role but page is
+    -- shared. Joiner uses "Refresh" to manually drain the socket since
+    -- we can't run a coroutine here.
+    -- ------------------------------------------------------------------
+    local mp_waiting_page
+    local pok2, perr2 = pcall(function()
+        mp_waiting_page = menu.AddPage("mp_waiting", "mp_lobby")
+        if not mp_waiting_page then error("AddPage('mp_waiting') returned nil") end
+        pcall(function() mp_waiting_page:AddBackground("gfx/menubg.bmp") end)
+
+        -- 4 player-slot buttons (info display via native label setter).
+        -- They're real buttons because the menu API has no static-text
+        -- runtime-update path; we relabel them on every state change.
+        --
+        -- Clicking any player slot ALSO drains the socket + updates the
+        -- roster — same "ambient refresh" as the action buttons, so the
+        -- player can poke any button to refresh.
+        local player_btns = {}
+        for i = 1, 4 do
+            player_btns[i] = mp_waiting_page:AddButton(60, 80 + (i-1)*14,
+                "(empty)",
+                "Player slot (click any waiting-room button to refresh)",
+                function()
+                    if mp.sock then drain_sock_sync() end
+                    if apply_waiting_labels then pcall(apply_waiting_labels) end
+                end)
+        end
+        mp.lobby_player_btns = player_btns
+
+        -- Ambient-refresh wrappers: every action button on this page does
+        -- a drain + apply BEFORE its action, so the player never has to
+        -- click "Refresh" explicitly. Pure polling — Wait()-based
+        -- coroutines crash the host at title-menu state, so there's no
+        -- automatic background poll yet.
+        local function auto_refresh()
+            if mp.sock then drain_sock_sync() end
+            if apply_waiting_labels then pcall(apply_waiting_labels) end
+        end
+
+        local start_btn = mp_waiting_page:AddButton(21, 154, "Start Game",
+            "Host only: begin the level for everyone in this room",
+            function() auto_refresh(); pcall(lobby_start_game) end)
+        mp.lobby_start_btn = start_btn
+        local leave_btn = mp_waiting_page:AddButton(21, 176, "Leave Room",
+            "Disconnect and return to the lobby",
+            function() auto_refresh(); pcall(lobby_leave_room) end)
+        pcall(function()
+            local back = mp_waiting_page:GetButton("BACK")
+            start_btn:SetNext("down", leave_btn);  leave_btn:SetNext("up", start_btn)
+            if back then
+                leave_btn:SetNext("down", back);   back:SetNext("up", leave_btn)
+            end
+        end)
+    end)
+    logf("MP page mp_waiting: ok=%s err=%s", tostring(pok2), tostring(perr2))
+
+    -- Background auto-refresh: hook user32!PeekMessageA per frame and
+    -- call _G.MP_FRAME_TICK at ~10Hz. Engine-tracked coroutines (Wait)
+    -- crash at title-menu state, but a Win32-API hook fires every frame
+    -- regardless. Tick body just drains the socket + relabels.
+    _G.MP_FRAME_TICK = function()
+        -- ESC pressed in the lobby waiting room → leave the room.
+        -- (Native hook latches the keypress + swallows the event; we
+        -- run the action here in safe Lua context.)
+        if _G.MP_NATIVE and _G.MP_NATIVE.check_esc_pressed then
+            local was = false
+            pcall(function() was = _G.MP_NATIVE.check_esc_pressed() end)
+            if was then
+                logf("ESC in waiting room — calling lobby_leave_room")
+                pcall(lobby_leave_room)
+            end
+        end
+
+        -- ============ DEATH INTERCEPT (task #8) ============
+        -- Engine's player-death branch (TPlayer think → FUN_0044dde0 <= 0
+        -- → gameover HUD vtable[14] FUN_0045c220) is purely native; no
+        -- Lua callback. So we POLL HP each frame and pin actor+0xBC via
+        -- MP_NATIVE.pin_hp the moment HP drops to the threshold. Once
+        -- pinned we hold HP at 9999 for the rest of the level so the
+        -- engine cannot reach the death branch, and run a manual
+        -- "spectate" state (task #9) until level exit (task #10).
+        --
+        -- Limitation: one-shot kills can outrun the poll. The pin runs
+        -- at the start of the tick → if a hit drops HP from full to <=
+        -- threshold between two ticks the engine's death branch may
+        -- have already executed. Acceptable for MVP; iterate later
+        -- with a CentralHit hook if it bites in practice.
+        if mp.in_game and _G.MP_NATIVE and _G.MP_NATIVE.pin_hp then
+            local pl = player.GetPlayer()
+            if pl and pl.pointer then
+                -- Allow external triggers (dev menu Kill Self, future
+                -- host-confirmed death) to flip mp.is_dead directly. If
+                -- it's set but we haven't pinned yet, pin now + announce.
+                if mp.is_dead and not mp.death_announced_at then
+                    mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
+                    logf("DEATH externally triggered → pin + announce")
+                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                    pcall(function()
+                        if _G.MP_NATIVE.set_invulnerable then
+                            _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
+                        end
+                    end)
+                    pcall(refresh_objective_string)
+                    if mp.sock then
+                        pcall(function() send_msg({ type = "player_died" }) end)
+                    end
+                end
+                if mp.is_dead then
+                    -- Keep pinning so any incoming damage can't tip HP <= 0.
+                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                    -- Spectate: each frame, teleport our corpse onto the
+                    -- nearest LIVING teammate. last_x/last_y are the most
+                    -- recent host-broadcast positions from handle_snapshot.
+                    -- We pick by current distance from us, then SetPosition.
+                    -- Skip puppets with is_dead set (server-forwarded
+                    -- peer_died) so we don't anchor to another corpse.
+                    local target, target_d2 = nil, math.huge
+                    local mx, my = 0, 0
+                    pcall(function() mx, my = pl:GetPosition() end)
+                    for _, entry in pairs(mp.puppets or {}) do
+                        if type(entry) == "table" and not entry.is_dead
+                           and entry.last_x and entry.last_y then
+                            local dx = entry.last_x - mx
+                            local dy = entry.last_y - my
+                            local d2 = dx*dx + dy*dy
+                            if d2 < target_d2 then
+                                target, target_d2 = entry, d2
+                            end
+                        end
+                    end
+                    if target and pl.SetPosition then
+                        pcall(function() pl:SetPosition(target.last_x, target.last_y) end)
+                    end
+                else
+                    local hp = nil
+                    pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
+                    -- Threshold of 5: gives a frame of slack before the
+                    -- engine's <=0 death check fires.
+                    if type(hp) == "number" and hp > 0 and hp <= 5 then
+                        logf("DEATH intercept: hp=%s → pinning + entering spectate", tostring(hp))
+                        mp.is_dead = true
+                        mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
+                        pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                        pcall(function()
+                            if _G.MP_NATIVE.set_invulnerable then
+                                _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
+                            end
+                        end)
+                        -- Refresh the on-screen banner immediately so the
+                        -- player sees the dead state without waiting for
+                        -- the next objective-string refresh tick.
+                        pcall(refresh_objective_string)
+                        -- Tell the server (other clients can mark us dead
+                        -- in their rosters once the server forwards it).
+                        if mp.sock then
+                            pcall(function() send_msg({ type = "player_died" }) end)
+                        end
+                    end
+                end
+            end
+        end
+        -- ============ END DEATH INTERCEPT ============
+
+        -- Deferred kick / disconnect cleanup. CRUCIAL: do NOT call
+        -- menu.SetState("game", false) — that boolean is "needs fresh
+        -- init" not "exit game", so it actually pulls the user BACK
+        -- into the level (this is what Continue uses). We just swap
+        -- the current page and let whichever state the user is in
+        -- handle the rest:
+        --   * Kicked while playing → page set to mp_kicked; user keeps
+        --     playing until they press ESC, then sees the notice.
+        --     Objective-string banner makes the kick visible in-world.
+        --   * Disconnect from pause → user is already in menu state,
+        --     so SetPage swap is immediately visible as mainmenu.
+        if mp.pending_kick_cleanup then
+            mp.pending_kick_cleanup = false
+            mp.room_id = nil
+            mp.is_host = false
+            mp.in_game = false
+            mp.is_dead = false
+            mp.death_announced_at = nil
+            mp.room_players = {}
+            mp.game_started_pending = false
+            -- Same cross-session cleanup as Disconnect: destroy engine
+            -- entities first, then drop the Lua bookkeeping so the
+            -- next join is clean.
+            for _, entry in pairs(mp.puppets or {}) do
+                if type(entry) == "table" then
+                    if entry.obj then pcall(function() safe_delete(entry.obj) end) end
+                    if entry.nameplate then
+                        pcall(function() entry.nameplate:Delete() end)
+                    end
+                end
+            end
+            for _, entry in pairs(mp.mob_puppets or {}) do
+                if type(entry) == "table" and entry.obj then
+                    pcall(function() safe_delete(entry.obj) end)
+                end
+            end
+            for _, entry in pairs(mp.items or {}) do
+                if type(entry) == "table" and entry.obj then
+                    pcall(function() safe_delete(entry.obj) end)
+                end
+            end
+            mp.puppets = {}
+            mp.mob_puppets = {}
+            mp.host_mobs = {}
+            mp.items = {}
+            mp.item_obj_to_id = {}
+            mp.next_mob_id = 1
+            mp.next_item_id = 1
+            mp.pending_initial_players = nil
+            mp.pending_item_list = nil
+            mp.force_kicked_page = true
+            mp._pause_bypass = true
+            pcall(function() menu.SetPage("mp_kicked") end)
+            mp._pause_bypass = false
+            if _G.MP_NATIVE and _G.MP_NATIVE.set_suppress_esc then
+                pcall(function() _G.MP_NATIVE.set_suppress_esc(true) end)
+            end
+            -- On mp_kicked, ESC quits Teleglitch (same as clicking OK).
+            if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_quits then
+                pcall(function() _G.MP_NATIVE.set_esc_quits(true) end)
+            end
+            if _G.MP_NATIVE and _G.MP_NATIVE.inject_esc then
+                pcall(function() _G.MP_NATIVE.inject_esc() end)
+            end
+            return
+        end
+
+        -- The engine's native ESC handler resets the active page to
+        -- mainmenu when it pauses. After a kick we just injected ESC
+        -- and set the page to mp_kicked — the engine then overwrote
+        -- it. Re-force mp_kicked here every ~500ms until the user
+        -- clicks OK (which clears the flag).
+        if mp.force_kicked_page then
+            local now = (socket and socket.gettime) and socket.gettime() or os.time()
+            if (now - (mp._last_kicked_force or 0)) >= 0.5 then
+                mp._pause_bypass = true
+                pcall(function() menu.SetPage("mp_kicked") end)
+                mp._pause_bypass = false
+                mp._last_kicked_force = now
+            end
+        end
+        -- (pending_to_mainmenu used to be processed here; Disconnect is
+        -- now handled inline from the button callback so the SetPage
+        -- swap actually sticks while the engine is still in menu state.)
+
+        -- Force mp_pause as the active page while in MP, but throttle
+        -- to ~750ms — fast enough that ESC swaps to mp_pause within
+        -- one beat, slow enough that the engine's button-click
+        -- dispatch can complete between forces without being clobbered.
+        if mp.in_game and not mp._pause_bypass then
+            local now = (socket and socket.gettime) and socket.gettime() or os.time()
+            if (now - (mp._last_pause_force or 0)) >= 0.75 then
+                pcall(function() menu.SetPage("mp_pause") end)
+                mp._last_pause_force = now
+            end
+        end
+
+        -- Drain the socket here as well so events arriving WHILE the
+        -- game is paused (the net coroutine is yielded in Wait and
+        -- therefore not processing messages) still get dispatched.
+        -- This is what makes the host see a kicked joiner disappear
+        -- from the pause-page roster without having to resume first.
+        if mp.sock then pcall(drain_sock_sync) end
+        if apply_waiting_labels then pcall(apply_waiting_labels) end
+        if apply_pause_labels   then pcall(apply_pause_labels)   end
+        -- Only re-fire begin_game if we actually have a live socket and
+        -- haven't already entered the game. Without these guards a
+        -- stale game_started_pending flag (e.g. from a previous run
+        -- before Disconnect) drags the user right back into the level.
+        if mp.game_started_pending and mp.sock and not mp.in_game and begin_game then
+            pcall(begin_game)
+        end
     end
+    if _G.MP_NATIVE and _G.MP_NATIVE.arm_frame_tick then
+        pcall(function() _G.MP_NATIVE.arm_frame_tick() end)
+        logf("frame_tick: armed")
+    end
+
+    -- ------------------------------------------------------------------
+    -- mp_pause = in-game pause/ESC menu. Set as the active page when
+    -- begin_game runs, so ESC shows it instead of the main menu.
+    -- 4 player-slot buttons act as kick targets for the host; for non-
+    -- hosts the slots are info-only.
+    -- ------------------------------------------------------------------
+    local function pause_kick_slot(idx)
+        if not mp.is_host then return end
+        if not mp.sock then return end
+        local target = mp.pause_roster and mp.pause_roster[idx]
+        if not target or target.self then return end
+        logf("pause: kicking id=%s name=%s", tostring(target.id), tostring(target.name))
+        send_msg({ type = "kick_player", target_id = target.id })
+    end
+
+    local function pause_resume()
+        pcall(function() menu.SetState("game", true) end)
+    end
+
+    -- Disconnect: clicked from a button on mp_pause, so we're in a
+    -- safe Lua context. Do everything INLINE: the engine sees
+    -- SetPage("mainmenu") during click dispatch and stays in menu
+    -- state showing main menu. No SetState (that boolean would
+    -- RESUME the game), no level.Clear (crashes from this context).
+    --   * Host   → "close_room" tears down the room (joiners kicked).
+    --   * Joiner → "leave_room" leaves quietly; host stays.
+    -- Disconnect goes through the same notification flow as a kick.
+    -- The user sees the mp_kicked page (telling them the game must be
+    -- restarted) and clicking OK calls ExitGame. We reuse the
+    -- pending_kick_cleanup tick path so the page reliably appears in
+    -- both menu-state and in-game-state.
+    local function pause_disconnect()
+        logf("DISCONNECT: entry, was_host=%s — showing restart notification", tostring(mp.is_host))
+        if mp.sock then
+            if mp.is_host then
+                pcall(function() send_msg({ type = "close_room" }) end)
+            else
+                pcall(function() send_msg({ type = "leave_room" }) end)
+            end
+            pcall(function() mp.sock:close() end)
+            mp.sock = nil
+        end
+        -- Hand off to the kicked-cleanup path so the same notification
+        -- page + ESC-injection works.
+        mp.pending_kick_cleanup = true
+    end
+
+    -- Exit to Title: leave the room (without closing it for joiners
+    -- still in) and return to main menu. Same deferred-cleanup pattern
+    -- as Disconnect.
+    local function pause_exit_to_title()
+        if mp.sock then
+            pcall(function() send_msg({ type = "leave_room" }) end)
+            pcall(function() mp.sock:close() end)
+            mp.sock = nil
+        end
+        mp.pending_to_mainmenu = true
+        logf("pause: exit to title (deferred)")
+    end
+
+    local mp_pause_page
+    local pok3, perr3 = pcall(function()
+        mp_pause_page = menu.AddPage("mp_pause", nil)  -- no parent → no BACK
+        if not mp_pause_page then error("AddPage('mp_pause') returned nil") end
+        pcall(function() mp_pause_page:AddBackground("gfx/menubg.bmp") end)
+
+        -- Two columns: player name (left, info) + kick button (right,
+        -- host-only action). Labels are updated each tick via
+        -- apply_pause_labels: kick buttons show "Kick" for host on
+        -- non-self/non-empty slots, and blank otherwise.
+        local pause_player_btns = {}
+        local pause_kick_btns   = {}
+        for i = 1, 4 do
+            pause_player_btns[i] = mp_pause_page:AddButton(40, 80 + (i-1)*14,
+                "(empty)",
+                "Player slot",
+                function() end)
+            pause_kick_btns[i] = mp_pause_page:AddButton(150, 80 + (i-1)*14,
+                "",
+                "Host: kick this player",
+                function() pcall(function() pause_kick_slot(i) end) end)
+        end
+        mp.pause_player_btns = pause_player_btns
+        mp.pause_kick_btns   = pause_kick_btns
+
+        local resume_btn = mp_pause_page:AddButton(21, 154, "Resume",
+            "Return to the game",
+            function() pcall(pause_resume) end)
+        local disc_btn = mp_pause_page:AddButton(21, 176, "Disconnect",
+            "Leave the MP room and return to the main menu (host: closes the room)",
+            function() pcall(pause_disconnect) end)
+        pcall(function()
+            for i = 1, 4 do
+                pause_player_btns[i]:SetNext("right", pause_kick_btns[i])
+                pause_kick_btns[i]:SetNext("left",    pause_player_btns[i])
+            end
+            for i = 1, 3 do
+                pause_player_btns[i]:SetNext("down", pause_player_btns[i+1])
+                pause_player_btns[i+1]:SetNext("up", pause_player_btns[i])
+                pause_kick_btns[i]:SetNext("down",   pause_kick_btns[i+1])
+                pause_kick_btns[i+1]:SetNext("up",   pause_kick_btns[i])
+            end
+            pause_player_btns[4]:SetNext("down", resume_btn)
+            resume_btn:SetNext("up", pause_player_btns[4])
+            -- Quick host-shortcut: Resume's right → first kickable slot.
+            resume_btn:SetNext("right", pause_kick_btns[2])
+            pause_kick_btns[2]:SetNext("down", resume_btn)
+            resume_btn:SetNext("down", disc_btn);  disc_btn:SetNext("up", resume_btn)
+        end)
+    end)
+    logf("MP page mp_pause: ok=%s err=%s", tostring(pok3), tostring(perr3))
+
+    -- ------------------------------------------------------------------
+    -- mp_kicked: shown to a player who got kicked or whose host closed
+    -- the room. Just a static notification + OK button.
+    -- ------------------------------------------------------------------
+    local mp_kicked_page
+    local pok4, perr4 = pcall(function()
+        mp_kicked_page = menu.AddPage("mp_kicked", nil)
+        if not mp_kicked_page then error("AddPage('mp_kicked') returned nil") end
+        pcall(function() mp_kicked_page:AddBackground("gfx/menubg.bmp") end)
+
+        -- Short button labels (long ones get clipped to the button
+        -- width). AddTextElement renders as a wide hit-box that blocks
+        -- the OK click, so we avoid it. Each info button has an empty
+        -- tooltip so nothing pops up on hover.
+        mp_kicked_page:AddButton(100, 110, "DISCONNECTED",    "", function() end)
+        mp_kicked_page:AddButton(100, 140, "Restart to play", "", function() end)
+        mp_kicked_page:AddButton(100, 156, "another MP game", "", function() end)
+        mp_kicked_page:AddButton(150, 190, "OK", "",
+            function()
+                mp.force_kicked_page = false
+                pcall(function() ExitGame() end)
+            end)
+    end)
+    logf("MP page mp_kicked: ok=%s err=%s", tostring(pok4), tostring(perr4))
+
+    -- Re-labels the pause page's player slots based on the in-game
+    -- roster: mp.my_id + mp.puppets (other players). Player slot shows
+    -- name+marker; kick column shows "Kick" for host on others, "" else.
+    apply_pause_labels = function()
+        if not (_G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
+        local roster = {}
+        if mp.my_id then
+            table.insert(roster, {
+                id = mp.my_id,
+                name = (config.name or "Player"),
+                self = true,
+                is_host = mp.is_host,
+            })
+        end
+        for pid, entry in pairs(mp.puppets or {}) do
+            if pid ~= mp.my_id then
+                table.insert(roster, {
+                    id = pid,
+                    name = (entry and entry.name) or "?",
+                    is_host = (pid == mp.host_id),
+                })
+            end
+        end
+        mp.pause_roster = roster
+        if mp.pause_player_btns then
+            for i = 1, 4 do
+                local btn  = mp.pause_player_btns[i]
+                local kbtn = mp.pause_kick_btns and mp.pause_kick_btns[i]
+                local p    = roster[i]
+                if btn and btn.pointer then
+                    local label
+                    if p then
+                        local nm = tostring(p.name or "?")
+                        local suffix = (p.is_host and "*" or "") .. (p.self and "(me)" or "")
+                        local prefix = i .. ":"
+                        local max_name = 15 - #prefix - #suffix
+                        if max_name < 1 then max_name = 1 end
+                        label = prefix .. nm:sub(1, max_name) .. suffix
+                    else
+                        label = "(empty)"
+                    end
+                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, label) end)
+                end
+                if kbtn and kbtn.pointer then
+                    -- Kick label is intentionally short — padded with
+                    -- spaces so the clickable area is comfortably wide
+                    -- without dragging the target's name into it.
+                    local label = (mp.is_host and p and not p.self) and "   Kick   " or ""
+                    pcall(function() _G.MP_NATIVE.set_button_label(kbtn.pointer, label) end)
+                end
+            end
+        end
+    end
+
+    -- Concrete implementation of the forward-declared apply_waiting_labels.
+    -- Re-labels the 4 player slot buttons + Start button on each state
+    -- change (welcome / join / leave / host_changed / refresh).
+    apply_waiting_labels = function()
+        if not (_G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
+        -- Build a roster ordered: self first, then others by id.
+        local roster = {}
+        if mp.my_id then
+            table.insert(roster, {
+                id = mp.my_id,
+                name = (config.name or "Player"),
+                self = true,
+                is_host = (mp.my_id == mp.host_id),
+            })
+        end
+        for _, p in ipairs(mp.room_players or {}) do
+            if p.id ~= mp.my_id then
+                table.insert(roster, { id = p.id, name = p.name, is_host = (p.id == mp.host_id) })
+            end
+        end
+        if mp.lobby_player_btns then
+            for i = 1, 4 do
+                local btn = mp.lobby_player_btns[i]
+                if btn and btn.pointer then
+                    local p = roster[i]
+                    local label
+                    if p then
+                        local nm = tostring(p.name or "?")
+                        local suffix = (p.is_host and "*" or "") .. (p.self and "(me)" or "")
+                        -- 15-char SSO budget. Reserve room for "i:" + suffix.
+                        local prefix = i .. ":"
+                        local max_name = 15 - #prefix - #suffix
+                        if max_name < 1 then max_name = 1 end
+                        label = prefix .. nm:sub(1, max_name) .. suffix
+                    else
+                        label = "(empty)"
+                    end
+                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, label) end)
+                end
+            end
+        end
+        if mp.lobby_start_btn and mp.lobby_start_btn.pointer then
+            local label = mp.is_host and "Start Game" or "Wait for host"
+            pcall(function() _G.MP_NATIVE.set_button_label(mp.lobby_start_btn.pointer, label) end)
+        end
+    end
+
+    -- ------------------------------------------------------------------
+    -- Main-menu entry — single Multiplayer button. Just navigates; the
+    -- relay connection happens when the user clicks Create or Join.
+    -- ------------------------------------------------------------------
+    local mp_btn = mainmenu_page:AddButton(144, 104, "Multiplayer",
+        "Open the multiplayer lobby (or pause menu while in MP game)",
+        function()
+            local cok, cerr = pcall(function()
+                if mp.in_game then
+                    logf("multiplayer: in MP game — opening mp_pause")
+                    menu.SetPage("mp_pause")
+                else
+                    if not pok1 then logf("mp_lobby page failed: %s", tostring(perr1)); return end
+                    logf("multiplayer: opening mp_lobby")
+                    -- Refresh stats counts so "Lobby:" / "Active:" reflect
+                    -- the current server state when the page renders.
+                    pcall(lobby_refresh_rooms)
+                    menu.SetPage("mp_lobby")
+                end
+            end)
+            if not cok then logf("Multiplayer click crash: %s", tostring(cerr)) end
+        end)
+
+    pcall(function()
+        local continue_btn = mainmenu_page:GetButton("Continue")
+        local newgame_btn  = mainmenu_page:GetButton("New Game")
+        if continue_btn then
+            continue_btn:SetNext("right", mp_btn)
+            mp_btn:SetNext("left", continue_btn)
+        end
+        if newgame_btn then
+            newgame_btn:SetNext("right", mp_btn)
+        end
+    end)
 end)
+if not _mp_integration_ok then
+    logf("MP MENU INTEGRATION FAILED: %s", tostring(_mp_integration_err))
+end
 
 logf("mp_client.lua init done")
