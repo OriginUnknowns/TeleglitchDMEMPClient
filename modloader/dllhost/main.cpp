@@ -48,6 +48,10 @@ static FILE* g_log = nullptr;
 static void host_log(const char* fmt, ...) {
     if (!g_log) g_log = fopen("modloader/dllhost.log", "a");
     if (!g_log) return;
+    // Prefix every line with our PID so two-instance logs are
+    // distinguishable. Both instances append to the same file; without
+    // this we can't tell which one fired a hook / called a native.
+    fprintf(g_log, "[%lu] ", (unsigned long)GetCurrentProcessId());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(g_log, fmt, ap);
@@ -187,9 +191,149 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
     return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
+static void* resolve_entity(lua_State* L, int idx);  // fwd decl — body lives below
+typedef void (*LuaPushNumberFn)(lua_State*, double);
+// ---- Bomb activation hook (TTimeBomb::Activate @ 0x00470aa0) ----
+// Captures bomb-activation events (left-click on explosive items) so Lua can
+// broadcast them. Fires once per activation; data: item name, position,
+// owner angle, fuse frames. Ring-buffered like bullets.
+struct BombEvt {
+    char type[32];
+    float x, y, angle;
+    int fuse;
+};
+static const int BOMB_RING_SIZE = 16;
+static BombEvt g_bomb_ring[BOMB_RING_SIZE];
+static volatile int g_bomb_write_idx = 0;
+static int g_bomb_read_idx = 0;
+
+typedef int (__thiscall *BombActivateFn)(void* self);
+static BombActivateFn orig_BombActivate = nullptr;
+
+// Mute counter — arm_bomb sets this to N, and the next N hook fires are
+// suppressed. Prevents the host↔joiner feedback loop: when peer receives
+// bomb_activated and calls arm_bomb, the engine's tick detects the newly
+// armed bomb and calls FUN_00470aa0 → our hook fires → we'd broadcast
+// AGAIN. Without this guard each peer activation echoes infinitely.
+static int g_bomb_mute_count = 0;
+
+// Ultra-safe bomb activation capture. Read ONLY from self (the bomb actor):
+// the type name (inline at +0x14) and the delay (+0x100). Skip any pointer-
+// chasing (no body deref, no owner deref, no main_p reads). Position +
+// angle for the broadcast are captured by the Lua side from the local
+// player at the moment of inv decrease — far more reliable than reading
+// any cached/uninitialized fields here.
+static int __fastcall hook_BombActivate(void* self, void* /*edx*/) {
+    if (g_bomb_mute_count > 0) {
+        g_bomb_mute_count--;
+        host_log("hook_BombActivate: MUTED (mute_count now %d)", g_bomb_mute_count);
+        return orig_BombActivate(self);
+    }
+    const char* type_ptr = (const char*)((char*)self + 0x14);
+    int delay = *(int*)((char*)self + 0x100);
+    int idx = g_bomb_write_idx % BOMB_RING_SIZE;
+    strncpy(g_bomb_ring[idx].type, type_ptr, 31);
+    g_bomb_ring[idx].type[31] = 0;
+    g_bomb_ring[idx].x = 0;     // Lua overrides with main player pos
+    g_bomb_ring[idx].y = 0;
+    g_bomb_ring[idx].angle = 0; // Lua overrides with main player aim
+    g_bomb_ring[idx].fuse = delay;
+    g_bomb_write_idx++;
+    host_log("hook_BombActivate: type=%s fuse=%d (pos/angle filled by Lua)",
+        type_ptr ? type_ptr : "?", delay);
+    return orig_BombActivate(self);
+}
+
+static int l_consume_bomb(lua_State* L) {
+    if (g_bomb_read_idx >= g_bomb_write_idx) { api.pushnil(L); return 1; }
+    BombEvt e = g_bomb_ring[g_bomb_read_idx % BOMB_RING_SIZE];
+    g_bomb_read_idx++;
+    static LuaPushNumberFn lua_pushnumber_p = nullptr;
+    if (!lua_pushnumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_pushnumber_p = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
+    }
+    api.pushstring(L, e.type);
+    lua_pushnumber_p(L, e.x);
+    lua_pushnumber_p(L, e.y);
+    lua_pushnumber_p(L, e.angle);
+    api.pushinteger(L, e.fuse);
+    return 5;
+}
+
+// validate_vtable(ptr, expected_rva) — returns true if *ptr (the vtable
+// pointer slot) equals (g_base + expected_rva). Used by Lua to verify a
+// TPlayer puppet's vtable is still intact (i.e. the C++ object hasn't been
+// freed/recycled) BEFORE calling any binding like SetPosition. The
+// recurring lua52 heap corruption is caused by binding calls on freed
+// entities — this check prevents those calls.
+static int l_validate_vtable(lua_State* L) {
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    int rva = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 0;
+    if (!e || rva == 0) { api.pushboolean(L, 0); return 1; }
+    if (IsBadReadPtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    DWORD_PTR vtbl = *(DWORD_PTR*)e;
+    DWORD_PTR expected = (DWORD_PTR)GetModuleHandleA(NULL) + (DWORD_PTR)(unsigned)rva;
+    api.pushboolean(L, (vtbl == expected) ? 1 : 0);
+    return 1;
+}
+
+// Read a bomb's fuse field (+0xfc). Returns -1 if inert, positive count if armed.
+// Used by Lua-side bomb activation detection to distinguish dropped (inert)
+// bombs from activated (armed) bombs after an inventory decrease.
+static int l_read_fuse(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushinteger(L, -1); return 1; }
+    int fuse = *(int*)((char*)e + 0xfc);
+    api.pushinteger(L, fuse);
+    return 1;
+}
+
+// Arm a peer-side bomb that was just CreateItem'd — write fuse, set velocity.
+// fuse_frames: e.g. 25 for smtimebomb (delay field).
+// vx, vy: linear velocity in world units/tick (compute from angle * throwspeed).
+static int l_arm_bomb(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    typedef int    (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e) { api.pushboolean(L, 0); return 1; }
+    int fuse = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 25;
+    float vx = lua_tonumber_p ? (float)lua_tonumber_p(L, 3, nullptr) : 0.0f;
+    float vy = lua_tonumber_p ? (float)lua_tonumber_p(L, 4, nullptr) : 0.0f;
+    *(int*)((char*)e + 0xfc) = fuse;
+    // Mute the next hook fire — the engine's tick will see the newly armed
+    // bomb and call FUN_00470aa0 again. Without muting we'd broadcast a
+    // spurious echo. 1 fire is enough but we use 2 for slack.
+    g_bomb_mute_count = 2;
+    // NOTE: NOT writing body velocity. The +0x40 offset for b2Body
+    // m_linearVelocity was a guess and likely caused heap corruption
+    // (crash inside ntdll's heap check). For now the bomb just sits
+    // where created and ticks down — same world position, same explosion
+    // moment. Throw velocity replication can come later when we verify
+    // the correct b2Body offset (or hook the engine's
+    // SetLinearVelocity).
+    (void)vx; (void)vy;
+    host_log("arm_bomb: fuse=%d (velocity skipped)", fuse);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 // Lua-callable: consume one bullet event. Returns nil if none, or 7 numbers
 // (x, y, vx, vy, damage, force, type). Caller loops until nil.
-typedef void (*LuaPushNumberFn)(lua_State*, double);
+// LuaPushNumberFn typedef now lives above near the bomb code.
 static int l_consume_bullet(lua_State* L) {
     if (g_bullet_read_idx >= g_bullet_write_idx) {
         api.pushnil(L);
@@ -340,6 +484,13 @@ static int l_install_hook_bullet(lua_State* L) {
     if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
     s = MH_EnableHook(target);
     host_log("MH_EnableHook(BulletCtor): status=%d", s);
+
+    // Bomb activate hook re-enabled with safer reads (see hook body).
+    BYTE* bomb = (BYTE*)m + 0x70aa0;
+    MH_STATUS bs = MH_CreateHook(bomb, (LPVOID)&hook_BombActivate, (LPVOID*)&orig_BombActivate);
+    if (bs == MH_OK) bs = MH_EnableHook(bomb);
+    host_log("bomb activate hook: status=%d", bs);
+
     api.pushboolean(L, s == MH_OK ? 1 : 0);
     return 1;
 }
@@ -943,6 +1094,23 @@ static int g_pin_debug_n = 0;
 static void apply_angle_pin_after_think(void* self) {
     for (int i = 0; i < 8; ++i) {
         if (g_angle_pins[i].valid && g_angle_pins[i].who == self) {
+            // Validate vtable before writing — if the engine freed/recycled
+            // this puppet, its vtable pointer changes, and writing to +0xB0
+            // would corrupt random memory (the long-standing lua52 heap
+            // crash source). Expected: TPlayer vftable at RVA 0x156b14.
+            if (IsBadReadPtr(self, 4)) {
+                g_angle_pins[i].valid = false;
+                host_log("pin_apply: self=%p unreadable, invalidating pin", self);
+                return;
+            }
+            DWORD_PTR vt = *(DWORD_PTR*)self;
+            DWORD_PTR expected_vt = (DWORD_PTR)mod_base() + 0x156b14;
+            if (vt != expected_vt) {
+                g_angle_pins[i].valid = false;
+                host_log("pin_apply: self=%p vtable=%p != TPlayer %p — invalidating pin",
+                    self, (void*)vt, (void*)expected_vt);
+                return;
+            }
             float before = *(float*)((char*)self + 0xB0);
             *(float*)((char*)self + 0xB0) = g_angle_pins[i].angle;
             // Log a sample when the engine's case-handler wrote a DIFFERENT
@@ -1616,7 +1784,7 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // realloc the table's array repeatedly mid-population, and under full page heap
     // those guard-paged grows turn lua52's trailing TValue write into a hard fault
     // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
-    api.createtable(L, 0, 28);
+    api.createtable(L, 0, 32);
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
@@ -1657,6 +1825,14 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "pin_hp");
     api.pushcclosure(L, l_pin_angle, 0);
     api.setfield(L, -2, "pin_angle");
+    api.pushcclosure(L, l_consume_bomb, 0);
+    api.setfield(L, -2, "consume_bomb");
+    api.pushcclosure(L, l_arm_bomb, 0);
+    api.setfield(L, -2, "arm_bomb");
+    api.pushcclosure(L, l_read_fuse, 0);
+    api.setfield(L, -2, "read_fuse");
+    api.pushcclosure(L, l_validate_vtable, 0);
+    api.setfield(L, -2, "validate_vtable");
     api.pushcclosure(L, l_set_invulnerable, 0);
     api.setfield(L, -2, "set_invulnerable");
     api.pushcclosure(L, l_probe_memory, 0);

@@ -263,6 +263,17 @@ if type(CreatePlayer) == "function" then
                 in_giveitem = prev
                 if not ok then error(err) end
             end
+            -- Wrap DropItem too. Logs every call so we can tell whether the
+            -- engine's drop key handler reaches us via the Lua binding.
+            if type(pl.DropItem) == "function" then
+                local orig_drop = pl.DropItem
+                pl.DropItem = function(self, ...)
+                    local args = {...}
+                    logf("DROPITEM CALLED arg1=%s nargs=%d", tostring(args[1]), select("#", ...))
+                    return orig_drop(self, ...)
+                end
+                logf("DROPITEM wrap installed on player")
+            end
             pcall(function() rawset(pl, "_mp_give_wrapped", true) end)
             logf("GIVEITEM wrap installed on player")
         end
@@ -763,6 +774,104 @@ local function broadcast_pickup_of_type(type_name, px, py)
         best_id, type_name, math.sqrt(best_d2))
 end
 
+-- When the player's inventory of `type_name` decreased, scan a small radius
+-- around the player for any object of that type that's NOT already in our
+-- tracking map — that's the dropped item. Add it, broadcast to peers.
+-- Engine's drop key handler (TPlayer vt[31] @0x460b00) creates the world
+-- item via a native call that bypasses our Lua Create / _CreateWeapon
+-- wraps, so this scan is how we catch drops.
+-- Keep a snapshot of all world-object pointers around the player so we can
+-- detect newly-appeared objects (drops). All world items appear as
+-- objtype="object" with no distinguishing GetName, so the only reliable
+-- way is "this pointer wasn't here a tick ago". Refresh on diff_inventory
+-- — same cadence as pickup detection.
+local DROP_SCAN_RADIUS = 30.0
+local last_world_ptrs = nil    -- set of pointer userdata → true
+local last_world_objs = nil    -- map pointer userdata → obj (so we can read pos after)
+
+local function refresh_world_snapshot(px, py)
+    local objs = GetObjectsInCircle(px, py, DROP_SCAN_RADIUS)
+    if type(objs) ~= "table" then return end
+    local ptrs, ents = {}, {}
+    for _, obj in ipairs(objs) do
+        if type(obj) == "table" and obj.pointer then
+            ptrs[obj.pointer] = true
+            ents[obj.pointer] = obj
+        end
+    end
+    last_world_ptrs = ptrs
+    last_world_objs = ents
+end
+
+local DROP_FOOT_RADIUS = 1.5    -- drops land near player's feet
+local function detect_drop_of_type(type_name, px, py, prior_ptrs)
+    -- Snapshot diff was unreliable due to engine pointer recycling — a
+    -- "new" drop often reuses a pointer that was visible in the prior
+    -- snapshot (representing a different object). Use a positional
+    -- heuristic instead: find the closest untracked-by-us object within
+    -- 1.5u of the player. Drops land at player's feet; walls there would
+    -- prevent the player from being there. The only false-positive risk
+    -- is another player/mob standing exactly on us — usually fine.
+    local objs = GetObjectsInCircle(px, py, DROP_FOOT_RADIUS)
+    if type(objs) ~= "table" then return end
+    -- Build "known" set: tracked items + mob puppets + player puppets.
+    local known_ptrs = {}
+    for _, e in pairs(mp.items or {}) do
+        if e and e.obj and e.obj.pointer then known_ptrs[e.obj.pointer] = true end
+    end
+    for _, e in pairs(mp.mob_puppets or {}) do
+        if e and e.obj and e.obj.pointer then known_ptrs[e.obj.pointer] = true end
+    end
+    for _, e in pairs(mp.puppets or {}) do
+        if e and e.obj and e.obj.pointer then known_ptrs[e.obj.pointer] = true end
+    end
+    -- Local player itself
+    local pl = player.GetPlayer()
+    if pl and pl.pointer then known_ptrs[pl.pointer] = true end
+    -- Pick closest unknown obj
+    local best_obj, best_d2, best_x, best_y = nil, math.huge, 0, 0
+    for _, obj in ipairs(objs) do
+        if type(obj) == "table" and obj.pointer and not known_ptrs[obj.pointer] then
+            local x, y = get_obj_pos(obj)
+            if x and y then
+                local dx, dy = x - px, y - py
+                local d2 = dx*dx + dy*dy
+                if d2 < best_d2 then
+                    best_obj, best_d2 = obj, d2
+                    best_x, best_y = x, y
+                end
+            end
+        end
+    end
+    if not best_obj then
+        logf("DROP %s: no untracked obj within %.1fu of (%.2f,%.2f)",
+            type_name, DROP_FOOT_RADIUS, px, py); return
+    end
+    -- Read fuse to distinguish a passive drop from an activated bomb.
+    -- ARMED bombs (fuse > 0) are handled by the NATIVE bomb-activation
+    -- hook which broadcasts bomb_activated. To avoid duplicate
+    -- broadcasts (and the heap corruption that pointer-reuse causes on
+    -- the receiver), we ONLY broadcast item_spawned for inert items.
+    local fuse = -1
+    if _G.MP_NATIVE and _G.MP_NATIVE.read_fuse and best_obj.pointer then
+        pcall(function() fuse = _G.MP_NATIVE.read_fuse(best_obj.pointer) end)
+    end
+    if fuse and fuse > 0 then
+        logf("DROP DETECTED (armed bomb fuse=%d, skip — native hook handles)", fuse)
+        return
+    end
+    local id = mp.next_item_id
+    mp.next_item_id = id + 1
+    mp.items[id] = { obj = best_obj, type = type_name, x = best_x, y = best_y }
+    mp.item_obj_to_id[best_obj] = id
+    logf("DROP DETECTED id=%d type=%s pos=(%.2f,%.2f) d=%.2f",
+        id, type_name, best_x, best_y, math.sqrt(best_d2))
+    if mp.sock then
+        send_msg({ type = "item_spawned",
+                   item = { id = id, type = type_name, x = best_x, y = best_y } })
+    end
+end
+
 local function diff_inventory()
     if not mp.sock then return end
     local now_counts = snapshot_inventory()
@@ -771,14 +880,33 @@ local function diff_inventory()
     local pl = player.GetPlayer()
     local px, py = 0, 0
     if pl then pcall(function() px, py = pl:GetPosition() end) end
+    -- IMPORTANT: snapshot BEFORE checking inventory delta. We compare the
+    -- current world to this snapshot — anything new (and matching an INV
+    -- DECREASE) is a drop.
+    local pre_drop_ptrs = last_world_ptrs   -- save the prior snapshot
+    refresh_world_snapshot(px, py)
     for type_name, cur_n in pairs(now_counts) do
         local prev_n = last_inv_counts[type_name] or 0
-        local gained = cur_n - prev_n
-        if gained > 0 then
-            logf("INV CHANGE type=%s prev=%d cur=%d gained=%d", type_name, prev_n, cur_n, gained)
-            for i = 1, gained do
-                logf("INV ATTEMPT %d/%d for type=%s", i, gained, type_name)
+        local delta = cur_n - prev_n
+        if delta > 0 then
+            logf("INV CHANGE type=%s prev=%d cur=%d gained=%d", type_name, prev_n, cur_n, delta)
+            for i = 1, delta do
+                logf("INV ATTEMPT %d/%d for type=%s", i, delta, type_name)
                 broadcast_pickup_of_type(type_name, px, py)
+            end
+        elseif delta < 0 then
+            logf("INV DECREASE type=%s prev=%d cur=%d lost=%d", type_name, prev_n, cur_n, -delta)
+            for i = 1, -delta do
+                detect_drop_of_type(type_name, px, py, pre_drop_ptrs)
+            end
+        end
+    end
+    -- Catch removed-from-inventory keys (lost everything of that type)
+    for type_name, prev_n in pairs(last_inv_counts) do
+        if not now_counts[type_name] and prev_n > 0 then
+            logf("INV DECREASE type=%s prev=%d cur=0 lost=%d", type_name, prev_n, prev_n)
+            for i = 1, prev_n do
+                detect_drop_of_type(type_name, px, py, pre_drop_ptrs)
             end
         end
     end
@@ -1218,18 +1346,28 @@ local function handle_snapshot(msg)
             local entry = mp.puppets[p.id]
             if not entry then handle_join(p); entry = mp.puppets[p.id] end
             if entry and entry.obj then
-                -- Liveness check: if engine has freed the entity, recreate.
-                -- SKIP for TPlayer puppets (Path A). The check uses
-                -- GetObjectsInCircle(local_player, 2000) — a puppet spawned
-                -- at the safe -9999 offset is OUTSIDE that radius, so the
-                -- check would mark it stale every tick → infinite recreate
-                -- loop → crash. TPlayer puppets don't share the recycled-ptr
-                -- problem the stale check was designed for (real TPlayers
-                -- aren't freed mid-frame the way mp_remote enemy actors are).
-                if not entry.is_tplayer and not entity_alive(entry.obj) then
-                    logf("PUPPET STALE id=%s last=(%.1f,%.1f) age=%.1fs — recreating",
+                -- Liveness check. For mp_remote puppets, use GetObjectsInCircle
+                -- scan via entity_alive. For TPlayer puppets, that scan misses
+                -- objects outside its radius — instead validate that the
+                -- puppet pointer still holds the TPlayer vtable. If the
+                -- engine freed/recycled the C++ object, the vtable pointer
+                -- changes (or is garbage) → we skip the binding call to
+                -- avoid AV inside lua52 (the long-standing heap corruptor).
+                local stale = false
+                if entry.is_tplayer then
+                    if _G.MP_NATIVE and _G.MP_NATIVE.validate_vtable and entry.obj.pointer then
+                        local ok = false
+                        pcall(function() ok = _G.MP_NATIVE.validate_vtable(entry.obj.pointer, 0x156b14) end)
+                        stale = not ok
+                    end
+                else
+                    stale = not entity_alive(entry.obj)
+                end
+                if stale then
+                    logf("PUPPET STALE id=%s last=(%.1f,%.1f) age=%.1fs tplayer=%s — recreating",
                         tostring(p.id), entry.last_x or 0, entry.last_y or 0,
-                        socket.gettime() - (entry.created_at or 0))
+                        socket.gettime() - (entry.created_at or 0),
+                        tostring(entry.is_tplayer))
                     mp.puppets[p.id] = nil
                     handle_join(p)
                     entry = mp.puppets[p.id]
@@ -1434,6 +1572,33 @@ local function handle_item_picked(msg)
     end
     logf("item_picked: id=%d type=%s deleted=%s from peer %s",
         msg.id, tostring(entry.type), tostring(deleted), tostring(msg.picker_id))
+end
+
+-- Peer-side bomb activation replication. Host's TTimeBomb::Activate hook
+-- captures (type, pos, angle, fuse). Peer creates a bomb at the same pos,
+-- then natively arms its fuse + sets the same thrown velocity so both
+-- engines tick down together and explode at the same world location.
+local function handle_bomb_activated(msg)
+    if not (msg and msg.btype) then return end
+    -- Use CreateItem (the right dispatch for itype=explosive → _CreateBomb).
+    local obj
+    pcall(function() obj = CreateItem(msg.x or 0, msg.y or 0, msg.btype) end)
+    if not (obj and obj.pointer) then
+        logf("bomb_activated: CreateItem failed type=%s", tostring(msg.btype))
+        return
+    end
+    -- Throw velocity: cos(angle)*throwspeed, sin(angle)*throwspeed. Use the
+    -- local itemtable's throwspeed so both peers compute the same value.
+    local def = itemtable and itemtable[msg.btype]
+    local ts = (def and def.throwspeed) or 10
+    local vx = math.cos(msg.angle or 0) * ts
+    local vy = math.sin(msg.angle or 0) * ts
+    local fuse = msg.fuse or (def and def.delay) or 25
+    if _G.MP_NATIVE and _G.MP_NATIVE.arm_bomb then
+        pcall(function() _G.MP_NATIVE.arm_bomb(obj.pointer, fuse, vx, vy) end)
+    end
+    logf("bomb_activated RX: type=%s pos=(%.2f,%.2f) fuse=%d v=(%.2f,%.2f)",
+        msg.btype, msg.x, msg.y, fuse, vx, vy)
 end
 
 local function handle_item_spawned(msg)
@@ -1839,6 +2004,7 @@ local handlers = {
     leave = handle_leave,
     snapshot = handle_snapshot,
     peer_died = handle_peer_died,
+    bomb_activated = handle_bomb_activated,
     host_changed = handle_host_changed,
     mob_snapshot = handle_mob_snapshot,
     mob_died = handle_mob_died,
@@ -2685,6 +2851,26 @@ local function dev_menu_tick()
             end
             send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = speed,
                        dmg = dmg or 10, force = force })
+        end
+        -- Drain bomb activation events from the native hook. Hook captures
+        -- type + fuse only (safest data). We fill the position + aim angle
+        -- from the LOCAL player here at consume time — that's the
+        -- activator and the most reliable source.
+        if _G.MP_NATIVE.consume_bomb then
+            for _ = 1, 8 do
+                local btype, _ux, _uy, _ua, fuse = _G.MP_NATIVE.consume_bomb()
+                if not btype then break end
+                local pl_loc = player.GetPlayer()
+                local lx, ly, la = 0, 0, 0
+                if pl_loc then
+                    pcall(function() lx, ly = pl_loc:GetPosition() end)
+                    pcall(function() la = pl_loc:GetAngle() end)
+                end
+                logf("BOMB activated: type=%s pos=(%.2f,%.2f) angle=%.3f fuse=%d",
+                    tostring(btype), lx, ly, la, fuse or 0)
+                send_msg({ type = "bomb_activated",
+                           btype = btype, x = lx, y = ly, angle = la, fuse = fuse })
+            end
         end
     end
     if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
