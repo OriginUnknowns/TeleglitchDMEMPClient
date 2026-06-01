@@ -1020,7 +1020,11 @@ end
 -- input / can self-shoot. Skipping the think wholesale (passive hooks) breaks
 -- rendering + crashes. Needs SURGICAL neutering of just the input+camera reads
 -- inside the think. Gated OFF until then; puppets are the stable path.
-_G.MP_USE_TPLAYER = false  -- WIP: see active-player-writer issue; puppets = stable
+_G.MP_USE_TPLAYER = true   -- Path A v3 (2026-06-01): no GiveItem, no
+                            -- set_action. Pure CreatePlayer + invuln/pin.
+                            -- If this is stable, the puppet stands frozen
+                            -- in idle pose at network-driven position — but
+                            -- it gives us a baseline to iterate from.
 
 handle_join = function(p)
     if mp.puppets[p.id] then return end
@@ -1037,7 +1041,15 @@ handle_join = function(p)
         local main_before, local_addr
         pcall(function() main_before = _G.MP_NATIVE.get_main_player() end)
         pcall(function() local_addr = _G.MP_NATIVE.addr_of(pl.pointer) end)
-        pcall(function() obj = CreatePlayer(sx, sy) end)
+        -- Path A v4 (2026-06-01): spawn the puppet FAR off-map. v3 (host-stable,
+        -- joiner-crash) suggested the issue is TPlayer-vs-TPlayer collision
+        -- between the puppet and the joiner's own local player at level start
+        -- (joiner spawns near origin; the host's reported pos is also near
+        -- origin). Spawning at (-9999, -9999) avoids any collision dispatch
+        -- before SetPosition (via handle_snapshot) brings the puppet to its
+        -- real position on the next network tick.
+        local SAFE_SPAWN = -9999
+        pcall(function() obj = CreatePlayer(SAFE_SPAWN, SAFE_SPAWN) end)
         local main_after_create
         pcall(function() main_after_create = _G.MP_NATIVE.get_main_player() end)
         pcall(function() _G.MP_NATIVE.set_main_player(saved) end)
@@ -1058,6 +1070,14 @@ handle_join = function(p)
                 if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(obj.pointer, true) end
                 if _G.MP_NATIVE.pin_hp then _G.MP_NATIVE.pin_hp(obj.pointer) end
             end)
+            -- Path A v3 (2026-06-01): NO GiveItem on the puppet. v2 equipped
+            -- pystol up-front; both clients froze+crashed after preamble. The
+            -- GiveItem also tripped our own GIVEITEM wrap (logged as
+            -- "TRACK SKIP-GIVE join type=pystol") so something in the inventory
+            -- path got confused. Try the puppet WITHOUT touching inventory:
+            -- just CreatePlayer + invuln/pin. No GiveItem, no set_action
+            -- (filtered to nothing below). If this is stable the puppet stays
+            -- idle but at least we have a baseline to iterate from.
         end
     end
     if not obj then
@@ -1176,7 +1196,14 @@ local function handle_snapshot(msg)
             if not entry then handle_join(p); entry = mp.puppets[p.id] end
             if entry and entry.obj then
                 -- Liveness check: if engine has freed the entity, recreate.
-                if not entity_alive(entry.obj) then
+                -- SKIP for TPlayer puppets (Path A). The check uses
+                -- GetObjectsInCircle(local_player, 2000) — a puppet spawned
+                -- at the safe -9999 offset is OUTSIDE that radius, so the
+                -- check would mark it stale every tick → infinite recreate
+                -- loop → crash. TPlayer puppets don't share the recycled-ptr
+                -- problem the stale check was designed for (real TPlayers
+                -- aren't freed mid-frame the way mp_remote enemy actors are).
+                if not entry.is_tplayer and not entity_alive(entry.obj) then
                     logf("PUPPET STALE id=%s last=(%.1f,%.1f) age=%.1fs — recreating",
                         tostring(p.id), entry.last_x or 0, entry.last_y or 0,
                         socket.gettime() - (entry.created_at or 0))
@@ -1185,6 +1212,15 @@ local function handle_snapshot(msg)
                     entry = mp.puppets[p.id]
                 end
                 if entry and entry.obj then
+                    -- Diagnostic counter so we can correlate the LAST snapshot
+                    -- before a crash with the dllhost think log. Logs every
+                    -- 30th update (~3 s at 10 Hz) to keep the log readable.
+                    entry._dbg_n = (entry._dbg_n or 0) + 1
+                    if entry.is_tplayer and (entry._dbg_n % 30 == 1) then
+                        logf("[PUP-DBG] id=%s ptr=%s n=%d p.x=%.1f p.y=%.1f p.act=%s p.hp=%s",
+                            tostring(p.id), tostring(entry.obj.pointer), entry._dbg_n,
+                            p.x or 0, p.y or 0, tostring(p.act), tostring(p.hp))
+                    end
                     -- If this peer is marked dead (server forwarded
                     -- player_died → handle_peer_died), pin their puppet
                     -- far off-map so the host's mob AI's nearest-target
@@ -1200,9 +1236,12 @@ local function handle_snapshot(msg)
                         if p.hp then entry.hp = p.hp end
                         goto continue_puppet
                     end
+                    if entry.is_tplayer then logf("[PUP] pre-SetPos ptr=%s", tostring(entry.obj.pointer)) end
                     pcall(function() entry.obj:SetPosition(p.x, p.y) end)
+                    if entry.is_tplayer then logf("[PUP] post-SetPos") end
                     if p.angle then
                         pcall(function() entry.obj:SetAngle(p.angle) end)
+                        if entry.is_tplayer then logf("[PUP] post-SetAngle") end
                     end
                     -- Drive the puppet's ANIMATION by mirroring the remote
                     -- player's action id onto its +0xB4 field (the engine's own
@@ -1221,15 +1260,27 @@ local function handle_snapshot(msg)
                             if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(entry.obj.pointer, true) end
                         end)
                     end
-                    -- Drive the remote player's ANIMATION. Only safe on a real
-                    -- TPlayer (full anim/weapon setup); the old enemy puppet
-                    -- null-derefs. Writes the action id to +0xB4 (engine's own
-                    -- SetAction field) so the engine plays the proper animation.
-                    if entry.is_tplayer and p.act and entry.obj.pointer
-                       and _G.MP_NATIVE and _G.MP_NATIVE.set_action
-                       and entity_alive(entry.obj) then
-                        pcall(function() _G.MP_NATIVE.set_action(entry.obj.pointer, p.act) end)
-                    end
+                    -- Drive the remote player's ANIMATION via the engine's own
+                    -- +0xB4 SetAction field. Filtered to "safe" actions:
+                    --   0=idle 1=walk 2=fall 3=rise 4=pain 6=hit 13=sprint
+                    -- DROPPED on TPlayer puppets:
+                    --   5=lay  (touches inventory)
+                    --   7=shoot 8=aim  (fire weapon-effect callback at attack
+                    --   frames → null-deref if the puppet has no weapon or the
+                    --   weapon ptr isn't set up the way render expects)
+                    --   9..12=vehib1/vehib2/hide/dig (vehicle / interactive
+                    --   subsystems we don't track)
+                    -- This costs visible aim/shoot anim on puppets but stops the
+                    -- "crash ~Ns into play" we saw on the first MP_USE_TPLAYER=true
+                    -- flight (2026-06-01). Restore shoot/aim once the puppet has
+                    -- a real weapon and we trust the render path.
+                    -- Path A v3 (2026-06-01): set_action DISABLED entirely on
+                    -- TPlayer puppets. v1 (no filter) crashed ~4s in; v2 (filter
+                    -- + give pystol) froze on preamble dismiss. Hypothesis is
+                    -- one of those interventions perturbs an engine state that
+                    -- only manifests once the level is fully running. Keep the
+                    -- puppet a pure position-receiver until v3 is proven stable.
+                    -- if entry.is_tplayer and p.act ... DISABLED
                     entry.last_x = p.x
                     entry.last_y = p.y
                     if p.hp then entry.hp = p.hp end

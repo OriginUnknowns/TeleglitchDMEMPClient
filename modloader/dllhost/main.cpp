@@ -801,6 +801,12 @@ static int l_set_main_player(lua_State* L) {
 #define FIRE_GATE_OFF  0xE4       // byte this+0xE4 (local_18[0x39]): !=0 -> no fire
 #define HP_OFF         0xBC       // float this+0xBC: actor health
 #define INVULN_OFF     0xFC       // byte  this+0xFC: invulnerable flag
+#define DEATH_TIMER_OFF 0xCC      // int   this+0xCC: TPlayer death timer
+                                  //   TakeDamage @0x45e900 writes +0xCC=0x32 on
+                                  //   HP<=0; vt[14] gameover @0x45c220 fires
+                                  //   when HP<=0 && +0xCC==0. Belt-and-braces
+                                  //   pin to a sentinel != 0 each frame.
+#define DEATH_TIMER_SENTINEL 0x7FFFFFFF
 
 static BYTE* g_base = nullptr;
 static inline BYTE* mod_base() { if (!g_base) g_base = (BYTE*)GetModuleHandleA(NULL); return g_base; }
@@ -830,13 +836,79 @@ typedef int (__thiscall *PThinkFn)(void* self);
 static PThinkFn orig_PThink1 = nullptr;
 static PThinkFn orig_PThink2 = nullptr;
 
+// Camera-coupling sub at 0x45b9d0 called from inside think2 on EVERY ticking
+// TPlayer. Diagnostic (tplayer_crash_diagnosis.md, 2026-06-01) traced the
+// 5-frame puppet crash here: when action!=8 the sub does 24 Box2D raycasts +
+// writes "discovered" flag into hit fixture user-data + walks module list +
+// writes view zoom global. All of that belongs to the camera-owner — running
+// it on a puppet AVs after ~5 frames as cumulative writes hit recycled
+// fixtures. Fix: bail the sub at entry when we're inside a puppet's think2.
+//
+// CRITICAL ABI NOTE: FUN_0045b9d0 is __thiscall (Ghidra shows it as void(void)
+// but the decomp reads local_18[0x2d] = +0xB4 action field, meaning ECX = this
+// at entry). Hook signature MUST mirror that with __fastcall(this/ecx, edx)
+// so g++ emits code that preserves ECX through the hook AND into the orig
+// call. The earlier `int(void)` form scribbled ECX (whatever the engine had
+// in it at the call site became `this` inside orig) → instant AV inside
+// orig's first +0xB4 read. Same trick as the bullet-ctor hook elsewhere
+// in this file.
+typedef int (__fastcall *ThisFn)(void* self, void* edx);
+static ThisFn orig_CameraSub = nullptr;
+static thread_local bool g_in_puppet_think2 = false;
+static int g_cam_calls = 0;
+static int g_cam_skips = 0;
+static int __fastcall hook_CameraSub(void* self, void* /*edx*/) {
+    // Bail for ANY non-main player, not just during our think2 wrapper.
+    // The flag-based gate missed the case where the sub is reached from
+    // outside think2 (think1, OnAction, etc.). Reading DAT_005747a4
+    // directly catches every call path.
+    void* main_p = *(void**)(g_base + MAIN_PLAYER_RVA);
+    bool is_passive = (self != main_p);
+    if (is_passive) {
+        if (++g_cam_skips <= 5) host_log("CameraSub SKIP self=%p main=%p (passive)", self, main_p);
+        return 0;
+    }
+    if (++g_cam_calls <= 5) host_log("CameraSub PASS self=%p (main player)", self);
+    return orig_CameraSub(self, nullptr);
+}
+
 static bool is_passive_player(void* self) {
     void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
     return self != mainp;   // not the local/controlled player -> passive
 }
 
+// First-N logger so we can see which puppet survived how many think frames
+// before crashing. Keyed by ptr identity; per-puppet up to 16 frames.
+struct PThinkLog { void* who; int frames; };
+static PThinkLog g_think_log[8];
+static void log_first_frames(void* self, const char* tag) {
+    for (int i = 0; i < 8; ++i) {
+        if (g_think_log[i].who == self) {
+            if (g_think_log[i].frames < 16) {
+                host_log("%s puppet=%p frame=%d hp=%.1f inv=%d cc=%d a=%d",
+                    tag, self, g_think_log[i].frames,
+                    *(float*)((char*)self + HP_OFF),
+                    (int)*((unsigned char*)self + INVULN_OFF),
+                    *(int*)((char*)self + DEATH_TIMER_OFF),
+                    *(int*)((char*)self + 0xB4));
+                g_think_log[i].frames++;
+            }
+            return;
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (g_think_log[i].who == nullptr) {
+            g_think_log[i].who = self;
+            g_think_log[i].frames = 1;
+            host_log("%s puppet=%p FRAME 0 (FIRST SEEN)", tag, self);
+            return;
+        }
+    }
+}
+
 static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
     if (!is_passive_player(self)) return orig_PThink1(self);
+    log_first_frames(self, "PT1.pre");
     init_dummy_device();
     void** ip = (void**)(mod_base() + INPUT_DEV_RVA);
     unsigned char* gate = (unsigned char*)self + FIRE_GATE_OFF;
@@ -844,7 +916,19 @@ static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
     unsigned char saved_gate = *gate;
     *ip = (void*)g_dummy_dev;   // every input query reads "nothing pressed"
     *gate = 1;                  // engine's own gate: skip fire/reload/drop/shoot
+    // Per-frame defensive pins. Lua re-pins at network rate (~10 Hz); these
+    // close the ~100 ms window where an incoming hit could fire TakeDamage
+    // @0x45e900 or the gameover branch @0x45c220 with cleared flags.
+    //   HP    > 0 → TActor death check never trips
+    //   inv   = 1 → entire TPlayer::TakeDamage body short-circuits
+    //   +0xCC ≠ 0 → vt[14] gameover gate stays closed even if HP momentarily
+    //                hits <= 0 (the order is HP→+0xCC=0x32; we pre-pin so the
+    //                "==0" check never matches).
+    *(float*)((char*)self + HP_OFF) = 9999.0f;
+    *((unsigned char*)self + INVULN_OFF) = 1;
+    *(int*)((char*)self + DEATH_TIMER_OFF) = DEATH_TIMER_SENTINEL;
     int r = orig_PThink1(self); // anim state machine + position + aim cache run
+    log_first_frames(self, "PT1.post");
     *gate = saved_gate;
     *ip = saved_in;
     return r;
@@ -852,30 +936,121 @@ static int __fastcall hook_PThink1(void* self, void* /*edx*/) {
 
 static int __fastcall hook_PThink2(void* self, void* /*edx*/) {
     if (!is_passive_player(self)) return orig_PThink2(self);
+    log_first_frames(self, "PT2.pre");
     init_dummy_device();
     void** ip = (void**)(mod_base() + INPUT_DEV_RVA);
-    float* zoom  = (float*)(mod_base() + VIEW_ZOOM_RVA);
-    float* zoom2 = (float*)(mod_base() + VIEW_ZOOM2_RVA);
     void* saved_in = *ip;
-    float sz = *zoom, sz2 = *zoom2;
     *ip = (void*)g_dummy_dev;
-    int r = orig_PThink2(self);  // render/draw block runs (this+0xFD==0); zoom discarded
-    *zoom = sz; *zoom2 = sz2;
+    // Belt-and-braces: even with the camera-sub hook below, force action=8
+    // (aim) for the duration of orig_PThink2 so that IF the hook somehow
+    // misses the sub (e.g. inlined elsewhere), the action!=8 branch — the
+    // 24-iter raycast loop + module walk that AVs — is not taken.
+    int* act = (int*)((char*)self + 0xB4);
+    int saved_act = *act;
+    *act = 8;
+    g_in_puppet_think2 = true;
+    int r = orig_PThink2(self);  // render/draw block runs (this+0xFD==0)
+    g_in_puppet_think2 = false;
+    *act = saved_act;
+    log_first_frames(self, "PT2.post");
+    // NO zoom save/restore — DAT_0057588c is in .rdata (read-only), and
+    // attempting to write it AVs. Old code did *zoom = sz; *zoom2 = sz2;
+    // which crashed inside this hook (caught by our own VEH at
+    // VERSION.dll+0x42c2). Since hook_CameraSub now bails on EVERY
+    // non-main-player call (not just within think2), the puppet never
+    // runs the camera sub at all, so there's no zoom mutation to undo.
     *ip = saved_in;
     return r;
 }
 
+// Hook purecall itself so ANY virtual-method-on-abstract-class dispatch
+// becomes a silent no-op instead of aborting the process. Chasing
+// individual purecall slots in TPlayer's vtable (6 found, all patched —
+// the engine STILL crashed through purecall) was whack-a-mole. The crash
+// chain showed esp+12=purecall after the patches, meaning either we missed
+// a slot or a different class's vtable has a purecall the engine reaches.
+// Hooking the stub itself catches them all. Logs the caller so we can still
+// learn what's being dispatched even though we silence the abort.
+static int g_purecall_hits = 0;
+static void __cdecl hook_purecall() {
+    // Read the return address right above ESP (cdecl, no args).
+    void* ret_addr;
+    asm volatile("movl 4(%%ebp), %0" : "=r"(ret_addr));
+    DWORD_PTR base = (DWORD_PTR)g_base;
+    DWORD_PTR r = (DWORD_PTR)ret_addr;
+    DWORD_PTR rel = (r >= base && r < base + 0x800000) ? (r - base) : 0;
+    if (++g_purecall_hits <= 20) {
+        host_log("purecall HIT #%d  caller=%p (Teleglitch.exe+0x%lx)",
+            g_purecall_hits, ret_addr, (unsigned long)rel);
+    }
+    // Just return. The caller expected vt[N]() to do something — usually
+    // void; sometimes returning 0 is fine. For methods that returned a
+    // non-zero pointer the caller might NULL-deref later, but that's still
+    // strictly better than terminating right now.
+}
+
+// Patch all purecall stubs in TPlayer's vtable region. Ghidra scan found 6:
+// +0x94, +0x11c, +0x134, +0x138, +0x1f8, +0x240 (RVAs from TPlayer vftable
+// base 0x556b14 — i.e. 0x556ba8, 0x556c30, 0x556c48, 0x556c4c, 0x556d0c,
+// 0x556d54). v1 of this patch only fixed the first; engine crashed in another
+// purecall slot. TPlayer extends way past 40 slots (probably extended vtables
+// for multiple inheritance / virtual bases). All purecall slots are
+// intentional poison pills — replacing with a noop is no worse than crash
+// for any slot the engine might dispatch on. Replacement target is the
+// existing PreSubclassWindow noop stub (RVA 0x2830) used by other classes
+// for "this method intentionally does nothing".
+static void patch_tplayer_purecall_slot() {
+    // RVAs of every purecall slot in TPlayer vftable (= 0x556b14 + slot_offset).
+    // Module RVA = 0x156b14 + slot_offset (load base differs by 0x400000 from
+    // Ghidra's analysis base).
+    static const DWORD slot_rvas[] = {
+        0x156ba8,  // +0x94
+        0x156c30,  // +0x11c
+        0x156c48,  // +0x134
+        0x156c4c,  // +0x138
+        0x156d0c,  // +0x1f8
+        0x156d54,  // +0x240
+    };
+    DWORD noop = (DWORD)(g_base + 0x2830);   // PreSubclassWindow noop
+    for (size_t i = 0; i < sizeof(slot_rvas) / sizeof(slot_rvas[0]); ++i) {
+        BYTE* slot = g_base + slot_rvas[i];
+        DWORD old_protect;
+        if (VirtualProtect(slot, 4, PAGE_READWRITE, &old_protect)) {
+            DWORD before = *(DWORD*)slot;
+            *(DWORD*)slot = noop;
+            DWORD ignored;
+            VirtualProtect(slot, 4, old_protect, &ignored);
+            host_log("patched TPlayer vt slot RVA 0x%x: 0x%08x -> 0x%08x", slot_rvas[i], before, noop);
+        } else {
+            host_log("patch TPlayer vt slot RVA 0x%x FAILED — err=%lu", slot_rvas[i], GetLastError());
+        }
+    }
+}
+
+typedef void (__cdecl *PurecallFn)(void);
+static PurecallFn orig_purecall = nullptr;
+
 static int l_install_passive_player_hooks(lua_State* L) {
     g_base = (BYTE*)GetModuleHandleA(NULL);
     init_dummy_device();
+    patch_tplayer_purecall_slot();
+    // Hook purecall itself. Catches every vt[N]() dispatch to an unimplemented
+    // virtual, regardless of which class's vtable holds it.
+    BYTE* pc = g_base + 0x10d0ee;   // RVA of purecall (Ghidra: 0x0050d0ee)
+    MH_STATUS spc = MH_CreateHook(pc, (LPVOID)&hook_purecall, (LPVOID*)&orig_purecall);
+    if (spc == MH_OK) spc = MH_EnableHook(pc);
+    host_log("purecall hook: status=%d", spc);
     BYTE* t1 = g_base + 0x5cbc0;   // FUN_0045cbc0 (vtable[10] think1)
     BYTE* t2 = g_base + 0x5bff0;   // FUN_0045bff0 (vtable[11] think2/render)
+    BYTE* tc = g_base + 0x5b9d0;   // FUN_0045b9d0 (camera-coupling sub, called from think2)
     MH_STATUS s1 = MH_CreateHook(t1, (LPVOID)&hook_PThink1, (LPVOID*)&orig_PThink1);
     if (s1 == MH_OK) s1 = MH_EnableHook(t1);
     MH_STATUS s2 = MH_CreateHook(t2, (LPVOID)&hook_PThink2, (LPVOID*)&orig_PThink2);
     if (s2 == MH_OK) s2 = MH_EnableHook(t2);
-    host_log("install_passive_player_hooks: think1=%d think2=%d", s1, s2);
-    api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK) ? 1 : 0);
+    MH_STATUS sc = MH_CreateHook(tc, (LPVOID)&hook_CameraSub, (LPVOID*)&orig_CameraSub);
+    if (sc == MH_OK) sc = MH_EnableHook(tc);
+    host_log("install_passive_player_hooks: think1=%d think2=%d camera=%d", s1, s2, sc);
+    api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK && sc == MH_OK) ? 1 : 0);
     return 1;
 }
 
@@ -1058,10 +1233,15 @@ static HWND find_our_hwnd() {
     return g_our_hwnd;
 }
 
+static LONG WINAPI mp_unhandled_filter(EXCEPTION_POINTERS*);  // fwd decl — body lives below DllMain
 static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
                                      UINT wMsgFilterMin, UINT wMsgFilterMax,
                                      UINT wRemoveMsg) {
     BOOL r = orig_PeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    // Re-arm our SEH filter every message-pump iteration. Engine or a plugin
+    // may install its own filter later in startup; SetUnhandledExceptionFilter
+    // is last-writer-wins, so we need to keep stomping it back to ours.
+    SetUnhandledExceptionFilter(mp_unhandled_filter);
     // Swallow ESC keydown/keyup while suppression is armed. Has to be
     // done both for KEYDOWN (would trigger the pause toggle) and
     // KEYUP/CHAR so the engine doesn't see a half-event.
@@ -1386,6 +1566,166 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     return 1;  // return the table
 }
 
+// Vectored exception handler — fires BEFORE SEH (which the CRT / Lua may
+// hijack) on EVERY exception including first-chance. We filter to the codes
+// that mean "we crashed", log, then chain. SetUnhandledExceptionFilter alone
+// missed our AV — likely the CRT installed its own filter or the exception
+// is RaiseFailFastException which bypasses unhandled filters by design.
+//
+// Filter heuristic: only the bad ones. C++ exceptions, breakpoint asserts,
+// and SEH unwind targets will be skipped. Stack overflow gets a partial dump
+// (filter runs on the broken stack but we'll get EIP at least).
+static volatile LONG g_in_filter = 0;
+static LONG WINAPI mp_unhandled_filter(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    DWORD c = er->ExceptionCode;
+    bool is_crash = (c == EXCEPTION_ACCESS_VIOLATION)
+                 || (c == EXCEPTION_STACK_OVERFLOW)
+                 || (c == EXCEPTION_ILLEGAL_INSTRUCTION)
+                 || (c == EXCEPTION_PRIV_INSTRUCTION)
+                 || (c == EXCEPTION_INT_DIVIDE_BY_ZERO)
+                 || (c == 0xC0000409)  // STATUS_STACK_BUFFER_OVERRUN / __fastfail
+                 || (c == 0xC0000374); // STATUS_HEAP_CORRUPTION
+    if (!is_crash) return EXCEPTION_CONTINUE_SEARCH;
+    // Recursion guard. If our own handler faults, we don't want to spiral.
+    if (InterlockedExchange(&g_in_filter, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* ctx = ep->ContextRecord;
+    HMODULE tg = GetModuleHandleA(NULL);
+    DWORD_PTR base = (DWORD_PTR)tg;
+    DWORD_PTR eip = (DWORD_PTR)er->ExceptionAddress;
+    DWORD_PTR rel = (eip >= base && eip < base + 0x800000) ? (eip - base) : 0;
+    const char* code_name = "?";
+    switch (er->ExceptionCode) {
+        case EXCEPTION_ACCESS_VIOLATION:    code_name = "ACCESS_VIOLATION"; break;
+        case EXCEPTION_STACK_OVERFLOW:      code_name = "STACK_OVERFLOW"; break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:  code_name = "DIV0"; break;
+        case EXCEPTION_PRIV_INSTRUCTION:    code_name = "PRIV_INSTR"; break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION: code_name = "ILLEGAL_INSTR"; break;
+    }
+    host_log("==== EXCEPTION %s code=0x%08lx ====", code_name, er->ExceptionCode);
+    // Identify which module EIP is in. GetModuleHandleEx with the address
+    // returns the module's HMODULE. If EIP is inside Teleglitch.exe show
+    // the RVA; otherwise show the module name + offset within it.
+    HMODULE eip_mod = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                       | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)eip, &eip_mod);
+    char modname[MAX_PATH] = "(unknown)";
+    if (eip_mod) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(eip_mod, path, MAX_PATH)) {
+            const char* fn = strrchr(path, '\\');
+            if (!fn) fn = strrchr(path, '/');
+            snprintf(modname, sizeof(modname), "%s", fn ? fn + 1 : path);
+        }
+        DWORD_PTR mod_off = eip - (DWORD_PTR)eip_mod;
+        host_log("  EIP=%p  (%s+0x%lx)", (void*)eip, modname, (unsigned long)mod_off);
+    } else {
+        host_log("  EIP=%p  (no module — heap/jit?)", (void*)eip);
+    }
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const char* op = (er->ExceptionInformation[0] == 0) ? "READ"
+                       : (er->ExceptionInformation[0] == 1) ? "WRITE"
+                       : (er->ExceptionInformation[0] == 8) ? "DEP" : "?";
+        host_log("  fault: %s addr=%p", op, (void*)er->ExceptionInformation[1]);
+    }
+    host_log("  EAX=%08lx  EBX=%08lx  ECX=%08lx  EDX=%08lx",
+        ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx);
+    host_log("  ESI=%08lx  EDI=%08lx  EBP=%08lx  ESP=%08lx",
+        ctx->Esi, ctx->Edi, ctx->Ebp, ctx->Esp);
+    // Walk the stack via EBP frames (works for non-fpo code). Print up to 16
+    // return addresses, mapped relative to Teleglitch.exe when in range.
+    host_log("  stack walk (EBP chain):");
+    DWORD_PTR ebp = ctx->Ebp;
+    for (int i = 0; i < 16; ++i) {
+        if (ebp == 0 || IsBadReadPtr((void*)ebp, 8)) break;
+        DWORD_PTR ret = *(DWORD_PTR*)(ebp + 4);
+        DWORD_PTR next_ebp = *(DWORD_PTR*)ebp;
+        DWORD_PTR rret = (ret >= base && ret < base + 0x800000) ? (ret - base) : 0;
+        host_log("    [%d] ret=%p  (Teleglitch.exe+0x%08lx)", i, (void*)ret, (unsigned long)rret);
+        if (next_ebp <= ebp) break;  // sanity: frames grow toward higher addresses
+        ebp = next_ebp;
+    }
+    // Also walk a small slice of the raw stack as a backup if EBP is FPO'd.
+    host_log("  raw ESP+0..+16 returns:");
+    DWORD_PTR esp = ctx->Esp;
+    for (int i = 0; i < 16; ++i) {
+        DWORD_PTR addr = esp + i * 4;
+        if (IsBadReadPtr((void*)addr, 4)) break;
+        DWORD_PTR v = *(DWORD_PTR*)addr;
+        if (v >= base && v < base + 0x800000) {
+            host_log("    esp+%02d = %p  (Teleglitch.exe+0x%08lx)",
+                i*4, (void*)v, (unsigned long)(v - base));
+        }
+    }
+    host_log("==== END EXCEPTION ====");
+    if (g_log) { fflush(g_log); }
+    InterlockedExchange(&g_in_filter, 0);
+    return EXCEPTION_CONTINUE_SEARCH;  // let the OS terminate normally
+}
+
+// Stack-walk helper used by both the SEH filter and the exit hooks. Logs
+// up to 16 EBP-chain frames mapped relative to Teleglitch.exe (paste those
+// addresses straight into Ghidra). Caller passes a starting EBP — either
+// the exception context's, or a fresh __builtin_frame_address(0).
+static void log_stack_walk_from_ebp(DWORD_PTR ebp, DWORD_PTR base, const char* tag) {
+    host_log("  %s stack walk (EBP=%p):", tag, (void*)ebp);
+    for (int i = 0; i < 16; ++i) {
+        if (ebp == 0 || IsBadReadPtr((void*)ebp, 8)) break;
+        DWORD_PTR ret = *(DWORD_PTR*)(ebp + 4);
+        DWORD_PTR next_ebp = *(DWORD_PTR*)ebp;
+        DWORD_PTR rret = (ret >= base && ret < base + 0x800000) ? (ret - base) : 0;
+        host_log("    [%d] ret=%p  (Teleglitch.exe+0x%08lx)",
+            i, (void*)ret, (unsigned long)rret);
+        if (next_ebp <= ebp) break;
+        ebp = next_ebp;
+    }
+}
+
+typedef VOID (WINAPI *ExitProcessFn)(UINT);
+typedef BOOL (WINAPI *TerminateProcessFn)(HANDLE, UINT);
+static ExitProcessFn orig_ExitProcess = nullptr;
+static TerminateProcessFn orig_TerminateProcess = nullptr;
+static VOID WINAPI hook_ExitProcess(UINT code) {
+    DWORD_PTR base = (DWORD_PTR)GetModuleHandleA(NULL);
+    host_log("==== ExitProcess(%u) called ====", code);
+    DWORD_PTR ebp;
+    asm volatile("movl %%ebp, %0" : "=r"(ebp));
+    log_stack_walk_from_ebp(ebp, base, "ExitProcess");
+    host_log("==== END ExitProcess ====");
+    if (g_log) fflush(g_log);
+    if (orig_ExitProcess) orig_ExitProcess(code);
+    else ExitProcess(code);
+}
+static BOOL WINAPI hook_TerminateProcess(HANDLE proc, UINT code) {
+    if (proc == GetCurrentProcess() || proc == (HANDLE)-1) {
+        DWORD_PTR base = (DWORD_PTR)GetModuleHandleA(NULL);
+        host_log("==== TerminateProcess(self, %u) called ====", code);
+        DWORD_PTR ebp;
+        asm volatile("movl %%ebp, %0" : "=r"(ebp));
+        log_stack_walk_from_ebp(ebp, base, "TerminateProcess");
+        host_log("==== END TerminateProcess ====");
+        if (g_log) fflush(g_log);
+    }
+    return orig_TerminateProcess ? orig_TerminateProcess(proc, code) : TerminateProcess(proc, code);
+}
+static void install_exit_hooks() {
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    if (!k) return;
+    void* ep = (void*)GetProcAddress(k, "ExitProcess");
+    void* tp = (void*)GetProcAddress(k, "TerminateProcess");
+    if (ep) {
+        if (MH_CreateHook(ep, (LPVOID)&hook_ExitProcess, (LPVOID*)&orig_ExitProcess) == MH_OK)
+            MH_EnableHook(ep);
+    }
+    if (tp) {
+        if (MH_CreateHook(tp, (LPVOID)&hook_TerminateProcess, (LPVOID*)&orig_TerminateProcess) == MH_OK)
+            MH_EnableHook(tp);
+    }
+    host_log("dllhost: exit hooks installed");
+}
+
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         // Load the real version.dll so our forwarded exports work.
@@ -1395,6 +1735,19 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
         snprintf(real, sizeof(real), "%s\\version.dll", sysdir);
         g_realVersion = LoadLibraryA(real);
         host_log("dllhost: process attach, real version.dll = %p", (void*)g_realVersion);
+
+        // SEH UEF + VEH + exit hooks. Belt-and-suspenders coverage:
+        //   - VEH catches first-chance AVs and fail-fast (the latter bypasses
+        //     SEH entirely). Recursion-guarded so it can't trip on its own
+        //     log code.
+        //   - UEF is the second-chance net. We re-arm it from PeekMessageA
+        //     so any late writer (engine / lua52 / a plugin) gets overwritten.
+        //   - ExitProcess/TerminateProcess hooks catch abort()/exit() paths
+        //     that don't go through an exception at all.
+        AddVectoredExceptionHandler(1, mp_unhandled_filter);
+        SetUnhandledExceptionFilter(mp_unhandled_filter);
+        host_log("dllhost: vectored + unhandled exception filters installed");
+        install_exit_hooks();
 
         load_native_mods();
     }
