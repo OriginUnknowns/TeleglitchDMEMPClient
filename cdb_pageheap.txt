@@ -1,7 +1,10 @@
-.echo ===GFLAG (hpa = page heap ON)===
+.echo === START
+.echo GlobalFlag should show hpa
 !gflag
-.echo ===RUNNING: a 'VERIFIER STOP' / 'CRASHED' line below = it crashed; reaching the menu with none = CLEAN (close the game).===
-sxe -c ".echo ===CRASHED-AV===; r; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" av
-sxe -c ".echo ===CRASHED-HC===; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" 0xc0000374
-sxe -c ".echo ===CRASHED-FASTFAIL===; kP 160; .dump /ma E:\projects\TMEMultiplayerClient\crash_ph.dmp; q" 0xc0000409
+.echo === setting exception filters (first AND second chance)
+sxe -c ".echo CRASHED-AV-FIRST; r; .echo STACK; kP 160; .echo INSTR; u eip L8; .echo HEAP-ESI; !heap -p -a @esi; .echo HEAP-EDI; !heap -p -a @edi; .echo HEAP-EBX; !heap -p -a @ebx; .echo DUMPING; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" av
+sxd -c ".echo CRASHED-AV-SECOND; r; .echo STACK; kP 160; .echo INSTR; u eip L8; .echo HEAP-ESI; !heap -p -a @esi; .echo HEAP-EDI; !heap -p -a @edi; .echo HEAP-EBX; !heap -p -a @ebx; .echo DUMPING; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" av
+sxe -c ".echo CRASHED-HC; r; kP 160; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" 0xc0000374
+sxe -c ".echo CRASHED-FASTFAIL; r; kP 160; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" 0xc0000409
+.echo === filters set, going
 g

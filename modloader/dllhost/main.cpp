@@ -192,6 +192,7 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
 }
 
 static void* resolve_entity(lua_State* L, int idx);  // fwd decl — body lives below
+static bool is_tplayer_ptr(void* e);                 // fwd decl — body below
 
 // Defensive hook on FUN_0042b2d0 — a 2-instruction helper called from a Lua
 // script-table dispatcher. It writes to DAT_005747a4+0xFD/+0x30, but if
@@ -249,6 +250,21 @@ static int __fastcall hook_BombActivate(void* self, void* /*edx*/) {
         return orig_BombActivate(self);
     }
     g_bomb_mute_until = 0;
+    // PUPPET GUARD: only forward to orig if the activator owner is the main
+    // player. Puppet activations (engine case-7/8 mirror on puppet TPlayer
+    // via set_action) call orig with a bomb whose owner has no real
+    // inventory, which makes orig modify state that doesn't exist → silent
+    // heap corruption → surfaces later in lua_close iteration. Without
+    // this guard, every multiplayer bomb activation may corrupt Lua state.
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    void* main_p = *(void**)(base + 0x1747a4);
+    void* inv = *(void**)((char*)self + 0x98);
+    void* owner = inv ? *(void**)((char*)inv + 0xc) : nullptr;
+    if (!main_p || !owner || owner != main_p) {
+        host_log("hook_BombActivate: SKIP — owner=%p main_p=%p (puppet)",
+            owner, main_p);
+        return 0;
+    }
     const char* type_ptr = (const char*)((char*)self + 0x14);
     int delay = *(int*)((char*)self + 0x100);
     int idx = g_bomb_write_idx % BOMB_RING_SIZE;
@@ -873,6 +889,11 @@ static int l_set_frame(lua_State* L) {
         if (full) { void** v = *(void***)full; if (SF_IN_RANGE(v)) entity = full; }
     }
     if (!entity) { api.pushboolean(L, 0); return 1; }
+    // TPlayer vtable check — set_frame writes +0x70 (frame). On a recycled
+    // non-TPlayer object that offset is something else and writing corrupts.
+    DWORD_PTR vt2 = *(DWORD_PTR*)entity;
+    DWORD_PTR expected_tp = (DWORD_PTR)me + 0x156b14;
+    if (vt2 != expected_tp) { api.pushboolean(L, 0); return 1; }
 
     *(float*)((char*)entity + 0x70) = frame;
     api.pushboolean(L, 1);
@@ -936,7 +957,7 @@ static int l_set_action(lua_State* L) {
         lua_tointeger_p = (LuaToIntFn)GetProcAddress(lm, "lua_tointegerx");
     }
     void* e = resolve_entity(L, 1);
-    if (!e) { api.pushboolean(L, 0); return 1; }
+    if (!is_tplayer_ptr(e)) { api.pushboolean(L, 0); return 1; }
     int id = lua_tointeger_p ? (int)lua_tointeger_p(L, 2, nullptr) : 0;
     *(int*)((char*)e + 0xB4) = id;
     api.pushboolean(L, 1);
@@ -1092,6 +1113,12 @@ static int __fastcall hook_CameraSub(void* self, void* /*edx*/) {
 
 static bool is_passive_player(void* self) {
     void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
+    // If main_player is NULL (engine in mid-init), treat ALL TPlayers as
+    // main-player (i.e. NOT passive) — prevents accidental pinning of the
+    // local player when main_p was temporarily NULL during a level reset
+    // or CreatePlayer sequence. The puppet pin will catch up on the next
+    // frame once main_p is properly set.
+    if (!mainp) return false;
     return self != mainp;   // not the local/controlled player -> passive
 }
 
@@ -1388,12 +1415,24 @@ static int l_install_passive_player_hooks(lua_State* L) {
     return 1;
 }
 
+// Shared TPlayer-vtable validation. Returns true if ptr's vtable is the
+// known TPlayer vftable (RVA 0x156b14). Used by every native that writes
+// puppet-only fields — if the engine freed/recycled this puppet, the write
+// would corrupt random memory which surfaces seconds later as a lua52 heap
+// crash. Skipping the write loses an anim frame but keeps the process up.
+static bool is_tplayer_ptr(void* e) {
+    if (!e || IsBadReadPtr(e, 4)) return false;
+    DWORD_PTR vt = *(DWORD_PTR*)e;
+    DWORD_PTR expected = (DWORD_PTR)mod_base() + 0x156b14;
+    return vt == expected;
+}
+
 // pin_hp(ptr) — write a positive health to actor+0xBC so a passive remote never
 // reaches HP<=0 locally (which would run the death branch + gameover HUD over
 // OUR screen). Called each snapshot for tplayer remotes.
 static int l_pin_hp(lua_State* L) {
     void* e = resolve_entity(L, 1);
-    if (!e) { api.pushboolean(L, 0); return 1; }
+    if (!is_tplayer_ptr(e)) { api.pushboolean(L, 0); return 1; }
     *(float*)((char*)e + HP_OFF) = 9999.0f;
     api.pushboolean(L, 1);
     return 1;
@@ -1409,7 +1448,7 @@ static int l_set_invulnerable(lua_State* L) {
         lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
     }
     void* e = resolve_entity(L, 1);
-    if (!e) { api.pushboolean(L, 0); return 1; }
+    if (!is_tplayer_ptr(e)) { api.pushboolean(L, 0); return 1; }
     int on = lua_toboolean_p ? lua_toboolean_p(L, 2) : 1;
     *(unsigned char*)((char*)e + INVULN_OFF) = on ? 1 : 0;
     api.pushboolean(L, 1);

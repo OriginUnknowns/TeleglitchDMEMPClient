@@ -32,10 +32,14 @@ if (-not (Test-Path $game)) { Write-Host "ERROR: game not found"; Read-Host "Ent
 try {
     Write-Host "[1/3] Enabling FULL page heap for Teleglitch.exe ..."
     New-Item -Path $ifeo -Force | Out-Null
-    New-ItemProperty -Path $ifeo -Name GlobalFlag    -PropertyType DWord -Value 0x02000000 -Force | Out-Null
+    # GlobalFlag = 0x02001000 = FLG_HEAP_PAGE_ALLOCATIONS | FLG_USER_STACK_TRACE_DB.
+    # The +0x1000 enables stack tracing for ALL heap allocations, so when the
+    # crash hits we can `!heap -p -a <addr>` to get the alloc stack of the
+    # corrupted block — that tells us WHICH allocation got overwritten.
+    New-ItemProperty -Path $ifeo -Name GlobalFlag    -PropertyType DWord -Value 0x02001000 -Force | Out-Null
     New-ItemProperty -Path $ifeo -Name PageHeapFlags -PropertyType DWord -Value 0x00000003 -Force | Out-Null
     $gf = (Get-ItemProperty $ifeo).GlobalFlag
-    Write-Host ("      GlobalFlag = 0x{0:X8}  (0x02000000 = plain full page heap, reproduces the crash)" -f $gf)
+    Write-Host ("      GlobalFlag = 0x{0:X8}  (page heap + alloc stack tracing)" -f $gf)
 
     Remove-Item $out,$err,"E:\projects\TMEMultiplayerClient\crash_ph.dmp" -ErrorAction SilentlyContinue
 
