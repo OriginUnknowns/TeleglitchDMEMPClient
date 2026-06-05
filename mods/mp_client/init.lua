@@ -776,8 +776,8 @@ local function broadcast_pickup_of_type(type_name, px, py)
     if mp.sock then
         send_msg({ type = "item_picked", id = best_id, picker_id = mp.my_id })
     end
-    logf("inv diff: picked id=%d type=%s d=%.2f BROADCAST",
-        best_id, type_name, math.sqrt(best_d2))
+    logf("inv diff: picked id=%s type=%s d=%.2f BROADCAST",
+        tostring(best_id), type_name, math.sqrt(best_d2))
 end
 
 -- When the player's inventory of `type_name` decreased, scan a small radius
@@ -866,12 +866,22 @@ local function detect_drop_of_type(type_name, px, py, prior_ptrs)
         logf("DROP DETECTED (armed bomb fuse=%d, skip — native hook handles)", fuse)
         return
     end
-    local id = mp.next_item_id
-    mp.next_item_id = id + 1
+    -- Peer-namespaced IDs prevent collision with host's item_list IDs
+    -- (which are 1..N) and other peers' drops. Host keeps using numeric
+    -- IDs; joiners use "p<my_id>_<n>" strings. handle_item_spawned uses
+    -- mp.items[id] lookup which tolerates either type.
+    local n = mp.next_item_id
+    mp.next_item_id = n + 1
+    local id
+    if mp.is_host then
+        id = n
+    else
+        id = "p" .. tostring(mp.my_id or "?") .. "_" .. tostring(n)
+    end
     mp.items[id] = { obj = best_obj, type = type_name, x = best_x, y = best_y }
     mp.item_obj_to_id[best_obj] = id
-    logf("DROP DETECTED id=%d type=%s pos=(%.2f,%.2f) d=%.2f",
-        id, type_name, best_x, best_y, math.sqrt(best_d2))
+    logf("DROP DETECTED id=%s type=%s pos=(%.2f,%.2f) d=%.2f is_host=%s",
+        tostring(id), type_name, best_x, best_y, math.sqrt(best_d2), tostring(mp.is_host))
     if mp.sock then
         send_msg({ type = "item_spawned",
                    item = { id = id, type = type_name, x = best_x, y = best_y } })
@@ -966,8 +976,8 @@ local function broadcast_ammo_pickup(px, py)
     if mp.sock then
         send_msg({ type = "item_picked", id = best_id, picker_id = mp.my_id })
     end
-    logf("ammo diff: picked id=%d type=%s d=%.2f BROADCAST",
-        best_id, entry.type, math.sqrt(best_d2))
+    logf("ammo diff: picked id=%s type=%s d=%.2f BROADCAST",
+        tostring(best_id), entry.type, math.sqrt(best_d2))
 end
 
 local function diff_ammo()
@@ -1226,6 +1236,13 @@ handle_join = function(p)
             pcall(function()
                 if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(obj.pointer, true) end
                 if _G.MP_NATIVE.pin_hp then _G.MP_NATIVE.pin_hp(obj.pointer) end
+                -- Switch puppet's b2Body to kinematic: stops Box2D from
+                -- integrating leftover velocity / collision impulses against
+                -- the puppet. We own the transform via SetPosition each
+                -- snapshot; a kinematic body honors that without fighting it.
+                if _G.MP_NATIVE.set_body_kinematic then
+                    _G.MP_NATIVE.set_body_kinematic(obj.pointer)
+                end
             end)
             -- Path A v3 (2026-06-01): NO GiveItem on the puppet. v2 equipped
             -- pystol up-front; both clients froze+crashed after preamble. The
@@ -1403,13 +1420,35 @@ local function handle_snapshot(msg)
                         if p.hp then entry.hp = p.hp end
                         goto continue_puppet
                     end
-                    -- SetPosition every snapshot. The deadzone we tried
-                    -- caused puppet-side physics drift (when we stopped
-                    -- SetPosition'ing during idle, residual engine velocity
-                    -- kept moving the puppet). Better to keep the puppet
-                    -- glued to authoritative pos and handle walk/idle anim
-                    -- via the action field.
-                    pcall(function() entry.obj:SetPosition(p.x, p.y) end)
+                    -- VELOCITY-BASED CATCH-UP (no per-snapshot snap):
+                    -- Instead of SetPosition snapping each snapshot (which
+                    -- causes the rubberband visible-jitter), compute a
+                    -- velocity that will move the kinematic body from its
+                    -- CURRENT position to the authoritative target over the
+                    -- next snapshot interval (~100ms). The body integrates
+                    -- smoothly toward the target. On next snapshot, we
+                    -- update velocity to the new target. No snaps → no
+                    -- rubberband. Drift self-corrects each tick because
+                    -- velocity points toward authoritative.
+                    if entry.is_tplayer and _G.MP_NATIVE and _G.MP_NATIVE.set_body_velocity then
+                        local catchup = 0.1   -- target arrival time (sec)
+                        local cur_x, cur_y = p.x, p.y
+                        pcall(function() cur_x, cur_y = entry.obj:GetPosition() end)
+                        local vx = (p.x - cur_x) / catchup
+                        local vy = (p.y - cur_y) / catchup
+                        -- Safety: if puppet has drifted FAR (>5 units, e.g.
+                        -- engine teleported it, level reset, lag spike),
+                        -- snap rather than chase at insane velocity.
+                        local dx, dy = p.x - cur_x, p.y - cur_y
+                        if (dx*dx + dy*dy) > 25 then
+                            pcall(function() entry.obj:SetPosition(p.x, p.y) end)
+                            vx, vy = 0, 0
+                        end
+                        pcall(function() _G.MP_NATIVE.set_body_velocity(entry.obj.pointer, vx, vy) end)
+                    else
+                        -- Non-TPlayer puppets keep the immediate snap.
+                        pcall(function() entry.obj:SetPosition(p.x, p.y) end)
+                    end
                     if p.angle then
                         pcall(function() entry.obj:SetAngle(p.angle) end)
                         -- Pin angle natively so the engine's case-1 walk
@@ -1422,7 +1461,7 @@ local function handle_snapshot(msg)
                             -- cache can be stale if aliveUpdate hasn't run,
                             -- and the dummy-device aim target needs an
                             -- accurate origin to produce the right angle.
-                            pcall(function() _G.MP_NATIVE.pin_angle(entry.obj.pointer, p.angle, p.x, p.y) end)
+                            pcall(function() _G.MP_NATIVE.pin_angle(entry.obj.pointer, p.angle, p.x, p.y, p.act or -1) end)
                         end
                     end
                     -- Mirror the exact body sprite frame too — action sync
@@ -1548,7 +1587,7 @@ local function handle_item_picked(msg)
     if not msg.id then return end
     local entry = mp.items[msg.id]
     if not entry then
-        logf("item_picked: NO entry id=%d from peer %s", msg.id, tostring(msg.picker_id))
+        logf("item_picked: NO entry id=%s from peer %s", tostring(msg.id), tostring(msg.picker_id))
         return
     end
     local deleted = false
@@ -1576,8 +1615,8 @@ local function handle_item_picked(msg)
     for ptr, pid in pairs(mp.item_obj_to_id) do
         if pid == msg.id then mp.item_obj_to_id[ptr] = nil end
     end
-    logf("item_picked: id=%d type=%s deleted=%s from peer %s",
-        msg.id, tostring(entry.type), tostring(deleted), tostring(msg.picker_id))
+    logf("item_picked: id=%s type=%s deleted=%s from peer %s",
+        tostring(msg.id), tostring(entry.type), tostring(deleted), tostring(msg.picker_id))
 end
 
 -- Peer-side bomb activation replication. Host's TTimeBomb::Activate hook
@@ -1619,18 +1658,27 @@ local function handle_bomb_activated(msg)
 end
 
 local function handle_item_spawned(msg)
-    if mp.is_host then return end
+    -- Both host AND joiner replicate. Originally host-skipped because
+    -- the CreateItem wrap fires track_item_host on host, which re-
+    -- broadcasts and infinite-loops. The in_giveitem flag below blocks
+    -- that re-broadcast (same pattern as handle_bomb_activated). Without
+    -- this fix, joiner drops never appear on host's screen.
     local it = msg.item
     if not (it and it.id and it.type) then return end
-    if mp.items[it.id] then return end  -- already have it
+    if mp.items[it.id] then return end  -- already have it (id space is
+    -- now disjoint between host & joiner via peer-namespacing, so a
+    -- collision here means a legitimate duplicate)
     mp.item_snapshot_received = true  -- bypass spawn-block wraps
     local obj
+    local prev_in_give = in_giveitem
+    in_giveitem = true
     pcall(function() obj = CreateItem(it.x, it.y, it.type) end)
+    in_giveitem = prev_in_give
     local store_obj = (type(obj) == "table") and obj or nil
     mp.items[it.id] = { obj = store_obj, type = it.type, x = it.x, y = it.y }
     if store_obj then mp.item_obj_to_id[store_obj] = it.id end
-    logf("handle_item_spawned: id=%d type=%s pos=(%.1f,%.1f) ok=%s",
-        it.id, it.type, it.x, it.y, tostring(store_obj ~= nil))
+    logf("handle_item_spawned: id=%s type=%s pos=(%.1f,%.1f) ok=%s is_host=%s",
+        tostring(it.id), it.type, it.x, it.y, tostring(store_obj ~= nil), tostring(mp.is_host))
 end
 
 -- Run apply_item_list in its own coroutine so the net loop keeps receiving
@@ -1836,13 +1884,33 @@ local function handle_bullet_fire(msg)
     -- the joiner's inert puppets. Either way we mute the capture flag around
     -- CreateBullet so the spawned bullet isn't re-drained and re-broadcast
     -- (that would feed back into an infinite amplification loop).
-    local owner = player.GetPlayer()
+    -- Owner = the FIRING peer's representation on THIS client. Critical:
+    -- the engine's collision dispatch excludes only the bullet's owner from
+    -- hits. If we naïvely use player.GetPlayer() (= local player), then on
+    -- the HOST side, an incoming joiner bullet has owner=host_local — so
+    -- the engine happily collides it with the joiner's PUPPET (a separate
+    -- TPlayer object) and triggers a pain anim on the puppet. The puppet
+    -- then visibly reacts as if joiner shot themselves.
+    --
+    -- Resolution: look up mp.puppets[msg.from] and use that puppet's
+    -- pointer as owner. Fall back to local player only if the puppet isn't
+    -- known (shouldn't happen but defensive).
+    local owner = nil
+    if msg.from and mp.puppets and mp.puppets[msg.from]
+       and mp.puppets[msg.from].obj then
+        owner = mp.puppets[msg.from].obj
+    end
+    if not owner then owner = player.GetPlayer() end
     local cosmetic = not mp.is_host
     local bdmg = cosmetic and 0 or ((type(msg.dmg) == "number") and msg.dmg or 10)
     -- Real force from the firing weapon (ctor a7); fall back to 2.0. Force also
     -- drives knockback + bullet range (tick decay), so the replicated shot
     -- behaves like the original weapon.
     local bforce = (type(msg.force) == "number" and msg.force > 0) and msg.force or 2.0
+    -- Cosmetic bullets (joiner side) need MORE force than the real value
+    -- because: (a) we don't want them dying after 1-2 ticks, (b) they're
+    -- visual-only so the larger range is fine.
+    if cosmetic and bforce < 2.0 then bforce = 5.0 end
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
         CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
@@ -3371,17 +3439,15 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     local function lobby_start_game()
         if not mp.sock then logf("Start: no socket"); return end
         if not mp.is_host then logf("Start: not host, ignoring"); return end
-        mp.game_started_pending = false
         send_msg({ type = "start_game" })
-        -- Drain until we see our own game_started broadcast back.
-        for _ = 1, 50 do
-            drain_sock_sync()
-            if mp.game_started_pending then break end
-        end
-        if not mp.game_started_pending then
-            logf("Start: never saw game_started echo")
-            return
-        end
+        -- Host doesn't wait for the relay's broadcast echo. mp.session_seed
+        -- was already set in welcome (= room.seed), and the relay broadcasts
+        -- game_started to joiners. The previous 50-iter drain loop had no
+        -- sleep between iterations so it completed in microseconds — well
+        -- before TCP could roundtrip the echo. Just begin locally now.
+        mp.game_started_pending = true
+        logf("Start: sent start_game, beginning game locally (seed=%s)",
+             tostring(mp.session_seed))
         if begin_game then begin_game() end
     end
 
@@ -3598,7 +3664,102 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     -- call _G.MP_FRAME_TICK at ~10Hz. Engine-tracked coroutines (Wait)
     -- crash at title-menu state, but a Win32-API hook fires every frame
     -- regardless. Tick body just drains the socket + relabels.
+    -- Debug heartbeat: log every 30th tick (~3s at 10Hz) so we can confirm
+    -- frame_tick is firing on each instance. Remove once thread-gate
+    -- regression is sorted.
+    mp._frame_tick_dbg_count = mp._frame_tick_dbg_count or 0
+    -- ==========================================================
+    -- MP_INTERP_TICK — disabled. The interp architecture (buffer
+    -- snapshots, lerp at render time) needs more work; the previous
+    -- implementation fired once per session then stopped, leaving
+    -- puppets at SAFE_SPAWN. Keep this as a no-op stub so the native
+    -- hook's getglobal succeeds without errors.
+    -- ==========================================================
+    _G.MP_INTERP_TICK = function() end
+    -- Old interp body kept below for reference (currently dead code via
+    -- the early `return` above). Will be revived when re-architected.
+    local INTERP_DELAY = 0.15
+    local _UNUSED_INTERP_TICK = function()
+        -- DIAG: log once per ~3s what state we're in (BEFORE any guard)
+        mp._interp_dbg_n = (mp._interp_dbg_n or 0) + 1
+        if (mp._interp_dbg_n % 100) == 1 then
+            local n_pup, n_tp, n_buf = 0, 0, 0
+            for _, e in pairs(mp.puppets or {}) do
+                if type(e) == "table" then
+                    n_pup = n_pup + 1
+                    if e.is_tplayer then n_tp = n_tp + 1 end
+                    if e.snap_buf then n_buf = n_buf + #e.snap_buf end
+                end
+            end
+            logf("INTERP n=%d in_game=%s puppets=%d tplayers=%d total_snaps=%d",
+                 mp._interp_dbg_n, tostring(mp.in_game), n_pup, n_tp, n_buf)
+        end
+        if not mp.in_game then return end
+        local now_t = (socket and socket.gettime) and socket.gettime() or 0
+        local render_t = now_t - INTERP_DELAY
+        for _, entry in pairs(mp.puppets or {}) do
+            if type(entry) == "table"
+               and entry.is_tplayer and not entry.is_dead
+               and entry.obj and entry.obj.pointer
+               and entry.snap_buf and #entry.snap_buf >= 1 then
+                local buf = entry.snap_buf
+                local x, y, ang, vx, vy
+                if #buf == 1 then
+                    -- Only one snapshot so far — snap to it. No interp data
+                    -- yet, but better than leaving the puppet at SAFE_SPAWN.
+                    local s = buf[1]
+                    x, y, ang, vx, vy = s.x, s.y, s.angle, 0, 0
+                else
+                    -- Find pair (a,b) bracketing render_t: a.t <= render_t <= b.t
+                    local a, b
+                    for i = 1, #buf - 1 do
+                        if buf[i].t <= render_t and buf[i+1].t >= render_t then
+                            a, b = buf[i], buf[i+1]
+                            break
+                        end
+                    end
+                    if a and b then
+                        local span = b.t - a.t
+                        local alpha = (span > 0.0001) and ((render_t - a.t) / span) or 1
+                        if alpha < 0 then alpha = 0 elseif alpha > 1 then alpha = 1 end
+                        x   = a.x + (b.x - a.x) * alpha
+                        y   = a.y + (b.y - a.y) * alpha
+                        ang = a.angle + (b.angle - a.angle) * alpha
+                        if span > 0.0001 then
+                            vx = (b.x - a.x) / span
+                            vy = (b.y - a.y) / span
+                        else
+                            vx, vy = 0, 0
+                        end
+                    else
+                        -- render_t outside the buffered range: hold the
+                        -- latest position. Skip extrapolation to avoid
+                        -- prediction overshoot when snapshots arrive late.
+                        local last = buf[#buf]
+                        x, y, ang, vx, vy = last.x, last.y, last.angle, 0, 0
+                    end
+                end
+                pcall(function() entry.obj:SetPosition(x, y) end)
+                if _G.MP_NATIVE and _G.MP_NATIVE.set_body_velocity then
+                    pcall(function()
+                        _G.MP_NATIVE.set_body_velocity(entry.obj.pointer, vx, vy)
+                    end)
+                end
+                -- NOTE: angle pin still fires from handle_snapshot at
+                -- snapshot rate. Visual angle jitter is lower-impact than
+                -- position jitter; revisit if needed.
+            end
+        end
+    end
+
     _G.MP_FRAME_TICK = function()
+        mp._frame_tick_dbg_count = (mp._frame_tick_dbg_count or 0) + 1
+        if (mp._frame_tick_dbg_count % 30) == 1 then
+            logf("frame_tick HB n=%d in_game=%s sock=%s pending=%s",
+                 mp._frame_tick_dbg_count,
+                 tostring(mp.in_game), tostring(mp.sock ~= nil),
+                 tostring(mp.game_started_pending))
+        end
         -- ESC pressed in the lobby waiting room → leave the room.
         -- (Native hook latches the keypress + swallows the event; we
         -- run the action here in safe Lua context.)
@@ -3634,7 +3795,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 if mp.is_dead and not mp.death_announced_at then
                     mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
                     logf("DEATH externally triggered → pin + announce")
-                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                     pcall(function()
                         if _G.MP_NATIVE.set_invulnerable then
                             _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
@@ -3647,7 +3808,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 end
                 if mp.is_dead then
                     -- Keep pinning so any incoming damage can't tip HP <= 0.
-                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                     -- Spectate: each frame, teleport our corpse onto the
                     -- nearest LIVING teammate. last_x/last_y are the most
                     -- recent host-broadcast positions from handle_snapshot.
@@ -3680,7 +3841,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                         logf("DEATH intercept: hp=%s → pinning + entering spectate", tostring(hp))
                         mp.is_dead = true
                         mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
-                        pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer) end)
+                        pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                         pcall(function()
                             if _G.MP_NATIVE.set_invulnerable then
                                 _G.MP_NATIVE.set_invulnerable(pl.pointer, true)

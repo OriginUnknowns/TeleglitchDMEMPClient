@@ -123,6 +123,129 @@ static void load_native_mods() {
 static LuaApi api;
 static lua_State* g_L = nullptr;
 
+// Thread ID of the thread that loaded our module (= the thread that holds
+// the lua_State at load time). Captured in luaopen_mp_native. Kept for
+// diagnostics; the actual race protection is the depth-counted model below.
+static DWORD g_main_tid = 0;
+
+// =====================================================================
+// Thread-safe Lua access — DEPTH-COUNTED model (no critical section).
+// =====================================================================
+// Lua 5.2 is single-threaded. The engine drives all Lua on its main game
+// thread; OUR hooks must never touch Lua from any other thread. The
+// original crash (lua_rawseti+0xb5 UAF) was caused by us calling Lua
+// from NVIDIA's GL worker thread via PeekMessageA.
+//
+// The fix: ALL our Lua work happens on the main thread, at points where
+// the engine has just RETURNED from its own Lua call (so we know Lua is
+// idle). We hook the engine's two Lua entry points (lua_resume,
+// lua_pcallk) and maintain a per-process nesting counter. When the
+// counter goes back to zero, we know we're at the outermost engine→Lua
+// call boundary — safe to run MP_FRAME_TICK.
+//
+// The worker-thread PeekMessageA hook does ESC handling only — no Lua
+// access whatsoever, so no race possible.
+//
+// Why a counter instead of a critical section:
+//   - CS deadlocks: worker thread holding CS while main thread tries to
+//     enter lua_resume blocks the engine's render path (window freeze).
+//   - Hooking lua_resume only is incomplete: the engine ALSO calls
+//     lua_pcallk directly for button callbacks etc., bypassing our CS.
+//   - With depth counting we don't need cross-thread sync at all — all
+//     access stays on one thread.
+// =====================================================================
+
+// Frame-tick state (referenced by hook_PeekMessageA further down too).
+static volatile bool g_frame_tick_armed = false;
+static volatile bool g_in_frame_tick    = false;
+static DWORD         g_last_tick_ms     = 0;
+
+// Interp-tick state (separate from MP_FRAME_TICK). Runs at ~30 ms so
+// puppet positions can be interpolated between 100 ms snapshots without
+// the visual jitter of snap-to-latest. Calls _G.MP_INTERP_TICK; that Lua
+// function reads each puppet's snapshot buffer and SetPosition's the
+// interpolated value at (now - interp_delay).
+static volatile bool g_in_interp_tick    = false;
+static DWORD         g_last_interp_ms    = 0;
+#define INTERP_TICK_PERIOD_MS 30
+
+// Nesting depth of engine→Lua calls (lua_resume + lua_pcallk). When this
+// returns to 0 after a top-level call, Lua is idle and we can safely
+// piggy-back MP_FRAME_TICK on the same (main) thread.
+static int g_lua_nest_depth = 0;
+
+typedef int (*LuaResumeFn)(lua_State* L, lua_State* from, int nargs);
+typedef int (*LuaPcallkFn)(lua_State* L, int nargs, int nresults,
+                           int errfunc, intptr_t ctx, void* k);
+static LuaResumeFn orig_lua_resume = nullptr;
+static LuaPcallkFn orig_lua_pcallk = nullptr;
+
+static inline void maybe_run_interp_tick(lua_State* L) {
+    if (g_lua_nest_depth != 0) return;
+    if (g_in_frame_tick || g_in_interp_tick) return;
+    if (g_L != L || !api.pcall || !api.getglobal) return;
+    DWORD now = GetTickCount();
+    if ((now - g_last_interp_ms) < INTERP_TICK_PERIOD_MS) return;
+    g_last_interp_ms = now;
+    g_in_interp_tick = true;
+    api.getglobal(L, "MP_INTERP_TICK");
+    int rc = orig_lua_pcallk
+        ? orig_lua_pcallk(L, 0, 0, 0, 0, nullptr)
+        : api.pcall(L, 0, 0, 0, 0, nullptr);
+    if (rc != 0) {
+        const char* err = api.tolstring(L, -1, nullptr);
+        // Throttle the error log — interp ticks fire ~33Hz so a Lua bug
+        // would spam dllhost.log. Print every 100th error only.
+        static int s_err_n = 0;
+        if ((s_err_n++ % 100) == 0) {
+            host_log("MP_INTERP_TICK error (#%d): %s", s_err_n, err ? err : "?");
+        }
+        api.settop(L, -2);
+    }
+    g_in_interp_tick = false;
+}
+
+static inline void maybe_run_frame_tick(lua_State* L) {
+    if (g_lua_nest_depth != 0) return;                  // still nested — not safe
+    if (!g_frame_tick_armed || g_in_frame_tick) return;
+    if (g_L != L || !api.pcall || !api.getglobal) return;
+    DWORD now = GetTickCount();
+    if ((now - g_last_tick_ms) < 250) return;           // throttle
+    g_last_tick_ms = now;
+    g_in_frame_tick = true;
+    api.getglobal(L, "MP_FRAME_TICK");
+    // Call the original pcallk directly so we don't recursively bump
+    // g_lua_nest_depth via our own hook (the trampoline reaches the
+    // real lua_pcallk).
+    if (orig_lua_pcallk
+        ? orig_lua_pcallk(L, 0, 0, 0, 0, nullptr)
+        : api.pcall(L, 0, 0, 0, 0, nullptr)) {
+        const char* err = api.tolstring(L, -1, nullptr);
+        host_log("MP_FRAME_TICK error: %s", err ? err : "?");
+        api.settop(L, -2);
+    }
+    g_in_frame_tick = false;
+}
+
+static int hook_lua_resume(lua_State* L, lua_State* from, int nargs) {
+    g_lua_nest_depth++;
+    int r = orig_lua_resume(L, from, nargs);
+    g_lua_nest_depth--;
+    maybe_run_interp_tick(L);
+    maybe_run_frame_tick(L);
+    return r;
+}
+
+static int hook_lua_pcallk(lua_State* L, int nargs, int nresults,
+                           int errfunc, intptr_t ctx, void* k) {
+    g_lua_nest_depth++;
+    int r = orig_lua_pcallk(L, nargs, nresults, errfunc, ctx, k);
+    g_lua_nest_depth--;
+    maybe_run_interp_tick(L);
+    maybe_run_frame_tick(L);
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // Hook target addresses (RVA + module base). Resolved at install time so we
 // survive ASLR (Teleglitch's image base 0x400000 matches our objdump VAs,
@@ -342,6 +465,15 @@ static int l_activate_bomb(lua_State* L) {
 static int l_read_fuse(lua_State* L) {
     void* e = resolve_entity(L, 1);
     if (!e) { api.pushinteger(L, -1); return 1; }
+    // GATE: +0xfc is the fuse field ONLY for TTimeBomb. On any other
+    // TItem subclass, that offset is something else (often the
+    // 0x7FFFFFFF sentinel used by inert items) and a naive read produces
+    // garbage that callers mistake for "armed bomb". Verify the vtable
+    // matches TTimeBomb (RVA 0x157274) before reading.
+    if (IsBadReadPtr(e, 4)) { api.pushinteger(L, -1); return 1; }
+    DWORD_PTR vt = *(DWORD_PTR*)e;
+    DWORD_PTR expected = (DWORD_PTR)GetModuleHandleA(NULL) + 0x157274;
+    if (vt != expected) { api.pushinteger(L, -1); return 1; }
     int fuse = *(int*)((char*)e + 0xfc);
     api.pushinteger(L, fuse);
     return 1;
@@ -1128,7 +1260,12 @@ static bool is_passive_player(void* self) {
 // our SetAngle from snapshot is overwritten by orig think1 on the very
 // next frame. Fix: store the snapshot's angle here per-puppet, then
 // re-apply it in hook_PThink1 post-orig.
-struct AnglePin { void* who; float angle; float px; float py; bool valid; };
+struct AnglePin {
+    void* who;
+    float angle; float px; float py;
+    int   action;           // -1 = don't pin action
+    bool  valid;
+};
 static AnglePin g_angle_pins[8];
 
 static int l_pin_angle(lua_State* L) {
@@ -1137,6 +1274,12 @@ static int l_pin_angle(lua_State* L) {
     if (!lua_tonumber_p) {
         HMODULE lm = GetModuleHandleA("lua52.dll");
         lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+    }
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
     }
     void* who = resolve_entity(L, 1);
     float angle = lua_tonumber_p ? (float)lua_tonumber_p(L, 2, nullptr) : 0.0f;
@@ -1148,12 +1291,22 @@ static int l_pin_angle(lua_State* L) {
     // the pinned angle.
     float px = lua_tonumber_p ? (float)lua_tonumber_p(L, 3, nullptr) : 0.0f;
     float py = lua_tonumber_p ? (float)lua_tonumber_p(L, 4, nullptr) : 0.0f;
+    // Optional arg 5 = action to pin between snapshots. Pass -1 (or omit)
+    // to leave action unmanaged. Prevents the on/off flicker on remote when
+    // a player aims (action 8) or attacks (action 7) — without the pin the
+    // engine's think resets +0xB4 to walk/idle within a few frames of each
+    // snapshot's set_action.
+    int  action = -1;
+    if (lua_tointeger_p && api.gettop(L) >= 5) {
+        action = lua_tointeger_p(L, 5, nullptr);
+    }
     if (!who) { api.pushboolean(L, 0); return 1; }
     for (int i = 0; i < 8; ++i) {
         if (g_angle_pins[i].who == who) {
             g_angle_pins[i].angle = angle;
             g_angle_pins[i].px = px;
             g_angle_pins[i].py = py;
+            g_angle_pins[i].action = action;
             g_angle_pins[i].valid = true;
             api.pushboolean(L, 1); return 1;
         }
@@ -1164,6 +1317,7 @@ static int l_pin_angle(lua_State* L) {
             g_angle_pins[i].angle = angle;
             g_angle_pins[i].px = px;
             g_angle_pins[i].py = py;
+            g_angle_pins[i].action = action;
             g_angle_pins[i].valid = true;
             api.pushboolean(L, 1); return 1;
         }
@@ -1194,6 +1348,13 @@ static void apply_angle_pin_after_think(void* self) {
             }
             float before = *(float*)((char*)self + 0xB0);
             *(float*)((char*)self + 0xB0) = g_angle_pins[i].angle;
+            // Pin action (+0xB4) too if Lua supplied one. Prevents the
+            // engine's think from resetting +0xB4 to walk/idle between
+            // snapshots — what was causing the aim/knife anim flicker on
+            // remote puppets. action=-1 = unmanaged (don't pin).
+            if (g_angle_pins[i].action != -1) {
+                *(int*)((char*)self + 0xB4) = g_angle_pins[i].action;
+            }
             // Log a sample when the engine's case-handler wrote a DIFFERENT
             // angle than our pin — that's the case-7/8 path overwriting us.
             // Throttled: only first 40 mismatches so it doesn't flood.
@@ -1433,7 +1594,105 @@ static bool is_tplayer_ptr(void* e) {
 static int l_pin_hp(lua_State* L) {
     void* e = resolve_entity(L, 1);
     if (!is_tplayer_ptr(e)) { api.pushboolean(L, 0); return 1; }
+    // Safety guard: never pin the LOCAL/main player's HP unless caller
+    // explicitly passes a second truthy arg (used by death-intercept). A
+    // stray pin on the main player would surface as "9999 HP in own HUD"
+    // forever. Log loudly so we catch the offending callsite.
+    void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
+    if (mainp && e == mainp) {
+        typedef int (*LuaToBoolFn)(lua_State*, int);
+        static LuaToBoolFn lua_toboolean_p = nullptr;
+        if (!lua_toboolean_p) {
+            HMODULE lm = GetModuleHandleA("lua52.dll");
+            lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+        }
+        int allow_main = lua_toboolean_p ? lua_toboolean_p(L, 2) : 0;
+        if (!allow_main) {
+            host_log("pin_hp REFUSED on main player e=%p — pass true as 2nd arg to allow", e);
+            api.pushboolean(L, 0);
+            return 1;
+        }
+        host_log("pin_hp on main player ALLOWED (death-intercept path) e=%p", e);
+    }
     *(float*)((char*)e + HP_OFF) = 9999.0f;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_body_kinematic(ptr) — switch the actor's Box2D body to kinematic so
+// it stops being driven by physics (no force response, no collisions push it).
+// Puppet TPlayers should be kinematic — we own their world transform via
+// SetPosition; dynamic bodies fight back by integrating leftover velocity
+// against walls/items and accumulating drift.
+//
+// TActor->body is at +0x50 (see tplayer_crash_diagnosis.md).
+// b2Body::m_type is at the start of the b2Body block in Box2D 2.x layouts.
+// We dump the first 32 bytes the FIRST time we're called so we can verify
+// the offset from the log (a live player should read 2=b2_dynamicBody;
+// b2_staticBody=0, b2_kinematicBody=1).
+#define ACTOR_BODY_OFF   0x50
+#define B2_TYPE_OFF      0x00
+#define B2_KINEMATIC     1
+static int l_set_body_kinematic(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadReadPtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    void* body = *(void**)((char*)e + ACTOR_BODY_OFF);
+    if (!body || IsBadWritePtr(body, 32)) {
+        host_log("set_body_kinematic: body=%p — bad/null at e+0x50", body);
+        api.pushboolean(L, 0); return 1;
+    }
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        const unsigned char* b = (const unsigned char*)body;
+        host_log("b2Body @%p dump (32 bytes): %02x%02x%02x%02x %02x%02x%02x%02x  "
+                 "%02x%02x%02x%02x %02x%02x%02x%02x  %02x%02x%02x%02x %02x%02x%02x%02x  "
+                 "%02x%02x%02x%02x %02x%02x%02x%02x",
+                 body,
+                 b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+                 b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
+                 b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23],
+                 b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31]);
+        host_log("  as int32 [0..7]: %d %d %d %d %d %d %d %d",
+                 *(int*)(b+0),  *(int*)(b+4),  *(int*)(b+8),  *(int*)(b+12),
+                 *(int*)(b+16), *(int*)(b+20), *(int*)(b+24), *(int*)(b+28));
+    }
+    int old_type = *(int*)((char*)body + B2_TYPE_OFF);
+    *(int*)((char*)body + B2_TYPE_OFF) = B2_KINEMATIC;
+    host_log("set_body_kinematic: e=%p body=%p [+%02x] was=%d set=%d",
+             e, body, B2_TYPE_OFF, old_type, B2_KINEMATIC);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_body_velocity(ptr, vx, vy) — write the actor's Box2D body
+// m_linearVelocity. Used on puppet TPlayers: their bodies are kinematic
+// (we own position via SetPosition each snapshot) so Box2D doesn't
+// integrate forces — but the engine's anim system reads velocity to decide
+// when to play the walk cycle. Setting velocity from the snapshot delta
+// makes the puppet's walk animation play without re-introducing drift
+// (kinematic body honors velocity but our next SetPosition snaps back).
+//
+// b2Body::m_linearVelocity at +0x40 (b2Vec2 = 2 floats) — standard Box2D
+// 2.x layout, same offset our earlier bomb-throw guess used.
+#define B2_LINVEL_OFF 0x40
+static int l_set_body_velocity(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadReadPtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    void* body = *(void**)((char*)e + ACTOR_BODY_OFF);
+    if (!body || IsBadWritePtr(body, B2_LINVEL_OFF + 8)) {
+        api.pushboolean(L, 0); return 1;
+    }
+    float vx = lua_tonumber_p ? (float)lua_tonumber_p(L, 2, nullptr) : 0.0f;
+    float vy = lua_tonumber_p ? (float)lua_tonumber_p(L, 3, nullptr) : 0.0f;
+    *(float*)((char*)body + B2_LINVEL_OFF + 0) = vx;
+    *(float*)((char*)body + B2_LINVEL_OFF + 4) = vy;
     api.pushboolean(L, 1);
     return 1;
 }
@@ -1557,9 +1816,8 @@ static int l_probe_memory(lua_State* L) {
 // double-entry if the callback itself causes another PeekMessageA call.
 typedef BOOL (WINAPI *PeekMessageAFn)(LPMSG, HWND, UINT, UINT, UINT);
 static PeekMessageAFn orig_PeekMessageA = nullptr;
-static volatile bool  g_frame_tick_armed = false;
-static volatile bool  g_in_frame_tick    = false;
-static DWORD          g_last_tick_ms     = 0;
+// g_frame_tick_armed / g_in_frame_tick / g_last_tick_ms are defined up
+// near hook_lua_resume so that hook can reference them.
 
 // When true, every ESC keypress arriving via PeekMessageA gets rewritten
 // to WM_NULL so the engine's native ESC handler doesn't toggle the
@@ -1662,15 +1920,37 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
     // is about to render. Calling Lua during PM_NOREMOVE peeks (which
     // happen mid-callback in many places) reenters Lua at an unsafe
     // point and corrupts the stack → crash.
+    // Worker-thread MP_FRAME_TICK fallback for menu states.
+    //
+    // At the menu, the engine often doesn't call lua_resume / lua_pcallk
+    // for many seconds — there's no per-frame Lua tick like there is in
+    // game. Without this path, the joiner can sit at mp_waiting forever
+    // without ever draining the socket to see the host's "game_started".
+    //
+    // We guard with g_lua_nest_depth == 0: that proves the main thread
+    // is currently NOT inside any engine→Lua call, so calling Lua here
+    // (from whatever thread Win32 dispatched PeekMessageA on) doesn't
+    // race the engine. The depth counter is the same one updated by
+    // hook_lua_resume / hook_lua_pcallk. There's a small race window
+    // between the check and the first api.getglobal, but at the menu
+    // depth stays at 0 reliably; in game the depth-counted path covers
+    // us and this fallback rarely fires.
     if (!r && wRemoveMsg == PM_REMOVE
         && g_frame_tick_armed && !g_in_frame_tick && g_L
-        && api.pcall && api.getglobal) {
+        && api.pcall && api.getglobal
+        && g_lua_nest_depth == 0) {
         DWORD now = GetTickCount();
         if ((now - g_last_tick_ms) >= 250) {
             g_last_tick_ms = now;
             g_in_frame_tick = true;
             api.getglobal(g_L, "MP_FRAME_TICK");
-            if (api.pcall(g_L, 0, 0, 0, 0, nullptr) != 0) {
+            // Call the original pcallk directly (bypass our hook so we
+            // don't bump g_lua_nest_depth here — depth tracking is for
+            // ENGINE→Lua entries only).
+            int rc = orig_lua_pcallk
+                ? orig_lua_pcallk(g_L, 0, 0, 0, 0, nullptr)
+                : api.pcall(g_L, 0, 0, 0, 0, nullptr);
+            if (rc != 0) {
                 const char* err = api.tolstring(g_L, -1, nullptr);
                 host_log("MP_FRAME_TICK error: %s", err ? err : "?");
                 api.settop(g_L, -2);
@@ -1867,10 +2147,39 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
         return 0;
     }
     g_L = L;
-    host_log("luaopen_mp_native: L=%p, api resolved", (void*)L);
+    g_main_tid = GetCurrentThreadId();
+    host_log("luaopen_mp_native: L=%p main_tid=%lu api resolved", (void*)L, g_main_tid);
 
     // Initialize MinHook once; safe to call multiple times.
     MH_Initialize();
+
+    // Hook the two engine→Lua entry points (lua_resume + lua_pcallk).
+    // Both bump g_lua_nest_depth at entry and decrement at exit; when
+    // the depth returns to 0 after a top-level call we piggy-back
+    // MP_FRAME_TICK on the same (main) thread.
+    {
+        HMODULE lua = GetModuleHandleA("lua52.dll");
+        FARPROC pResume  = lua ? GetProcAddress(lua, "lua_resume")  : nullptr;
+        FARPROC pPcallk  = lua ? GetProcAddress(lua, "lua_pcallk")  : nullptr;
+        if (pResume) {
+            MH_STATUS st = MH_CreateHook((LPVOID)pResume,
+                                         (LPVOID)hook_lua_resume,
+                                         (LPVOID*)&orig_lua_resume);
+            host_log("lua_resume hook @%p: status=%d", (void*)pResume, (int)st);
+            if (st == MH_OK) MH_EnableHook((LPVOID)pResume);
+        } else {
+            host_log("lua_resume hook: lua_resume not found");
+        }
+        if (pPcallk) {
+            MH_STATUS st = MH_CreateHook((LPVOID)pPcallk,
+                                         (LPVOID)hook_lua_pcallk,
+                                         (LPVOID*)&orig_lua_pcallk);
+            host_log("lua_pcallk hook @%p: status=%d", (void*)pPcallk, (int)st);
+            if (st == MH_OK) MH_EnableHook((LPVOID)pPcallk);
+        } else {
+            host_log("lua_pcallk hook: lua_pcallk not found");
+        }
+    }
 
     // Build a table of native functions. Size the hash part for the EXACT field
     // count (18) up front: an under-sized hint (was 0,4) makes lua52 luaH_resize/
@@ -1930,6 +2239,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "validate_vtable");
     api.pushcclosure(L, l_set_invulnerable, 0);
     api.setfield(L, -2, "set_invulnerable");
+    api.pushcclosure(L, l_set_body_kinematic, 0);
+    api.setfield(L, -2, "set_body_kinematic");
+    api.pushcclosure(L, l_set_body_velocity, 0);
+    api.setfield(L, -2, "set_body_velocity");
     api.pushcclosure(L, l_probe_memory, 0);
     api.setfield(L, -2, "probe_memory");
     api.pushcclosure(L, l_set_button_label, 0);

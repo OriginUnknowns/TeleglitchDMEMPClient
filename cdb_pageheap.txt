@@ -1,10 +1,33 @@
 .echo === START
 .echo GlobalFlag should show hpa
 !gflag
-.echo === setting exception filters (first AND second chance)
-sxe -c ".echo CRASHED-AV-FIRST; r; .echo STACK; kP 160; .echo INSTR; u eip L8; .echo HEAP-ESI; !heap -p -a @esi; .echo HEAP-EDI; !heap -p -a @edi; .echo HEAP-EBX; !heap -p -a @ebx; .echo DUMPING; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" av
-sxd -c ".echo CRASHED-AV-SECOND; r; .echo STACK; kP 160; .echo INSTR; u eip L8; .echo HEAP-ESI; !heap -p -a @esi; .echo HEAP-EDI; !heap -p -a @edi; .echo HEAP-EBX; !heap -p -a @ebx; .echo DUMPING; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" av
-sxe -c ".echo CRASHED-HC; r; kP 160; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" 0xc0000374
-sxe -c ".echo CRASHED-FASTFAIL; r; kP 160; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; q" 0xc0000409
+
+.echo === ignoring informational SEH events that arent crashes
+.echo (0x80000026 = STATUS_LONGJUMP, raised by Lua error handling — NOT a bug)
+sxi 0x80000026
+.echo (0x406d1388 = MS_VC_THREADNAME — debugger thread-name notification)
+sxi 0x406d1388
+.echo (0x4001000a = WX86 breakpoint on wow64 thread init)
+sxi 0x4001000a
+.echo (0xe06d7363 = C++ throw — Lua-related noise)
+sxi 0xe06d7363
+
+.echo === setting CRASH filters (first-chance — DUMP FIRST so a corrupted
+.echo eip/esp can't abort the command line and skip the dump)
+sxe -c ".echo CRASHED-AV-FIRST; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" av
+
+sxe -c ".echo CRASHED-HC; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" 0xc0000374
+
+sxe -c ".echo CRASHED-FASTFAIL; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" 0xc0000409
+
+sxe -c ".echo CRASHED-STACK-OVERFLOW; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" 0xc00000fd
+
+sxe -c ".echo CRASHED-ILLEGAL-INSTR; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" 0xc000001d
+
+sxe -c ".echo CRASHED-PRIV-INSTR; .dump /ma E:/projects/TMEMultiplayerClient/crash_ph.dmp; r; q" 0xc0000096
+
+.echo === current exception filter summary
+sx
+
 .echo === filters set, going
 g
