@@ -1240,18 +1240,68 @@ static int __fastcall hook_CameraSub(void* self, void* /*edx*/) {
         return 0;
     }
     if (++g_cam_calls <= 5) host_log("CameraSub PASS self=%p (main player)", self);
+    // (HP diagnostic removed — proved actor +0xBC is correct; HUD reads
+    // from another source we haven't located yet.)
     return orig_CameraSub(self, nullptr);
 }
 
+// Puppet registry: explicit allow-list of TPlayer pointers that ARE
+// puppets. The earlier "self != main_p" check was unsafe — during
+// CreatePlayer (puppet creation), we temporarily swap main_p to the new
+// puppet, so for that brief window is_passive_player(local_player)
+// returned true → hook_PThink1 fired on the local player and pinned its
+// HP to 9999. After we restore main_p the pinning stopped, but the
+// permanent 9999 remained, surfacing as "HP 9888/800 (9999 minus
+// accumulated damage)" in the HUD.
+//
+// Lua registers each puppet via register_puppet() right after
+// CreatePlayer succeeds; unregister_puppet() on puppet destroy / leave.
+#define MAX_PUPPETS 16
+static void* g_puppet_registry[MAX_PUPPETS] = {0};
+
+static int l_register_puppet(lua_State* L) {
+    void* p = resolve_entity(L, 1);
+    if (!p) { api.pushboolean(L, 0); return 1; }
+    for (int i = 0; i < MAX_PUPPETS; ++i) {
+        if (g_puppet_registry[i] == p) { api.pushboolean(L, 1); return 1; }
+    }
+    for (int i = 0; i < MAX_PUPPETS; ++i) {
+        if (g_puppet_registry[i] == nullptr) {
+            g_puppet_registry[i] = p;
+            host_log("register_puppet[%d] = %p", i, p);
+            api.pushboolean(L, 1); return 1;
+        }
+    }
+    host_log("register_puppet: registry full (>%d)", MAX_PUPPETS);
+    api.pushboolean(L, 0); return 1;
+}
+
+static int l_unregister_puppet(lua_State* L) {
+    void* p = resolve_entity(L, 1);
+    if (!p) { api.pushboolean(L, 0); return 1; }
+    for (int i = 0; i < MAX_PUPPETS; ++i) {
+        if (g_puppet_registry[i] == p) {
+            g_puppet_registry[i] = nullptr;
+            host_log("unregister_puppet[%d] = %p", i, p);
+            api.pushboolean(L, 1); return 1;
+        }
+    }
+    api.pushboolean(L, 0); return 1;
+}
+
+static bool is_registered_puppet(void* self) {
+    for (int i = 0; i < MAX_PUPPETS; ++i) {
+        if (g_puppet_registry[i] == self) return true;
+    }
+    return false;
+}
+
 static bool is_passive_player(void* self) {
-    void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
-    // If main_player is NULL (engine in mid-init), treat ALL TPlayers as
-    // main-player (i.e. NOT passive) — prevents accidental pinning of the
-    // local player when main_p was temporarily NULL during a level reset
-    // or CreatePlayer sequence. The puppet pin will catch up on the next
-    // frame once main_p is properly set.
-    if (!mainp) return false;
-    return self != mainp;   // not the local/controlled player -> passive
+    // Strict allow-list: a TPlayer is "passive" (puppet) only if Lua
+    // explicitly registered it. The old "self != main_p" check was
+    // unsafe across the main_p-swap window in CreatePlayer; see the
+    // registry comment above.
+    return is_registered_puppet(self);
 }
 
 // Per-puppet angle override. The engine's TPlayer think1 case 1 (walk)
@@ -1594,11 +1644,14 @@ static bool is_tplayer_ptr(void* e) {
 static int l_pin_hp(lua_State* L) {
     void* e = resolve_entity(L, 1);
     if (!is_tplayer_ptr(e)) { api.pushboolean(L, 0); return 1; }
-    // Safety guard: never pin the LOCAL/main player's HP unless caller
-    // explicitly passes a second truthy arg (used by death-intercept). A
-    // stray pin on the main player would surface as "9999 HP in own HUD"
-    // forever. Log loudly so we catch the offending callsite.
+    // For PUPPETS, we pin to 9999 so they're effectively unkillable from
+    // local damage — the host's snapshot is authoritative for their HP.
+    // For the LOCAL/MAIN player (death-intercept path, 2nd arg = true),
+    // pin to 100 instead: same engine effect (HP > 0 → death check never
+    // trips) but the HUD reads a sensible value the user expects to see
+    // rather than "9999+".
     void* mainp = *(void**)(mod_base() + MAIN_PLAYER_RVA);
+    float pin_value = 9999.0f;
     if (mainp && e == mainp) {
         typedef int (*LuaToBoolFn)(lua_State*, int);
         static LuaToBoolFn lua_toboolean_p = nullptr;
@@ -1612,9 +1665,9 @@ static int l_pin_hp(lua_State* L) {
             api.pushboolean(L, 0);
             return 1;
         }
-        host_log("pin_hp on main player ALLOWED (death-intercept path) e=%p", e);
+        pin_value = 100.0f;
     }
-    *(float*)((char*)e + HP_OFF) = 9999.0f;
+    *(float*)((char*)e + HP_OFF) = pin_value;
     api.pushboolean(L, 1);
     return 1;
 }
@@ -2243,6 +2296,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_body_kinematic");
     api.pushcclosure(L, l_set_body_velocity, 0);
     api.setfield(L, -2, "set_body_velocity");
+    api.pushcclosure(L, l_register_puppet, 0);
+    api.setfield(L, -2, "register_puppet");
+    api.pushcclosure(L, l_unregister_puppet, 0);
+    api.setfield(L, -2, "unregister_puppet");
     api.pushcclosure(L, l_probe_memory, 0);
     api.setfield(L, -2, "probe_memory");
     api.pushcclosure(L, l_set_button_label, 0);

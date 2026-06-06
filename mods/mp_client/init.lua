@@ -1234,12 +1234,14 @@ handle_join = function(p)
             -- The wrapped think neuters its own input; HP-pin + invuln cover
             -- external damage. (Natives are absent/no-op on the puppet path.)
             pcall(function()
+                -- Register FIRST so hook_PThink1's strict allow-list
+                -- recognizes this puppet on its very first think frame.
+                -- Before the registry, "self != main_p" was the gate, which
+                -- mis-fired during CreatePlayer's brief main_p swap and
+                -- pinned the local player's HP to 9999.
+                if _G.MP_NATIVE.register_puppet then _G.MP_NATIVE.register_puppet(obj.pointer) end
                 if _G.MP_NATIVE.set_invulnerable then _G.MP_NATIVE.set_invulnerable(obj.pointer, true) end
                 if _G.MP_NATIVE.pin_hp then _G.MP_NATIVE.pin_hp(obj.pointer) end
-                -- Switch puppet's b2Body to kinematic: stops Box2D from
-                -- integrating leftover velocity / collision impulses against
-                -- the puppet. We own the transform via SetPosition each
-                -- snapshot; a kinematic body honors that without fighting it.
                 if _G.MP_NATIVE.set_body_kinematic then
                     _G.MP_NATIVE.set_body_kinematic(obj.pointer)
                 end
@@ -1352,6 +1354,10 @@ end
 local function handle_leave(msg)
     local entry = mp.puppets[msg.id]
     if entry then
+        if entry.obj and entry.obj.pointer and _G.MP_NATIVE
+           and _G.MP_NATIVE.unregister_puppet then
+            pcall(function() _G.MP_NATIVE.unregister_puppet(entry.obj.pointer) end)
+        end
         safe_delete(entry.obj)
         -- Nameplate is a TextObj (not in the actor scan); we own its lifetime
         -- and Delete it exactly once here, so a plain guarded Delete is safe.
@@ -3755,10 +3761,19 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     _G.MP_FRAME_TICK = function()
         mp._frame_tick_dbg_count = (mp._frame_tick_dbg_count or 0) + 1
         if (mp._frame_tick_dbg_count % 30) == 1 then
-            logf("frame_tick HB n=%d in_game=%s sock=%s pending=%s",
+            local hp_val = "?"
+            -- Only probe HP when in-game; at menu pl exists but has no
+            -- backing TPlayer, so calling :GetHealth nullderefs the engine.
+            if mp.in_game then
+                local pl_for_hp = player.GetPlayer()
+                if pl_for_hp and pl_for_hp.GetHealth then
+                    pcall(function() hp_val = tostring(pl_for_hp:GetHealth()) end)
+                end
+            end
+            logf("frame_tick HB n=%d in_game=%s sock=%s pending=%s is_dead=%s hp=%s",
                  mp._frame_tick_dbg_count,
                  tostring(mp.in_game), tostring(mp.sock ~= nil),
-                 tostring(mp.game_started_pending))
+                 tostring(mp.game_started_pending), tostring(mp.is_dead), hp_val)
         end
         -- ESC pressed in the lobby waiting room → leave the room.
         -- (Native hook latches the keypress + swallows the event; we
