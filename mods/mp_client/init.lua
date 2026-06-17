@@ -254,6 +254,13 @@ if type(CreatePlayer) == "function" then
             local orig_give = pl.GiveItem
             local give_count = 0
             pl.GiveItem = function(self, type_name, ...)
+                -- Block pickups while dead. Initial inventory grants happen
+                -- at level start when is_dead=false, so this only filters
+                -- spectate-time pickups (engine touch-pickup, etc).
+                if mp.is_dead then
+                    logf("GIVEITEM blocked (dead, spectating): type=%s", tostring(type_name))
+                    return
+                end
                 give_count = give_count + 1
                 logf("GIVEITEM #%d type=%s in_giveitem_was=%s",
                     give_count, tostring(type_name), tostring(in_giveitem))
@@ -893,6 +900,13 @@ local function diff_inventory()
     local now_counts = snapshot_inventory()
     if not now_counts then return end
     if not last_inv_counts then last_inv_counts = now_counts; return end
+    -- Dead/spectating: local body is parked off-map (pickup scan finds
+    -- nothing). No drop-back needed; just skip the diff entirely so we
+    -- don't broadcast phantom inventory changes.
+    if mp.is_dead then
+        last_inv_counts = now_counts
+        return
+    end
     local pl = player.GetPlayer()
     local px, py = 0, 0
     if pl then pcall(function() px, py = pl:GetPosition() end) end
@@ -1178,6 +1192,135 @@ local function refresh_objective_string()
         line = string.format(">> %s <<  you=%s   peers=%d", role, config.name, n)
     end
     pcall(function() level.SetObjectiveString(line) end)
+end
+
+-- ============ DEATH INTERCEPT helper (task #8) ============
+-- Polls the LOCAL player's HP each call; when it dips to the threshold,
+-- pins +0xBC > 0 (so the engine's native death branch and gameover HUD
+-- vt[14] FUN_0045c220 can't trip) and flips mp.is_dead so the rest of
+-- the client enters spectate mode.
+--
+-- Called from net_tick_loop at network rate (~10 Hz). Originally lived
+-- inside MP_FRAME_TICK, but the engine's in-game Lua dispatch bypasses
+-- our lua_resume/lua_pcallk hooks, so MP_FRAME_TICK never fires once
+-- begin_game runs. net_tick_loop's coroutine IS resumed every tick
+-- (Wait yields go through lua_resume), so the helper runs reliably.
+local function tick_death_intercept()
+    if not mp.in_game then return end
+    if not (_G.MP_NATIVE and _G.MP_NATIVE.pin_hp) then return end
+    -- Local player ptr was captured in begin_game; this is just a fallback.
+    if not mp.local_player_obj then
+        local pl0 = player.GetPlayer()
+        if pl0 and pl0.pointer then
+            mp.local_player_obj = pl0
+            mp.local_player_ptr = pl0.pointer
+        end
+    end
+    local pl = mp.local_player_obj
+    if not (pl and pl.pointer) then return end
+    local target_ptr = mp.local_player_ptr or pl.pointer
+    -- Externally-triggered death (dev menu / host-confirmed): pin + announce.
+    if mp.is_dead and not mp.death_announced_at then
+        mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
+        logf("DEATH externally triggered → pin + announce")
+        pcall(function() _G.MP_NATIVE.pin_hp(target_ptr, true) end)
+        pcall(function()
+            if _G.MP_NATIVE.set_invulnerable then
+                _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
+            end
+        end)
+        -- Spectate ergonomics: kinematic body (no collisions / physics
+        -- jitter against the teammate we're glued to) and fire-gate set
+        -- (engine's own gate that no-ops shoot/reload/drop).
+        pcall(function()
+            if _G.MP_NATIVE.set_body_kinematic then _G.MP_NATIVE.set_body_kinematic(target_ptr) end
+            if _G.MP_NATIVE.set_fire_gate then _G.MP_NATIVE.set_fire_gate(target_ptr, 1) end
+        end)
+        pcall(refresh_objective_string)
+        if mp.sock then pcall(function() send_msg({ type = "player_died" }) end) end
+    end
+    if mp.is_dead then
+        -- Keep pinning so any incoming damage can't tip HP <= 0.
+        pcall(function() _G.MP_NATIVE.pin_hp(target_ptr, true) end)
+        -- One-time on death-entry: park local body far off-map so the
+        -- engine's item pickup scan finds nothing near us.
+        if not mp.local_parked_off_map then
+            mp.local_parked_off_map = true
+            if pl.SetPosition then
+                pcall(function() pl:SetPosition(-99999, -99999) end)
+            end
+            if _G.MP_NATIVE.set_body_velocity then
+                pcall(function() _G.MP_NATIVE.set_body_velocity(target_ptr, 0, 0) end)
+            end
+        end
+        -- Pick the nearest LIVING teammate to spectate.
+        local target, target_d2 = nil, math.huge
+        for _, entry in pairs(mp.puppets or {}) do
+            if type(entry) == "table" and not entry.is_dead and entry.obj
+               and entry.obj.pointer and entry.last_x and entry.last_y then
+                local dx = entry.last_x - (-99999)
+                local dy = entry.last_y - (-99999)
+                local d2 = dx*dx + dy*dy
+                if d2 < target_d2 then target, target_d2 = entry, d2 end
+            end
+        end
+        if target and target.obj and target.obj.pointer then
+            -- Redirect camera + HUD to the spectated puppet. set_main_player
+            -- writes DAT_005747a4 → engine camera follows that ptr.
+            -- set_hud_allowed_puppet lets vt[14] render for this puppet
+            -- (normally we skip puppet HUD to avoid the overlap bug).
+            if mp.spectate_target_ptr ~= target.obj.pointer then
+                mp.spectate_target_ptr = target.obj.pointer
+                pcall(function()
+                    if _G.MP_NATIVE.set_main_player then _G.MP_NATIVE.set_main_player(target.obj.pointer) end
+                    if _G.MP_NATIVE.set_hud_allowed_puppet then _G.MP_NATIVE.set_hud_allowed_puppet(target.obj.pointer) end
+                end)
+                logf("SPECTATE target switched to puppet ptr=%s",
+                    tostring(_G.MP_NATIVE.addr_of and _G.MP_NATIVE.addr_of(target.obj.pointer)))
+            end
+        end
+        return
+    end
+    -- Alive: poll HP directly from cached pointer (avoids GetHealth() going
+    -- through engine state puppets can pollute).
+    local hp = nil
+    if _G.MP_NATIVE.read_hp then
+        pcall(function() hp = _G.MP_NATIVE.read_hp(target_ptr) end)
+    else
+        pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
+    end
+    mp._last_logged_hp = mp._last_logged_hp or -1
+    if hp ~= mp._last_logged_hp then
+        logf("DEATH poll: hp=%s", tostring(hp))
+        mp._last_logged_hp = hp
+    end
+    -- Threshold of 30: a single bullet (~26 dmg) can drop 100→0 in one
+    -- tick, so we must catch BEFORE the lethal hit. Also accept hp<=0
+    -- (engine may have started death but pin_hp + +0xCC sentinel still
+    -- close the gameover gate). Negative hp is the "already shot past 0"
+    -- case from a one-shot heavy weapon.
+    if type(hp) == "number" and hp <= 30 then
+        logf("DEATH intercept: hp=%s → pinning + entering spectate", tostring(hp))
+        mp.is_dead = true
+        mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
+        pcall(function() _G.MP_NATIVE.pin_hp(target_ptr, true) end)
+        pcall(function()
+            if _G.MP_NATIVE.set_invulnerable then
+                _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
+            end
+        end)
+        -- Spectate ergonomics: kinematic body (no jitter against teammate
+        -- we follow) + fire-gate set (engine's own no-fire/no-reload gate)
+        -- + render-gate set (think2 draw skip, local body invisible so the
+        -- camera shows only the teammate puppet).
+        pcall(function()
+            if _G.MP_NATIVE.set_body_kinematic then _G.MP_NATIVE.set_body_kinematic(target_ptr) end
+            if _G.MP_NATIVE.set_fire_gate then _G.MP_NATIVE.set_fire_gate(target_ptr, 1) end
+            if _G.MP_NATIVE.set_render_gate then _G.MP_NATIVE.set_render_gate(target_ptr, 1) end
+        end)
+        pcall(refresh_objective_string)
+        if mp.sock then pcall(function() send_msg({ type = "player_died" }) end) end
+    end
 end
 
 -- Toggle: represent remote players as REAL TPlayer instances (proper weapon-
@@ -1546,6 +1689,17 @@ local NAMEPLATE_HIDE_POS     = -9999
 local function update_nameplates()
     local pl = player.GetPlayer()
     if not pl then return end
+    -- While spectating, hide ALL puppet nameplates. Our local body is
+    -- teleported on top of the spectated puppet, so its nameplate floats
+    -- right where the camera sits — looks like our own name tag.
+    if mp.is_dead then
+        for _, entry in pairs(mp.puppets) do
+            if entry.nameplate then
+                pcall(function() entry.nameplate:SetPosition(NAMEPLATE_HIDE_POS, NAMEPLATE_HIDE_POS) end)
+            end
+        end
+        return
+    end
     local ppx, ppy = pl:GetPosition()
     local mwx, mwy
     pcall(function()
@@ -1553,7 +1707,11 @@ local function update_nameplates()
         if mx and my then mwx, mwy = GetWorldPoint(mx, my) end
     end)
     for _, entry in pairs(mp.puppets) do
-        if entry.last_x and entry.nameplate then
+        if entry.is_dead and entry.nameplate then
+            -- Hide nameplate of dead peers — they're spectating on top of a
+            -- teammate, and their name would float over the teammate's head.
+            pcall(function() entry.nameplate:SetPosition(NAMEPLATE_HIDE_POS, NAMEPLATE_HIDE_POS) end)
+        elseif entry.last_x and entry.nameplate then
             local dx, dy = entry.last_x - ppx, entry.last_y - ppy
             local visible = (dx*dx + dy*dy) <= (NAMEPLATE_PLAYER_RANGE * NAMEPLATE_PLAYER_RANGE)
             if not visible and mwx then
@@ -2411,6 +2569,12 @@ local function net_tick_loop()
                     logf("unknown msg type: %s", tostring(msg.type))
                 end
             end
+            -- Death intercept: poll local HP + drive spectate state.
+            -- Runs here (not MP_FRAME_TICK) because the engine's in-game
+            -- Lua dispatch bypasses our lua_resume/lua_pcallk hooks, so
+            -- MP_FRAME_TICK doesn't fire after begin_game. This coroutine
+            -- IS resumed on every tick (Wait yields go through lua_resume).
+            pcall(tick_death_intercept)
             local now = socket.gettime()
             if mp.sock and now - mp.last_send >= send_interval then
                 local pl = player.GetPlayer()
@@ -3807,21 +3971,11 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             end
         end
 
-        -- ============ DEATH INTERCEPT (task #8) ============
-        -- Engine's player-death branch (TPlayer think → FUN_0044dde0 <= 0
-        -- → gameover HUD vtable[14] FUN_0045c220) is purely native; no
-        -- Lua callback. So we POLL HP each frame and pin actor+0xBC via
-        -- MP_NATIVE.pin_hp the moment HP drops to the threshold. Once
-        -- pinned we hold HP at 9999 for the rest of the level so the
-        -- engine cannot reach the death branch, and run a manual
-        -- "spectate" state (task #9) until level exit (task #10).
-        --
-        -- Limitation: one-shot kills can outrun the poll. The pin runs
-        -- at the start of the tick → if a hit drops HP from full to <=
-        -- threshold between two ticks the engine's death branch may
-        -- have already executed. Acceptable for MVP; iterate later
-        -- with a CentralHit hook if it bites in practice.
-        if mp.in_game and _G.MP_NATIVE and _G.MP_NATIVE.pin_hp then
+        -- Death intercept also called here for the menu/lobby case, but
+        -- the real driver is net_tick_loop because the engine bypasses
+        -- our resume/pcallk hooks in-game (MP_FRAME_TICK doesn't fire).
+        pcall(tick_death_intercept)
+        if false and mp.in_game and _G.MP_NATIVE and _G.MP_NATIVE.pin_hp then
             -- Cache the LOCAL player handle on first tick after begin_game.
             -- Polling via player.GetPlayer() each frame is unsafe once puppets
             -- exist: the engine's GetPlayer / GetHealth can resolve to a puppet

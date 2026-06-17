@@ -1644,10 +1644,28 @@ static PurecallFn orig_purecall = nullptr;
 // vt[14] HUD/gameover @ 0x45c220 — drawn per-TPlayer. The puppet's HUD draws
 // on top of the local's (overlapping "9999" text). Skip orig when self is a
 // puppet so only the local renders its HP/ammo strings.
+//
+// Exception: while we're spectating, the LOCAL body is moved off-map and
+// the camera follows the spectated puppet. The local's HUD then renders at
+// the local's off-map position (invisible) → no HUD visible. To show the
+// spectated puppet's HUD instead, Lua sets g_hud_allowed_puppet = puppet,
+// and we DO call orig for that one puppet.
+static void* g_hud_allowed_puppet = nullptr;
+
+static int l_set_hud_allowed_puppet(lua_State* L) {
+    void* p = resolve_entity(L, 1);
+    g_hud_allowed_puppet = p;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 typedef int (__fastcall *HudFn)(void* self, void* edx);
 static HudFn orig_PHud = nullptr;
 static int __fastcall hook_PHud(void* self, void* /*edx*/) {
-    if (is_passive_player(self)) return 0;
+    if (is_passive_player(self)) {
+        if (self == g_hud_allowed_puppet) return orig_PHud(self, nullptr);
+        return 0;
+    }
     return orig_PHud(self, nullptr);
 }
 
@@ -1720,6 +1738,13 @@ static int l_pin_hp(lua_State* L) {
         pin_value = 100.0f;
     }
     *(float*)((char*)e + HP_OFF) = pin_value;
+    // Also pin the death timer (+0xCC). On a TakeDamage that drops HP<=0,
+    // the engine writes +0xCC=0x32 (50-frame countdown) then runs vt[14]
+    // gameover when +0xCC==0 AND HP<=0. We just pinned HP, but if the
+    // engine had already started the countdown before this call, the
+    // gateover would still fire once +0xCC ticks down. Pinning +0xCC to
+    // a huge sentinel keeps the countdown from ever reaching 0.
+    *(int*)((char*)e + DEATH_TIMER_OFF) = DEATH_TIMER_SENTINEL;
     api.pushboolean(L, 1);
     return 1;
 }
@@ -1785,6 +1810,57 @@ static int l_set_body_kinematic(lua_State* L) {
     *(int*)((char*)body + B2_TYPE_OFF) = B2_KINEMATIC;
     host_log("set_body_kinematic: e=%p body=%p [+%02x] was=%d set=%d",
              e, body, B2_TYPE_OFF, old_type, B2_KINEMATIC);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_body_dynamic(ptr) — restore the actor's Box2D body to dynamic (the
+// default for a live player). Used to undo set_body_kinematic on respawn.
+#define B2_DYNAMIC 2
+static int l_set_body_dynamic(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadReadPtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    void* body = *(void**)((char*)e + ACTOR_BODY_OFF);
+    if (!body || IsBadWritePtr(body, 32)) { api.pushboolean(L, 0); return 1; }
+    *(int*)((char*)body + B2_TYPE_OFF) = B2_DYNAMIC;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_render_gate(ptr, val) — write byte to +0xFD (think2's render/draw
+// gate). !=0 → draw block in think2 short-circuits, the actor becomes
+// invisible. Used to hide the local player's body during spectate so the
+// camera shows ONLY the teammate puppet at the spectate target.
+#define RENDER_GATE_OFF 0xFD
+static int l_set_render_gate(lua_State* L) {
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadWritePtr(e, RENDER_GATE_OFF + 1)) { api.pushboolean(L, 0); return 1; }
+    int val = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 0;
+    *((unsigned char*)e + RENDER_GATE_OFF) = (unsigned char)(val & 0xff);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_fire_gate(ptr, val) — write byte to +0xE4 (think1's fire/reload/drop/
+// shoot gate). !=0 → all weapon blocks skip with anim intact. Used to
+// disable firing while spectating.
+static int l_set_fire_gate(lua_State* L) {
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadWritePtr(e, FIRE_GATE_OFF + 1)) { api.pushboolean(L, 0); return 1; }
+    int val = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 0;
+    *((unsigned char*)e + FIRE_GATE_OFF) = (unsigned char)(val & 0xff);
     api.pushboolean(L, 1);
     return 1;
 }
@@ -2371,6 +2447,14 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_invulnerable");
     api.pushcclosure(L, l_set_body_kinematic, 0);
     api.setfield(L, -2, "set_body_kinematic");
+    api.pushcclosure(L, l_set_body_dynamic, 0);
+    api.setfield(L, -2, "set_body_dynamic");
+    api.pushcclosure(L, l_set_fire_gate, 0);
+    api.setfield(L, -2, "set_fire_gate");
+    api.pushcclosure(L, l_set_render_gate, 0);
+    api.setfield(L, -2, "set_render_gate");
+    api.pushcclosure(L, l_set_hud_allowed_puppet, 0);
+    api.setfield(L, -2, "set_hud_allowed_puppet");
     api.pushcclosure(L, l_set_body_velocity, 0);
     api.setfield(L, -2, "set_body_velocity");
     api.pushcclosure(L, l_register_puppet, 0);
