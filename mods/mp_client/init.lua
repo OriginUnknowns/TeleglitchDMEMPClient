@@ -519,6 +519,28 @@ local function track_item_host(obj, type_name, x, y)
                    item = { id = id, type = type_name,
                             x = mp.items[id].x, y = mp.items[id].y } })
         logf("broadcast item_spawned id=%d type=%s", id, type_name)
+        -- Loot ejection: if this new item appeared right next to a tracked
+        -- container that holds this type, treat it as a loot pop. Decrement
+        -- the container's shadow + broadcast so joiners stay in sync.
+        local CONTAINER_LOOT_R2 = 4.0   -- ~2u radius; containers are 5-7u wide
+        for cid, c in pairs(mp.containers or {}) do
+            if c.items and #c.items > 0 then
+                local dx, dy = (c.x or 0) - mp.items[id].x, (c.y or 0) - mp.items[id].y
+                if dx*dx + dy*dy <= CONTAINER_LOOT_R2 then
+                    for i, it in ipairs(c.items) do
+                        if it == type_name then
+                            table.remove(c.items, i)
+                            logf("CONTAINER LOOT id=%d ejected %s (n=%d remain)",
+                                cid, type_name, #c.items)
+                            send_msg({ type = "container_item_taken",
+                                       container_id = cid, item_type = type_name })
+                            break
+                        end
+                    end
+                    break
+                end
+            end
+        end
     end
 end
 
@@ -1213,6 +1235,50 @@ do
                         if trace then logf("LL>track_item_host returned") end
                     elseif not mp.item_snapshot_received then
                         track_item_joiner_pre(obj, nimi)
+                    elseif mp.sock and not in_giveitem then
+                        -- Joiner post-snapshot: a new item appeared locally.
+                        -- This is almost always a container loot pop on the
+                        -- joiner's side (the engine ejects items when the
+                        -- player USEs a container). Detect proximity to a
+                        -- tracked container and broadcast container_item_taken
+                        -- + an item_spawned with a peer-namespaced id so the
+                        -- host sees the world item appear.
+                        local CONTAINER_LOOT_R2 = 4.0
+                        local wx, wy = x, y
+                        pcall(function()
+                            if obj.GetPosition then wx, wy = obj:GetPosition() end
+                        end)
+                        for cid, c in pairs(mp.containers or {}) do
+                            if c.items and #c.items > 0 then
+                                local dx, dy = (c.x or 0) - (wx or 0), (c.y or 0) - (wy or 0)
+                                if dx*dx + dy*dy <= CONTAINER_LOOT_R2 then
+                                    for i, it in ipairs(c.items) do
+                                        if it == nimi then
+                                            table.remove(c.items, i)
+                                            logf("CONTAINER LOOT (joiner) id=%d ejected %s (n=%d remain)",
+                                                cid, nimi, #c.items)
+                                            -- Session-monotonic counter so each ejection gets a
+                                            -- globally-unique id. Using container index (i)
+                                            -- collided after table.remove shifts everything down.
+                                            mp.peer_loot_seq = (mp.peer_loot_seq or 0) + 1
+                                            local peer_iid = "p" .. tostring(mp.my_id or "?") .. "_c" .. tostring(cid) .. "_" .. tostring(mp.peer_loot_seq)
+                                            -- Add to local mp.items so the joiner's own pickup
+                                            -- detector (ammo diff / inventory diff) can find the
+                                            -- item by id and broadcast item_picked when grabbed.
+                                            mp.items[peer_iid] = { obj = obj, type = nimi, x = wx or 0, y = wy or 0 }
+                                            mp.item_obj_to_id[obj] = peer_iid
+                                            send_msg({ type = "item_spawned",
+                                                       item = { id = peer_iid, type = nimi,
+                                                                x = wx or 0, y = wy or 0 } })
+                                            send_msg({ type = "container_item_taken",
+                                                       container_id = cid, item_type = nimi })
+                                            break
+                                        end
+                                    end
+                                    break
+                                end
+                            end
+                        end
                     end
                 end
                 return obj
@@ -1492,6 +1558,7 @@ local apply_pause_labels     -- updates the in-game ESC menu player slots
 -- Forward decl — defined after the item-list handler below; handle_welcome
 -- needs to call it when the relay piggy-backs a container_list on welcome.
 local handle_container_list  -- forward decl
+local handle_container_item_taken  -- forward decl
 
 local function handle_welcome(msg)
     mp.my_id = msg.id
@@ -1937,55 +2004,111 @@ handle_container_list = function(msg)
     logf("handle_container_list: is_host=%s msg.containers_n=%d", tostring(mp.is_host), n)
     if mp.is_host then return end
     if n == 0 then logf("handle_container_list: empty"); return end
-    -- Match by POSITION (host + joiner both run identical levelgen with the
-    -- same seed → identical container layout, but IDs are assigned in local
-    -- Create order so they diverge between clients). After matching, re-key
-    -- the local container record to the host's ID so future host-authoritative
-    -- updates (loot taken, etc) can address them.
-    local local_by_pos = {}
-    local POS_KEY = function(x, y) return string.format("%.2f|%.2f", x or 0, y or 0) end
-    for lid, lc in pairs(mp.containers or {}) do
-        local_by_pos[POS_KEY(lc.x, lc.y)] = { id = lid, entry = lc }
+    -- AUTHORITATIVE OVERRIDE: levelgen on host and joiner produces different
+    -- container layouts/contents despite identical RNG (engine internals
+    -- consume math.random asymmetrically). The fix that matches what
+    -- apply_item_list does for items: wipe everything we have locally and
+    -- recreate from the host's snapshot. The Create + AddItem wraps will
+    -- re-populate mp.containers as we go.
+    local wiped = 0
+    for _, lc in pairs(mp.containers or {}) do
+        if lc.obj and type(lc.obj.Delete) == "function" then
+            local ok = pcall(function() lc.obj:Delete() end)
+            if ok then wiped = wiped + 1 end
+        end
     end
-    local match, content_mismatch, missing = 0, 0, 0
-    local rekeyed = {}
+    mp.containers = {}
+    mp.container_obj_to_id = {}
+    mp.next_container_id = 1
+    logf("handle_container_list: wiped %d local containers", wiped)
+    -- Recreate each. Order is host's broadcast order (sorted by host id).
+    local recreated, items_added = 0, 0
     for _, c in ipairs(msg.containers) do
-        local items_str = table.concat(c.items or {}, ",")
-        local hit = local_by_pos[POS_KEY(c.x, c.y)]
-        if not hit then
-            logf("  RX CONTAINER host_id=%d pos=(%.2f,%.2f) sprite=%s items=[%s] (NO LOCAL CONTAINER AT POS)",
-                c.id, c.x or 0, c.y or 0, tostring(c.sprite), items_str)
-            missing = missing + 1
+        local cont
+        local ok = pcall(function()
+            cont = Create({ type = "container", x = c.x, y = c.y,
+                            angle = c.angle or 0, sprite = c.sprite })
+        end)
+        if not ok or not cont then
+            logf("  CONTAINER recreate FAIL host_id=%d pos=(%.2f,%.2f) sprite=%s",
+                c.id, c.x or 0, c.y or 0, tostring(c.sprite))
         else
-            local local_items_str = table.concat(hit.entry.items or {}, ",")
-            if items_str == local_items_str then
-                match = match + 1
-            else
-                content_mismatch = content_mismatch + 1
-                logf("  RX CONTAINER host_id=%d pos=(%.2f,%.2f) CONTENT DIFF host=[%s] local=[%s]",
-                    c.id, c.x or 0, c.y or 0, items_str, local_items_str)
-                -- Adopt host's content list (authoritative). We do NOT mutate
-                -- the engine container itself — only our shadow record — so
-                -- the visual loot behavior is unchanged. Future work: also
-                -- sync via cont:AddItem / a clear-then-fill helper.
-                hit.entry.items = c.items
-            end
-            -- Re-key local id -> host id (for future per-container updates).
-            if hit.id ~= c.id then
-                mp.containers[c.id] = hit.entry
-                mp.containers[hit.id] = nil
-                for ptr, pid in pairs(mp.container_obj_to_id) do
-                    if pid == hit.id then mp.container_obj_to_id[ptr] = c.id end
-                end
-                table.insert(rekeyed, { from = hit.id, to = c.id })
+            recreated = recreated + 1
+            for _, it in ipairs(c.items or {}) do
+                local addok = pcall(function() cont:AddItem(it) end)
+                if addok then items_added = items_added + 1 end
             end
         end
     end
-    if #rekeyed > 0 then
-        logf("handle_container_list: rekeyed %d local IDs to host IDs", #rekeyed)
+    logf("handle_container_list: recreated %d containers, added %d items", recreated, items_added)
+    -- Optional: re-key the freshly-tracked containers (the Create wrap
+    -- assigned them new local IDs 1..N in iteration order) to host's IDs.
+    -- Since we iterate msg.containers in host-id order and assign local
+    -- IDs in Create order (also 1..N in the same iteration), they should
+    -- already match. Verify.
+    local mismatched_ids = 0
+    for _, c in ipairs(msg.containers) do
+        if not mp.containers[c.id] then mismatched_ids = mismatched_ids + 1 end
     end
-    logf("handle_container_list: %d match, %d content-diff, %d missing (of %d)",
-        match, content_mismatch, missing, n)
+    if mismatched_ids > 0 then
+        logf("handle_container_list: WARN %d host IDs missing in local containers", mismatched_ids)
+    end
+end
+
+-- Host loot pop forwarded by the relay. Update our shadow record and, if
+-- the engine container is still around, recreate it with the new contents
+-- so the joiner can't re-loot the already-taken item.
+handle_container_item_taken = function(msg)
+    -- Both host AND joiner apply the shadow update + engine container
+    -- rebuild: if a joiner loots a container locally, the host needs to
+    -- decrement its own container so subsequent loot stays in sync.
+    local cid, it = msg.container_id, msg.item_type
+    local c = mp.containers and mp.containers[cid]
+    if not c then
+        logf("container_item_taken: id=%d UNKNOWN", cid or -1)
+        return
+    end
+    local removed = false
+    for i, v in ipairs(c.items or {}) do
+        if v == it then table.remove(c.items, i); removed = true; break end
+    end
+    logf("container_item_taken: id=%d type=%s removed=%s remain=%d",
+        cid, tostring(it), tostring(removed), #(c.items or {}))
+    -- Recreate the engine container with the new (smaller) inventory so
+    -- a joiner-side USE doesn't pop the host-already-claimed item.
+    -- Capture the desired post-loot inventory NOW, before we trigger any
+    -- AddItem wraps that mutate state.
+    local target_items = {}
+    for _, v in ipairs(c.items or {}) do table.insert(target_items, v) end
+    if c.obj and type(c.obj.Delete) == "function" then
+        pcall(function() c.obj:Delete() end)
+        mp.containers[cid] = nil
+        local newcont
+        pcall(function()
+            newcont = Create({ type = "container", x = c.x, y = c.y,
+                               angle = c.angle or 0, sprite = c.sprite })
+        end)
+        if newcont then
+            -- Create wrap assigned the new container a fresh local id.
+            -- Find it, then re-key to host's cid.
+            local fresh_id
+            for fid, fc in pairs(mp.containers) do
+                if fc.obj == newcont then fresh_id = fid; break end
+            end
+            if fresh_id then
+                local e = mp.containers[fresh_id]
+                mp.containers[fresh_id] = nil
+                mp.containers[cid] = e
+                for ptr, pid in pairs(mp.container_obj_to_id) do
+                    if pid == fresh_id then mp.container_obj_to_id[ptr] = cid end
+                end
+                -- AddItem wrap will append to mp.containers[cid].items.
+                for _, it2 in ipairs(target_items) do
+                    pcall(function() newcont:AddItem(it2) end)
+                end
+            end
+        end
+    end
 end
 
 local function handle_item_list(msg)
@@ -2397,6 +2520,7 @@ local handlers = {
     item_picked = handle_item_picked,
     item_list = handle_item_list,
     container_list = handle_container_list,
+    container_item_taken = function(m) handle_container_item_taken(m) end,
     item_spawned = handle_item_spawned,
     inventory = handle_inventory,
     -- New lobby / multi-room messages.
