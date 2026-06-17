@@ -276,8 +276,16 @@ static int g_bullet_count = 0;
 // damage (ctor a5), force (a7) and bullet type (a6). This is the authoritative
 // per-weapon damage — no Lua-side GetEquippedItem guesswork.
 #define BULLET_RING_SIZE 128
-struct BulletEvt { float x, y, vx, vy, dmg, force; int type; };
+// subclass: 0=TBullet (normal), 1=TNail, 2=TExplodingBullet, 8=TCannonBullet
+struct BulletEvt { float x, y, vx, vy, dmg, force; int type; int subclass; };
 static BulletEvt g_bullet_ring[BULLET_RING_SIZE] = {0};
+
+// Set by hook_NailCtor / hook_ExplodingBulletCtor right BEFORE they invoke
+// the (inherited) TBullet ctor, cleared right after. The TBullet hook reads
+// this and tags the ring entry — gives the receiver the subclass id without
+// needing a separate ring per ctor. thread_local is overkill for the
+// engine's single-threaded shoot path, but cheap insurance.
+static thread_local int g_pending_subclass = 0;
 static volatile int g_bullet_write_idx = 0;
 static int g_bullet_read_idx = 0;
 // When false, the hook still passes the bullet through to the engine but does
@@ -306,12 +314,81 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
     g_bullet_ring[idx].dmg = dmgf.f;
     g_bullet_ring[idx].force = forcef.f;
     g_bullet_ring[idx].type = a6;
+    g_bullet_ring[idx].subclass = g_pending_subclass;  // 0 unless wrapped by a subclass-ctor hook
     g_bullet_write_idx++;
     if (g_bullet_count <= 16 || (g_bullet_count % 50) == 0) {
         host_log("hook_BulletCtor #%d: pos=(%.2f,%.2f) vel=(%.2f,%.2f) dmg=%.1f type=%d force=%.2f",
                  g_bullet_count, px.f, py.f, vx.f, vy.f, dmgf.f, a6, forcef.f);
     }
     return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+// Subclass ctor hooks — both TExplodingBullet (0x497140) and TNail (0x497200)
+// invoke the TBullet ctor (0x497040) internally. We tag g_pending_subclass
+// before the call so hook_BulletCtor stamps the ring entry, and clear it on
+// return. Subclass ids match Lua's bullettypes table:
+//   1 = nails, 2 = explode (0 = normal).
+typedef void* (__fastcall *SubBulletCtorFn)(void* self, void* edx,
+                                            int a1, int a2, int a3, int a4,
+                                            int a5, int a6, int a7, int a8);
+static SubBulletCtorFn orig_NailCtor = nullptr;
+static SubBulletCtorFn orig_ExplodeCtor = nullptr;
+
+static void* __fastcall hook_NailCtor(void* self, void* edx,
+                                      int a1, int a2, int a3, int a4,
+                                      int a5, int a6, int a7, int a8) {
+    int prev = g_pending_subclass;
+    g_pending_subclass = 1;  // bullettypes.nails
+    void* r = orig_NailCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    g_pending_subclass = prev;
+    return r;
+}
+
+static void* __fastcall hook_ExplodeCtor(void* self, void* edx,
+                                         int a1, int a2, int a3, int a4,
+                                         int a5, int a6, int a7, int a8) {
+    int prev = g_pending_subclass;
+    g_pending_subclass = 2;  // bullettypes.explode
+    void* r = orig_ExplodeCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    g_pending_subclass = prev;
+    return r;
+}
+
+// Receiver-side: after Lua CreateBullet spawns a base TBullet, this swaps the
+// object's vtable to the target subclass. vt[20] dispatches the impact-effect
+// behavior (nail trail / explode AoE) so the visual + behavioral payload comes
+// through. Cannon is intentionally excluded — its ctor bypasses TBullet and
+// damage works differently (vt[23] flat 1.0); a vtable-swap alone would mis-
+// damage. See KNOWN_ISSUES.md.
+#define VT_TBULLET      0x5583ec
+#define VT_TNAIL        0x55831c
+#define VT_TEXPLODE     0x558384
+#define VT_TCANNON      0x558454
+
+// Forward decls — bodies live further down.
+static void* resolve_entity(lua_State* L, int idx);
+static inline BYTE* mod_base();
+
+static int l_swap_bullet_subclass(lua_State* L) {
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    void* e = resolve_entity(L, 1);
+    int subclass = lua_tointeger_p ? lua_tointeger_p(L, 2, nullptr) : 0;
+    if (!e || IsBadWritePtr(e, 4)) { api.pushboolean(L, 0); return 1; }
+    BYTE* base = (BYTE*)mod_base();
+    unsigned int new_vt = 0;
+    switch (subclass) {
+        case 1: new_vt = (unsigned int)(base + VT_TNAIL);    break;
+        case 2: new_vt = (unsigned int)(base + VT_TEXPLODE); break;
+        default: api.pushboolean(L, 0); return 1;
+    }
+    *(unsigned int*)e = new_vt;
+    api.pushboolean(L, 1);
+    return 1;
 }
 
 static void* resolve_entity(lua_State* L, int idx);  // fwd decl — body lives below
@@ -549,7 +626,8 @@ static int l_consume_bullet(lua_State* L) {
     lua_pushnumber_p(L, e.dmg);
     lua_pushnumber_p(L, e.force);
     lua_pushnumber_p(L, (double)e.type);
-    return 7;  // x, y, vx, vy, damage, force, type
+    lua_pushnumber_p(L, (double)e.subclass);
+    return 8;  // x, y, vx, vy, damage, force, type, subclass
 }
 
 // Central damage entry: TNewLiving::ApplyHit(attacker, ...). Located via
@@ -680,6 +758,17 @@ static int l_install_hook_bullet(lua_State* L) {
     if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
     s = MH_EnableHook(target);
     host_log("MH_EnableHook(BulletCtor): status=%d", s);
+
+    // Subclass ctor hooks — tag g_pending_subclass before invoking orig so
+    // the TBullet hook above stamps the ring entry with the right subclass.
+    BYTE* nailCtor = (BYTE*)m + 0x97200;
+    MH_STATUS ns = MH_CreateHook(nailCtor, (LPVOID)&hook_NailCtor, (LPVOID*)&orig_NailCtor);
+    if (ns == MH_OK) ns = MH_EnableHook(nailCtor);
+    host_log("nail ctor hook: status=%d", ns);
+    BYTE* explCtor = (BYTE*)m + 0x97140;
+    MH_STATUS es = MH_CreateHook(explCtor, (LPVOID)&hook_ExplodeCtor, (LPVOID*)&orig_ExplodeCtor);
+    if (es == MH_OK) es = MH_EnableHook(explCtor);
+    host_log("exploding bullet ctor hook: status=%d", es);
 
     // Bomb activate hook re-enabled with safer reads (see hook body).
     BYTE* bomb = (BYTE*)m + 0x70aa0;
@@ -2405,6 +2494,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "install_takedmg2_hook");
     api.pushcclosure(L, l_consume_bullet, 0);
     api.setfield(L, -2, "consume_bullet");
+    api.pushcclosure(L, l_swap_bullet_subclass, 0);
+    api.setfield(L, -2, "swap_bullet_subclass");
     api.pushcclosure(L, l_kill_actor, 0);
     api.setfield(L, -2, "kill_actor");
     api.pushcclosure(L, l_apply_damage, 0);

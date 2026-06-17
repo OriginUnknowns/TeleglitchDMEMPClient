@@ -1,5 +1,48 @@
 # Known Issues
 
+## 🟡 Weapon-subclass replication gap (2026-06-17)
+
+`Lua CreateBullet` always spawns the base `TBullet`. For weapons whose
+bullettype is cannon/explode/nails/railgun, replicated shots on the
+receiver appear as plain bullets — no nail-trail visual, no explosion on
+impact, no railgun pierce. Damage value is correct (we capture the
+ctor's a5 directly), only the subclass behavior is missing.
+
+**Fix path:** hook subclass ctors (`TCannonBullet` 0x558454,
+`TExplodingBullet` 0x558384, `TNail` 0x55831c — vtable addresses per
+teleglitch-engine-internals.md; ctor offsets need Ghidra), expose native
+`CreateNail` / `CreateCannonBullet` / `CreateExpl` bindings, thread
+`subclass` through the `bullet_fire` message, dispatch on receive.
+
+## 🟡 Shotgun (5-pellet rapid fire) crashes remote client (2026-06-17)
+
+Repro: one player aims+fires a shotgun (`pump`, `bulletcount=5`),
+remote player's client AVs. Stack signature: ntdll heap (`0x591a8`
+`RtlpValidateHeapEntry`) → lua52.dll (`0x26a9b`). Same shape as the
+heap corruptor in task #2 — the 5-rapid-bullet path stresses the same
+corruption window. Not a new bug; just a new reproducer. Tie-in to
+task #2's bisect.
+
+## 🟡 Movement hitch introduced by spectate work (2026-06-17)
+
+Holding a SINGLE movement direction (W/A/S/D) for several seconds causes a
+semi-persistent ~1s hitch on live players. Does not occur when stationary or
+when changing direction. Started with the spectate rework that added
+`set_main_player` camera redirect, kinematic local body, fire/render/HUD
+gates, and the `tick_death_intercept` poll from `net_tick_loop`.
+
+Likely candidates to bisect:
+- `hook_PHud` / `set_hud_allowed_puppet` running per-frame
+- `set_main_player` redirect side effects in TPlayer think
+- kinematic body interacting with sustained input
+- `tick_death_intercept` alive-path doing something per tick
+
+Files: `tick_death_intercept` (mods/mp_client/init.lua), `hook_PHud` /
+`hook_PThink1` / `set_main_player` / `set_body_kinematic` /
+`set_render_gate` / `set_fire_gate` (modloader/dllhost/main.cpp).
+
+Not urgent — gameplay is otherwise solid.
+
 ## 🔴 Intermittent heap-corruption crash — NARROWED to the native bridge (2026-05-30)
 
 **Symptom:** Joiner crashes intermittently (~every other join, and at startup under

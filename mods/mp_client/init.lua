@@ -2332,11 +2332,24 @@ local function handle_bullet_fire(msg)
     -- drives knockback + bullet range (tick decay), so the replicated shot
     -- behaves like the original weapon.
     local bforce = (type(msg.force) == "number" and msg.force > 0) and msg.force or 2.0
+    local bullet_obj
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
-        CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
+        bullet_obj = CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
     end)
+    -- Subclass dispatch: Lua CreateBullet only spawns base TBullet. For
+    -- nails/explode, swap the vtable so the engine's impact effect (vt[20])
+    -- runs the subclass behavior — nail trail / AoE explosion. Cannon is
+    -- intentionally unsupported (different ctor + flat-damage path).
+    if bullet_obj and bullet_obj.pointer and msg.subclass and msg.subclass ~= 0
+       and _G.MP_NATIVE and _G.MP_NATIVE.swap_bullet_subclass then
+        pcall(function() _G.MP_NATIVE.swap_bullet_subclass(bullet_obj.pointer, msg.subclass) end)
+        if not _G.MP_LOGGED_SUBCLASS then
+            _G.MP_LOGGED_SUBCLASS = true
+            logf("bullet_fire: subclass=%d swapped (1=nail 2=explode)", msg.subclass)
+        end
+    end
 end
 
 -- A remote player stabbed. Only the host is authoritative for mobs, so the
@@ -3346,7 +3359,7 @@ local function dev_menu_tick()
         -- and angle are recovered from the real velocity. No GetEquippedItem/
         -- itemtable lookup (GetName returned nil — removed).
         for _ = 1, 16 do
-            local x, y, vx, vy, dmg, force, btype = _G.MP_NATIVE.consume_bullet()
+            local x, y, vx, vy, dmg, force, btype, subclass = _G.MP_NATIVE.consume_bullet()
             if not x then break end
             local angle = math.atan2(vy, vx)
             -- Engine ctor gives vx/vy in PER-TICK world units (very small;
@@ -3364,7 +3377,7 @@ local function dev_menu_tick()
                     tostring(dmg), tostring(force), raw_speed, speed)
             end
             send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = speed,
-                       dmg = dmg or 10, force = force })
+                       dmg = dmg or 10, force = force, subclass = subclass or 0 })
         end
         -- Drain bomb activation events from the native hook. Hook captures
         -- type + fuse only (safest data). We fill the position + aim angle
@@ -3581,6 +3594,39 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     Wait(1.5)
                     host_send_item_list()
                     host_send_container_list()
+                end)
+            end)
+            coroutine.resume(co)
+        end
+        -- Debug starter loadout: give every player a representative slice of
+        -- weapons + ammo so we can exercise multi-bullet (pump), explode,
+        -- cannon, nailgun, and energy paths without hunting for them.
+        -- in_giveitem brackets the grant so the item Create wraps skip
+        -- tracking (otherwise each grant queues a phantom item_spawned).
+        do
+            local co = coroutine.create(function()
+                pcall(function()
+                    Wait(0.5)
+                    local pl = player.GetPlayer()
+                    if not pl or not pl.GiveItem then return end
+                    local prev = in_giveitem
+                    in_giveitem = true
+                    -- Loadout uses only bullettype.normal weapons, the
+                    -- shape our hooks cover end-to-end. Cannon (own ctor),
+                    -- agl (explode2), lasgun (laser), tesla (electro)
+                    -- need extra subclass support — see KNOWN_ISSUES.md.
+                    local STARTER = {
+                        weapons = { "pump", "rifle", "smg" },
+                        ammo    = { "pyammo", "ppammo", "smgammo" },
+                    }
+                    for _, w in ipairs(STARTER.weapons) do
+                        pcall(function() pl:GiveItem(w) end)
+                    end
+                    for _, a in ipairs(STARTER.ammo) do
+                        for _ = 1, 3 do pcall(function() pl:GiveItem(a) end) end
+                    end
+                    in_giveitem = prev
+                    logf("debug starter loadout granted")
                 end)
             end)
             coroutine.resume(co)
