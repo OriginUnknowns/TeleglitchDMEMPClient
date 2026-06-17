@@ -1259,9 +1259,45 @@ static int __fastcall hook_CameraSub(void* self, void* /*edx*/) {
 #define MAX_PUPPETS 16
 static void* g_puppet_registry[MAX_PUPPETS] = {0};
 
+// Local-player guard. Lua calls set_local_player(ptr) at begin_game BEFORE
+// any CreatePlayer puppet exists, capturing the LOCAL TPlayer's true pointer.
+// is_passive_player and register_puppet refuse to flag this address as a
+// puppet — so even if obj.pointer in Lua is a dynamic DAT_005747a4 read that
+// briefly resolves to the local, we never mis-pin the local's HP to 9999.
+static void* g_local_player = nullptr;
+
+static int l_set_local_player(lua_State* L) {
+    void* p = resolve_entity(L, 1);
+    g_local_player = p;
+    host_log("set_local_player = %p", p);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+static int l_get_local_player(lua_State* L) {
+    typedef void (*LuaPushIntegerFn)(lua_State*, ptrdiff_t);
+    static LuaPushIntegerFn lua_pushinteger_p = nullptr;
+    if (!lua_pushinteger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_pushinteger_p = (LuaPushIntegerFn)GetProcAddress(lm, "lua_pushinteger");
+    }
+    if (lua_pushinteger_p) lua_pushinteger_p(L, (ptrdiff_t)g_local_player);
+    else api.pushnil(L);
+    return 1;
+}
+
 static int l_register_puppet(lua_State* L) {
     void* p = resolve_entity(L, 1);
     if (!p) { api.pushboolean(L, 0); return 1; }
+    // Safety: never register the local player as a puppet. obj.pointer in Lua
+    // may resolve to DAT_005747a4 live — by register time the swap may have
+    // restored DAT_005747a4 to the local, so the value handed in here can be
+    // the local's address by accident. Refuse explicitly.
+    if (g_local_player && p == g_local_player) {
+        host_log("register_puppet REFUSED: ptr=%p matches local player", p);
+        api.pushboolean(L, 0);
+        return 1;
+    }
     for (int i = 0; i < MAX_PUPPETS; ++i) {
         if (g_puppet_registry[i] == p) { api.pushboolean(L, 1); return 1; }
     }
@@ -1301,6 +1337,9 @@ static bool is_passive_player(void* self) {
     // explicitly registered it. The old "self != main_p" check was
     // unsafe across the main_p-swap window in CreatePlayer; see the
     // registry comment above.
+    // Belt-and-suspenders: even if the local somehow got into the registry
+    // (Lua handle aliasing), refuse to treat it as a puppet.
+    if (g_local_player && self == g_local_player) return false;
     return is_registered_puppet(self);
 }
 
@@ -1602,6 +1641,16 @@ static void patch_tplayer_purecall_slot() {
 typedef void (__cdecl *PurecallFn)(void);
 static PurecallFn orig_purecall = nullptr;
 
+// vt[14] HUD/gameover @ 0x45c220 — drawn per-TPlayer. The puppet's HUD draws
+// on top of the local's (overlapping "9999" text). Skip orig when self is a
+// puppet so only the local renders its HP/ammo strings.
+typedef int (__fastcall *HudFn)(void* self, void* edx);
+static HudFn orig_PHud = nullptr;
+static int __fastcall hook_PHud(void* self, void* /*edx*/) {
+    if (is_passive_player(self)) return 0;
+    return orig_PHud(self, nullptr);
+}
+
 static int l_install_passive_player_hooks(lua_State* L) {
     g_base = (BYTE*)GetModuleHandleA(NULL);
     init_dummy_device();
@@ -1621,8 +1670,11 @@ static int l_install_passive_player_hooks(lua_State* L) {
     if (s2 == MH_OK) s2 = MH_EnableHook(t2);
     MH_STATUS sc = MH_CreateHook(tc, (LPVOID)&hook_CameraSub, (LPVOID*)&orig_CameraSub);
     if (sc == MH_OK) sc = MH_EnableHook(tc);
-    host_log("install_passive_player_hooks: think1=%d think2=%d camera=%d", s1, s2, sc);
-    api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK && sc == MH_OK) ? 1 : 0);
+    BYTE* th = g_base + 0x5c220;   // FUN_0045c220 (vtable[14] HUD/gameover)
+    MH_STATUS sh = MH_CreateHook(th, (LPVOID)&hook_PHud, (LPVOID*)&orig_PHud);
+    if (sh == MH_OK) sh = MH_EnableHook(th);
+    host_log("install_passive_player_hooks: think1=%d think2=%d camera=%d hud=%d", s1, s2, sc, sh);
+    api.pushboolean(L, (s1 == MH_OK && s2 == MH_OK && sc == MH_OK && sh == MH_OK) ? 1 : 0);
     return 1;
 }
 
@@ -1669,6 +1721,25 @@ static int l_pin_hp(lua_State* L) {
     }
     *(float*)((char*)e + HP_OFF) = pin_value;
     api.pushboolean(L, 1);
+    return 1;
+}
+
+// read_hp(ptr) — return *(float*)(ptr+0xBC) as a Lua number. Used by the
+// death intercept to poll the LOCAL player's HP from a cached pointer
+// without going through any engine state (DAT_005747a4 / GetPlayer) that
+// puppets can pollute. Returns nil on bad pointer.
+static int l_read_hp(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadReadPtr(e, HP_OFF + 4)) { api.pushnil(L); return 1; }
+    float hp = *(float*)((char*)e + HP_OFF);
+    typedef void (*LuaPushNumberFn)(lua_State*, double);
+    static LuaPushNumberFn lua_pushnumber_p = nullptr;
+    if (!lua_pushnumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_pushnumber_p = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
+    }
+    if (lua_pushnumber_p) lua_pushnumber_p(L, (double)hp);
+    else api.pushnil(L);
     return 1;
 }
 
@@ -2278,6 +2349,12 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "install_passive_player_hooks");
     api.pushcclosure(L, l_pin_hp, 0);
     api.setfield(L, -2, "pin_hp");
+    api.pushcclosure(L, l_read_hp, 0);
+    api.setfield(L, -2, "read_hp");
+    api.pushcclosure(L, l_set_local_player, 0);
+    api.setfield(L, -2, "set_local_player");
+    api.pushcclosure(L, l_get_local_player, 0);
+    api.setfield(L, -2, "get_local_player");
     api.pushcclosure(L, l_pin_angle, 0);
     api.setfield(L, -2, "pin_angle");
     api.pushcclosure(L, l_consume_bomb, 0);

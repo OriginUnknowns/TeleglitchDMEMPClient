@@ -1907,16 +1907,18 @@ local function handle_bullet_fire(msg)
         owner = mp.puppets[msg.from].obj
     end
     if not owner then owner = player.GetPlayer() end
-    local cosmetic = not mp.is_host
-    local bdmg = cosmetic and 0 or ((type(msg.dmg) == "number") and msg.dmg or 10)
+    -- Real bullet on BOTH sides. Previously the joiner spawned cosmetic
+    -- (damage 0) bullets for host shots — which meant host bullets did
+    -- nothing to the joiner's local TPlayer. With real damage on both
+    -- sides, host→joiner and joiner→host are symmetric: the receiver's
+    -- engine applies the firer's damage to its own local body. Mob
+    -- puppets sit at HP 999999 so a stray hit is harmless visually,
+    -- and player puppets have set_invulnerable=1 to gate TakeDamage.
+    local bdmg = (type(msg.dmg) == "number") and msg.dmg or 10
     -- Real force from the firing weapon (ctor a7); fall back to 2.0. Force also
     -- drives knockback + bullet range (tick decay), so the replicated shot
     -- behaves like the original weapon.
     local bforce = (type(msg.force) == "number" and msg.force > 0) and msg.force or 2.0
-    -- Cosmetic bullets (joiner side) need MORE force than the real value
-    -- because: (a) we don't want them dying after 1-2 ticks, (b) they're
-    -- visual-only so the larger range is fine.
-    if cosmetic and bforce < 2.0 then bforce = 5.0 end
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
         CreateBullet(msg.x, msg.y, msg.angle, msg.speed, bdmg, bforce, owner)
@@ -3114,6 +3116,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         -- HP polling in MP_FRAME_TICK drives the dead state.
         mp.is_dead = false
         mp.death_announced_at = nil
+        mp.local_player_obj = nil  -- repopulated by death-intercept block on first tick
+        mp.local_player_ptr = nil
         local seed = mp.session_seed or 1779843477
         logf("begin_game: seed=%s is_host=%s room='%s'",
             tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
@@ -3125,6 +3129,22 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         -- ESC mid-game. The engine remembers the most recently set page
         -- when bouncing in/out of game state.
         pcall(function() menu.SetPage("mp_pause") end)
+        -- Lock down the LOCAL TPlayer pointer BEFORE any handle_join runs.
+        -- After level.StartFrom, DAT_005747a4 is the local. handle_join's
+        -- CreatePlayer swaps DAT_005747a4 to the puppet briefly; if Lua's
+        -- player handle resolves .pointer dynamically from DAT_005747a4,
+        -- obj.pointer at register_puppet time can be the LOCAL's address —
+        -- which we'd then mis-pin to 9999, surfacing as the HUD HP bug.
+        -- set_local_player captures the real local ptr now; the native
+        -- register_puppet / is_passive_player gates refuse this address.
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_local_player then
+            local pl_lock = player.GetPlayer()
+            if pl_lock and pl_lock.pointer then
+                pcall(function() _G.MP_NATIVE.set_local_player(pl_lock.pointer) end)
+                mp.local_player_obj = pl_lock
+                mp.local_player_ptr = pl_lock.pointer
+            end
+        end
         for _, p in ipairs(mp.pending_initial_players or {}) do
             if p.id ~= mp.my_id then handle_join(p) end
         end
@@ -3802,7 +3822,23 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         -- have already executed. Acceptable for MVP; iterate later
         -- with a CentralHit hook if it bites in practice.
         if mp.in_game and _G.MP_NATIVE and _G.MP_NATIVE.pin_hp then
-            local pl = player.GetPlayer()
+            -- Cache the LOCAL player handle on first tick after begin_game.
+            -- Polling via player.GetPlayer() each frame is unsafe once puppets
+            -- exist: the engine's GetPlayer / GetHealth can resolve to a puppet
+            -- pinned to 9999, so the threshold check never trips and the real
+            -- local dies through the engine death branch. The cached handle
+            -- (taken before any CreatePlayer puppet exists) gives us a stable
+            -- pointer to read +0xBC from directly via MP_NATIVE.read_hp.
+            if not mp.local_player_obj then
+                local pl0 = player.GetPlayer()
+                if pl0 and pl0.pointer then
+                    mp.local_player_obj = pl0
+                    mp.local_player_ptr = pl0.pointer
+                    logf("DEATH intercept: cached local player ptr=%s",
+                        tostring(_G.MP_NATIVE.addr_of and _G.MP_NATIVE.addr_of(pl0.pointer)))
+                end
+            end
+            local pl = mp.local_player_obj
             if pl and pl.pointer then
                 -- Allow external triggers (dev menu Kill Self, future
                 -- host-confirmed death) to flip mp.is_dead directly. If
@@ -3810,7 +3846,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 if mp.is_dead and not mp.death_announced_at then
                     mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
                     logf("DEATH externally triggered → pin + announce")
-                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
+                    pcall(function() _G.MP_NATIVE.pin_hp(mp.local_player_ptr or pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                     pcall(function()
                         if _G.MP_NATIVE.set_invulnerable then
                             _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
@@ -3823,7 +3859,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 end
                 if mp.is_dead then
                     -- Keep pinning so any incoming damage can't tip HP <= 0.
-                    pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
+                    pcall(function() _G.MP_NATIVE.pin_hp(mp.local_player_ptr or pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                     -- Spectate: each frame, teleport our corpse onto the
                     -- nearest LIVING teammate. last_x/last_y are the most
                     -- recent host-broadcast positions from handle_snapshot.
@@ -3849,14 +3885,32 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     end
                 else
                     local hp = nil
-                    pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
+                    -- Read +0xBC directly from the cached local pointer.
+                    -- pl:GetHealth() goes through engine state that puppets
+                    -- pollute (returned 9999 from a puppet instead of the
+                    -- real local HP), making the threshold check miss.
+                    if _G.MP_NATIVE.read_hp then
+                        pcall(function() hp = _G.MP_NATIVE.read_hp(mp.local_player_ptr or pl.pointer) end)
+                    else
+                        pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
+                    end
+                    -- Per-tick log: any change in HP gets recorded.
+                    -- Logs are throttled by VALUE change to avoid spam.
+                    mp._last_logged_hp = mp._last_logged_hp or -1
+                    if hp ~= mp._last_logged_hp then
+                        local lp_addr = _G.MP_NATIVE.addr_of and _G.MP_NATIVE.addr_of(mp.local_player_ptr) or "?"
+                        local mainp = _G.MP_NATIVE.get_main_player and _G.MP_NATIVE.get_main_player() or "?"
+                        logf("DEATH poll: cached_ptr=%s main_p=%s hp=%s",
+                            tostring(lp_addr), tostring(mainp), tostring(hp))
+                        mp._last_logged_hp = hp
+                    end
                     -- Threshold of 5: gives a frame of slack before the
                     -- engine's <=0 death check fires.
                     if type(hp) == "number" and hp > 0 and hp <= 5 then
                         logf("DEATH intercept: hp=%s → pinning + entering spectate", tostring(hp))
                         mp.is_dead = true
                         mp.death_announced_at = (socket and socket.gettime) and socket.gettime() or 0
-                        pcall(function() _G.MP_NATIVE.pin_hp(pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
+                        pcall(function() _G.MP_NATIVE.pin_hp(mp.local_player_ptr or pl.pointer, true) end)  -- 2nd arg = allow main player (death intercept)
                         pcall(function()
                             if _G.MP_NATIVE.set_invulnerable then
                                 _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
@@ -3895,6 +3949,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             mp.in_game = false
             mp.is_dead = false
             mp.death_announced_at = nil
+            mp.local_player_obj = nil
+            mp.local_player_ptr = nil
             mp.room_players = {}
             mp.game_started_pending = false
             -- Same cross-session cleanup as Disconnect: destroy engine
