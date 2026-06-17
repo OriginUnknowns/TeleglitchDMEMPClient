@@ -302,6 +302,10 @@ if type(level) == "table" and type(level.Clear) == "function" then
         mp.next_item_id = 1
         mp.host_mobs = {}
         mp.next_mob_id = 1
+        mp.containers = {}      -- id -> {x, y, sprite, items={type,...}, obj=cont}
+        mp.next_container_id = 1
+        mp.container_obj_to_id = {}  -- pointer string -> id
+        mp.container_snapshot_sent = false
         -- Puppets / mob_puppets reference engine entities that level.Clear
         -- destroys. Discard our Lua-side handles so handle_join doesn't keep
         -- returning early on stale wrappers (which caused ghost puppets).
@@ -724,6 +728,32 @@ local function host_send_item_list()
     logf("host sent item_list: %d real items (dropped %d ghosts)", #list, ghosts)
 end
 
+-- Host: enumerate tracked containers + contents, send to relay so joiners
+-- get an authoritative snapshot. Containers spawn during levelgen on both
+-- sides (identical seed = identical layout), but contents could drift if
+-- anything diverged — this lets joiners verify/adopt host state.
+local function host_send_container_list()
+    if mp.container_snapshot_sent or not mp.is_host or not mp.sock then return end
+    local list = {}
+    for id, c in pairs(mp.containers) do
+        table.insert(list, {
+            id = id, x = c.x, y = c.y, angle = c.angle,
+            sprite = c.sprite, items = c.items,
+        })
+    end
+    -- Sort by id for stable log/transport ordering.
+    table.sort(list, function(a, b) return a.id < b.id end)
+    local total_items = 0
+    for _, c in ipairs(list) do total_items = total_items + #(c.items or {}) end
+    logf("host_send_container_list: %d containers, %d items total", #list, total_items)
+    for _, c in ipairs(list) do
+        logf("  CONTAINER SNAPSHOT id=%d pos=(%.2f,%.2f) sprite=%s items=[%s]",
+            c.id, c.x or 0, c.y or 0, tostring(c.sprite), table.concat(c.items or {}, ","))
+    end
+    send_msg({ type = "container_list", containers = list })
+    mp.container_snapshot_sent = true
+end
+
 -- Pickup detection via pl:GiveItem hook. Engine calls pl:GiveItem(type) whenever
 -- the local player gains an item (pickup or scripted grant). We match it to the
 -- nearest tracked item of matching type within pickup radius, broadcast its id,
@@ -1113,6 +1143,41 @@ do
                 mp.host_mobs[ptr_str] = { id = mp.next_mob_id, type = t, obj = obj }
                 mp.next_mob_id = mp.next_mob_id + 1
             end
+            -- Container tracking: containers are spawned by levelgen on both
+            -- host AND joiner (same seed -> same shuffles -> identical sets),
+            -- but the host is authoritative on which items they hold (SpawnItems
+            -- calls AddItem in shuffle order). Both sides track; on level load
+            -- the host broadcasts container_list so joiners can verify/adopt
+            -- contents. We wrap the returned cont:AddItem to capture each
+            -- item added — the engine fills them via cont:AddItem(type) during
+            -- levelgen.
+            if t == "container" and obj then
+                local id = mp.next_container_id
+                mp.next_container_id = id + 1
+                local ptr_str = tostring(obj.pointer)
+                local entry = {
+                    id = id, x = data.x, y = data.y, angle = data.angle or 0,
+                    sprite = data.sprite, items = {}, obj = obj,
+                }
+                mp.containers[id] = entry
+                mp.container_obj_to_id[ptr_str] = id
+                logf("CONTAINER tracked id=%d ptr=%s pos=(%.2f,%.2f) sprite=%s",
+                    id, ptr_str, entry.x or 0, entry.y or 0, tostring(entry.sprite))
+                if type(obj.AddItem) == "function" and not rawget(obj, "_mp_add_wrapped") then
+                    local orig_add = obj.AddItem
+                    obj.AddItem = function(self, item_type, ...)
+                        local r = orig_add(self, item_type, ...)
+                        local eid = mp.container_obj_to_id[tostring(self.pointer)]
+                        if eid and mp.containers[eid] then
+                            table.insert(mp.containers[eid].items, item_type)
+                            logf("CONTAINER addItem id=%d type=%s (n=%d)",
+                                eid, tostring(item_type), #mp.containers[eid].items)
+                        end
+                        return r
+                    end
+                    pcall(function() rawset(obj, "_mp_add_wrapped", true) end)
+                end
+            end
             -- Items are tracked in the _Create* low-level wraps only, NOT here.
             -- The engine wraps the same C++ entity in TWO different Lua tables —
             -- one returned by the low-level call, one returned by Create{} —
@@ -1424,6 +1489,10 @@ local apply_waiting_labels   -- set by the menu integration; updates the
                              -- player-slot button labels on the waiting page
 local apply_pause_labels     -- updates the in-game ESC menu player slots
 
+-- Forward decl — defined after the item-list handler below; handle_welcome
+-- needs to call it when the relay piggy-backs a container_list on welcome.
+local handle_container_list  -- forward decl
+
 local function handle_welcome(msg)
     mp.my_id = msg.id
     mp.room_id = msg.room_id
@@ -1441,6 +1510,10 @@ local function handle_welcome(msg)
     end
     if not mp.is_host and type(msg.item_list) == "table" and #msg.item_list > 0 then
         mp.pending_item_list = msg.item_list
+    end
+    if not mp.is_host and type(msg.container_list) == "table" and #msg.container_list > 0 then
+        logf("welcome: container_list pending n=%d", #msg.container_list)
+        handle_container_list({ containers = msg.container_list })
     end
     logf("welcome async: my_id=%s room='%s' host_id=%s is_host=%s status=%s players=%d",
         tostring(mp.my_id), tostring(msg.room_name), tostring(msg.host_id),
@@ -1856,6 +1929,65 @@ local function start_apply_coro(items)
     coroutine.resume(co)
 end
 
+-- Joiner: handle host's container snapshot. Log every container received
+-- and verify against locally-tracked containers (created by identical
+-- levelgen). For MVP we just log diffs — no rewrite of local state yet.
+handle_container_list = function(msg)
+    local n = (type(msg.containers) == "table") and #msg.containers or 0
+    logf("handle_container_list: is_host=%s msg.containers_n=%d", tostring(mp.is_host), n)
+    if mp.is_host then return end
+    if n == 0 then logf("handle_container_list: empty"); return end
+    -- Match by POSITION (host + joiner both run identical levelgen with the
+    -- same seed → identical container layout, but IDs are assigned in local
+    -- Create order so they diverge between clients). After matching, re-key
+    -- the local container record to the host's ID so future host-authoritative
+    -- updates (loot taken, etc) can address them.
+    local local_by_pos = {}
+    local POS_KEY = function(x, y) return string.format("%.2f|%.2f", x or 0, y or 0) end
+    for lid, lc in pairs(mp.containers or {}) do
+        local_by_pos[POS_KEY(lc.x, lc.y)] = { id = lid, entry = lc }
+    end
+    local match, content_mismatch, missing = 0, 0, 0
+    local rekeyed = {}
+    for _, c in ipairs(msg.containers) do
+        local items_str = table.concat(c.items or {}, ",")
+        local hit = local_by_pos[POS_KEY(c.x, c.y)]
+        if not hit then
+            logf("  RX CONTAINER host_id=%d pos=(%.2f,%.2f) sprite=%s items=[%s] (NO LOCAL CONTAINER AT POS)",
+                c.id, c.x or 0, c.y or 0, tostring(c.sprite), items_str)
+            missing = missing + 1
+        else
+            local local_items_str = table.concat(hit.entry.items or {}, ",")
+            if items_str == local_items_str then
+                match = match + 1
+            else
+                content_mismatch = content_mismatch + 1
+                logf("  RX CONTAINER host_id=%d pos=(%.2f,%.2f) CONTENT DIFF host=[%s] local=[%s]",
+                    c.id, c.x or 0, c.y or 0, items_str, local_items_str)
+                -- Adopt host's content list (authoritative). We do NOT mutate
+                -- the engine container itself — only our shadow record — so
+                -- the visual loot behavior is unchanged. Future work: also
+                -- sync via cont:AddItem / a clear-then-fill helper.
+                hit.entry.items = c.items
+            end
+            -- Re-key local id -> host id (for future per-container updates).
+            if hit.id ~= c.id then
+                mp.containers[c.id] = hit.entry
+                mp.containers[hit.id] = nil
+                for ptr, pid in pairs(mp.container_obj_to_id) do
+                    if pid == hit.id then mp.container_obj_to_id[ptr] = c.id end
+                end
+                table.insert(rekeyed, { from = hit.id, to = c.id })
+            end
+        end
+    end
+    if #rekeyed > 0 then
+        logf("handle_container_list: rekeyed %d local IDs to host IDs", #rekeyed)
+    end
+    logf("handle_container_list: %d match, %d content-diff, %d missing (of %d)",
+        match, content_mismatch, missing, n)
+end
+
 local function handle_item_list(msg)
     local n = (type(msg.items) == "table") and #msg.items or 0
     logf("handle_item_list: is_host=%s snapshot_received=%s msg.items_n=%d level_loaded=%s",
@@ -2264,6 +2396,7 @@ local handlers = {
     melee = handle_melee,
     item_picked = handle_item_picked,
     item_list = handle_item_list,
+    container_list = handle_container_list,
     item_spawned = handle_item_spawned,
     inventory = handle_inventory,
     -- New lobby / multi-room messages.
@@ -3323,6 +3456,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 pcall(function()
                     Wait(1.5)
                     host_send_item_list()
+                    host_send_container_list()
                 end)
             end)
             coroutine.resume(co)
