@@ -4030,13 +4030,12 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     logf("MP page mp_lobby: ok=%s err=%s", tostring(pok1), tostring(perr1))
 
     -- ------------------------------------------------------------------
-    -- mp_browse = room slot picker. 4 slot buttons + Refresh + Back.
-    -- Slot labels are static ("Join Slot N") because the title-menu
-    -- button API has no runtime caption update (probe confirmed: only
-    -- pointer/objtype/SetNext exposed). Per-room details are logged
-    -- by Refresh into mp_client.log so the player can pick the right
-    -- slot. Real label updates require a native bridge to poke the C++
-    -- button struct directly — parked for now.
+    -- mp_browse = room slot picker. 4 slot buttons + page prev/next + Back.
+    -- Slot labels ARE dynamic — apply_slot_labels writes via the native
+    -- set_button_label (which pokes the C++ button's std::string SSO buffer
+    -- directly, 15-char max — see format_slot_label). Refresh is triggered
+    -- inside lobby_join_slot before resolving the click so a stale slot
+    -- click never joins the wrong room.
     -- ------------------------------------------------------------------
     local mp_browse_page
     local pok1b, perr1b = pcall(function()

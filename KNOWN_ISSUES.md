@@ -2,17 +2,57 @@
 
 ## 🟡 Weapon-subclass replication gap (2026-06-17)
 
-`Lua CreateBullet` always spawns the base `TBullet`. For weapons whose
-bullettype is cannon/explode/nails/railgun, replicated shots on the
-receiver appear as plain bullets — no nail-trail visual, no explosion on
-impact, no railgun pierce. Damage value is correct (we capture the
-ctor's a5 directly), only the subclass behavior is missing.
+Partially fixed. `TNail` (nailguns) and `TExplodingBullet` (rocket
+launchers etc.) now replicate via vtable swap — both subclasses call
+TBullet's ctor internally, so the existing TBullet hook captures the
+shot with a `g_pending_subclass` tag set by the subclass-ctor hook,
+and the receiver's `swap_bullet_subclass` rewrites the spawned TBullet's
+vtable to the subclass. vt[20] (impact effect) dispatches the right
+visual / behavior.
 
-**Fix path:** hook subclass ctors (`TCannonBullet` 0x558454,
-`TExplodingBullet` 0x558384, `TNail` 0x55831c — vtable addresses per
-teleglitch-engine-internals.md; ctor offsets need Ghidra), expose native
-`CreateNail` / `CreateCannonBullet` / `CreateExpl` bindings, thread
-`subclass` through the `bullet_fire` message, dispatch on receive.
+**Still broken:** TCannonBullet, TLaser, TRailgunRay, TRocket,
+TBlueRocket — these bypass TBullet's ctor entirely (use TProjectile
+base, allocate their own sub-objects, etc.), so vtable-swap on a fresh
+TBullet leaves them in an inconsistent state. Need real native bindings.
+
+### Data already gathered (see ghidra_*.txt for full output)
+
+| Subclass         | vtable      | ctor      | size  | ctor stack args |
+|------------------|-------------|-----------|-------|-----------------|
+| TBullet          | 0x5583ec    | 0x497040  | 0xc0  | 8 (x,y,vx,vy,dmg,owner,force,const) |
+| TCannonBullet    | 0x558454    | 0x497660  | 0xbc  | 6 (x,y,vx,vy,dmg,owner) — flat dmg via vt[23]=1.0 |
+| TExplodingBullet | 0x558384    | 0x497140  | 0xc0  | 8 (calls TBullet ctor inside) ✅ working |
+| TNail            | 0x55831c    | 0x497200  | 0xc4  | 9 (TBullet args + range float) ✅ working |
+| TLaser           | 0x5584bc    | 0x497cd0  | 0xe0  | 7 (x,y,vx,vy,?,owner,char) — owns 2× operator_new(0x84) sub-objects |
+| TRailgunRay      | 0x5585ac    | 0x499d70  | 0x9c  | ? |
+| TRocket          | 0x5586c4    | 0x49a5c0  | 0xd8  | ? |
+| TBlueRocket      | 0x558604    | 0x49aa10  | 0xd8  | ? |
+
+Engine registration after ctor: `FUN_004b3a90(obj, lua_state)` — same
+call the Lua `CreateBullet` binding uses post-ctor.
+
+### Plan for the next pass
+For each missing subclass: write a Lua-callable native
+`create_<subclass>(x, y, vx, vy, dmg, owner)` that does
+`operator_new(SIZE)` → `__thiscall ctor(this, args…)` → `FUN_004b3a90`.
+Add capture-side hook on the subclass ctor so the firer sends
+`bullet_fire {subclass = <id>}`. Receiver dispatches by subclass id to
+the new native instead of `CreateBullet` + `swap_bullet_subclass`.
+
+`operator_new` address: TBC (search for any caller of size 0xc0).
+
+## 🔴 Cannon firer-side crash (2026-06-17)
+
+Repro: equip cannon (`itemtable.cannon`, bullettype 8) and fire. The
+**firer** AVs (not the receiver — joiner doesn't even know the shot
+happened, since cannon ctor bypasses TBullet and our hook misses it).
+No captured crash log yet — next session needs a cdb-attached repro to
+confirm root cause. Most plausible suspect: cannon's vt[20] explosion
+runs an AoE damage scan over actors near the impact, hitting the
+joiner's TPlayer puppet on the host. The puppet has set_invulnerable=1
+so TakeDamage short-circuits, but the scan or screen-shake path may
+touch state the cannon doesn't expect (puppet's hooked think,
+render-gated body, etc.).
 
 ## 🟡 Shotgun (5-pellet rapid fire) crashes remote client (2026-06-17)
 
