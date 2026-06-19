@@ -2332,6 +2332,57 @@ local function handle_bullet_fire(msg)
     -- drives knockback + bullet range (tick decay), so the replicated shot
     -- behaves like the original weapon.
     local bforce = (type(msg.force) == "number" and msg.force > 0) and msg.force or 2.0
+    -- Subclass dispatch BEFORE CreateBullet — TLaser has its own native
+    -- spawner because vtable-swap on a TBullet won't give a working
+    -- raycast laser (TLaser owns sub-objects + uses TProjectile base).
+    logf("handle_bullet_fire: subclass=%s create_tlaser=%s",
+        tostring(msg.subclass), tostring(_G.MP_NATIVE and _G.MP_NATIVE.create_tlaser ~= nil))
+    if msg.subclass == 3 and _G.MP_NATIVE and _G.MP_NATIVE.create_tlaser then
+        -- msg.angle was reconstructed from (vx,vy) = (cos,sin) on the firer.
+        local fang = msg.angle or 0
+        -- Lasgun damage isn't a ctor arg — the engine writes it post-ctor;
+        -- our firer-side hook can't grab it from the ctor frame. Fall back
+        -- to the static weapon damage from relvad.lua (lasgun=16).
+        local laser_dmg = (type(msg.dmg) == "number" and msg.dmg > 0) and msg.dmg or 16
+        -- owner is the puppet's Lua TABLE handle ({pointer=…}); the native
+        -- resolve_entity expects light userdata, so pass the .pointer
+        -- field directly.
+        local owner_ptr = owner and owner.pointer
+        if not owner_ptr then
+            logf("create_tlaser SKIP: no owner_ptr")
+            return
+        end
+        -- Track one active laser per peer. The first bullet_fire of a
+        -- fire-stream spawns it; subsequent laser_keepalive messages
+        -- refresh it; laser_end (or a 0.5s grace timeout for stragglers)
+        -- kills it. Per-shot spawn-then-kill never matched the firer's
+        -- continuous look because lasgun fires 1-3 Hz — gaps too big.
+        mp.peer_lasers = mp.peer_lasers or {}
+        local existing = mp.peer_lasers[msg.from]
+        if existing and existing.obj and existing.obj.pointer then
+            -- Refresh existing laser instead of spawning new (avoids
+            -- visual stacking). vt[22] re-runs with owner's current
+            -- state, extending beam in updated aim direction.
+            pcall(function() _G.MP_NATIVE.refresh_tlaser(existing.obj.pointer) end)
+            existing.last_t = socket.gettime()
+        else
+            local laser_obj
+            pcall(function()
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
+                laser_obj = _G.MP_NATIVE.create_tlaser(msg.x, msg.y, fang, laser_dmg, owner_ptr)
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
+            end)
+            if laser_obj and laser_obj.pointer then
+                mp.peer_lasers[msg.from] = {
+                    obj = laser_obj, last_t = socket.gettime(),
+                }
+            end
+        end
+        logf("bullet_fire: TLaser native spawn pos=(%.2f,%.2f) ang=%.3f dmg=%d",
+            msg.x, msg.y, fang, laser_dmg)
+        return
+    end
+
     local bullet_obj
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
@@ -2517,6 +2568,31 @@ local function handle_peer_died(m)
     end
 end
 
+-- Laser on/off protocol — receiver state machine. Firer broadcasts these
+-- between bullet_fire and laser_end to keep the persistent TLaser alive
+-- in the direction the firer is currently aiming.
+local function handle_laser_keepalive(msg)
+    if not msg.from then return end
+    mp.peer_lasers = mp.peer_lasers or {}
+    local entry = mp.peer_lasers[msg.from]
+    if entry and entry.obj and entry.obj.pointer
+       and _G.MP_NATIVE and _G.MP_NATIVE.refresh_tlaser then
+        pcall(function() _G.MP_NATIVE.refresh_tlaser(entry.obj.pointer) end)
+        entry.last_t = socket.gettime()
+    end
+end
+
+local function handle_laser_end(msg)
+    if not msg.from then return end
+    mp.peer_lasers = mp.peer_lasers or {}
+    local entry = mp.peer_lasers[msg.from]
+    if entry and entry.obj and entry.obj.pointer
+       and _G.MP_NATIVE and _G.MP_NATIVE.mark_laser_dead then
+        pcall(function() _G.MP_NATIVE.mark_laser_dead(entry.obj.pointer) end)
+    end
+    mp.peer_lasers[msg.from] = nil
+end
+
 local handlers = {
     welcome = handle_welcome,
     join = function(m) handle_join(m) end,
@@ -2529,6 +2605,8 @@ local handlers = {
     mob_died = handle_mob_died,
     mob_damage = handle_mob_damage,
     bullet_fire = handle_bullet_fire,
+    laser_keepalive = handle_laser_keepalive,
+    laser_end = handle_laser_end,
     melee = handle_melee,
     item_picked = handle_item_picked,
     item_list = handle_item_list,
@@ -2660,12 +2738,24 @@ end
 
 local function _apply_welcome(welcome)
     mp.puppets = {}
+    mp.peer_lasers = {}
     mp.items = {}
     mp.item_obj_to_id = {}
     mp.next_item_id = 1
     mp.item_snapshot_sent = false
     mp.item_snapshot_received = false
     mp.pending_item_list = nil
+    -- Cross-session state that must NOT leak from a prior room. Without
+    -- these, host→leave→join can either premature-trigger begin_game
+    -- (stale pending) or block it forever (stale in_game).
+    mp.in_game = false
+    mp.game_started_pending = false
+    mp.is_dead = false
+    mp.death_announced_at = nil
+    mp.local_player_obj = nil
+    mp.local_player_ptr = nil
+    mp.last_laser_t = nil
+    mp.laser_was_held = false
     joiner_pre_snapshot_items = {}
     joiner_pre_snapshot_objs = {}
     mp.my_id = welcome.id
@@ -3378,6 +3468,43 @@ local function dev_menu_tick()
             end
             send_msg({ type = "bullet_fire", x = x, y = y, angle = angle, speed = speed,
                        dmg = dmg or 10, force = force, subclass = subclass or 0 })
+            if (subclass or 0) == 3 then
+                -- Mark recent-laser-shot so the LMB keepalive loop below
+                -- knows to emit laser_keepalive while LMB stays held.
+                mp.last_laser_t = socket.gettime()
+            end
+        end
+        -- Laser on/off protocol: lasgun's natural fire rate is 1-3 Hz which
+        -- can't make a brief per-shot beam look continuous on the receiver.
+        -- Instead, while LMB stays held AFTER a laser shot, broadcast
+        -- laser_keepalive at 10Hz with current muzzle + aim. Receiver
+        -- maintains a single persistent TLaser and refreshes it on each
+        -- keepalive. On LMB release, broadcast laser_end → receiver kills.
+        if _G.MP_NATIVE and _G.MP_NATIVE.lmb_pressed and mp.sock then
+            local now = socket.gettime()
+            local lmb = _G.MP_NATIVE.lmb_pressed()
+            -- Tight window: 200ms (vs old 500). If reloading or out of
+            -- ammo, no new laser ctor fires → window expires within 200ms
+            -- → we treat the laser as ended and broadcast laser_end so
+            -- the receiver kills its beam even though LMB is still held.
+            local recent_laser = (now - (mp.last_laser_t or 0)) < 0.2
+            local should_be_active = lmb and recent_laser
+            local pl_for_aim = player.GetPlayer()
+            if should_be_active and pl_for_aim then
+                if (now - (mp.last_laser_keepalive_t or 0)) > 0.1 then
+                    local lx, ly = pl_for_aim:GetPosition()
+                    local la = pl_for_aim:GetAngle()
+                    send_msg({ type = "laser_keepalive", x = lx, y = ly,
+                               angle = la, from = mp.my_id })
+                    mp.last_laser_keepalive_t = now
+                end
+                mp.laser_was_held = true
+            elseif mp.laser_was_held and not should_be_active then
+                -- Transition active→inactive — either LMB released OR
+                -- ammo ran out / reload kicked in (no recent ctor).
+                send_msg({ type = "laser_end", from = mp.my_id })
+                mp.laser_was_held = false
+            end
         end
         -- Drain bomb activation events from the native hook. Hook captures
         -- type + fuse only (safest data). We fill the position + aim angle
@@ -3615,9 +3742,11 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     -- shape our hooks cover end-to-end. Cannon (own ctor),
                     -- agl (explode2), lasgun (laser), tesla (electro)
                     -- need extra subclass support — see KNOWN_ISSUES.md.
+                    -- Ammo types from relvad.lua: pump→ppammo, rifle→riammo,
+                    -- smg→pyammo, lasgun→battery (ammotype 5).
                     local STARTER = {
-                        weapons = { "pump", "rifle", "smg" },
-                        ammo    = { "pyammo", "ppammo", "smgammo" },
+                        weapons = { "pump", "rifle", "smg", "lasgun" },
+                        ammo    = { "ppammo", "riammo", "pyammo", "battery" },
                     }
                     for _, w in ipairs(STARTER.weapons) do
                         pcall(function() pl:GiveItem(w) end)
@@ -3971,15 +4100,38 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end
 
     local function lobby_leave_room()
-        logf("lobby_leave_room: entry — was_host=%s, mp.sock=%s",
-            tostring(mp.is_host), tostring(mp.sock ~= nil))
+        logf("lobby_leave_room: entry — was_host=%s, in_game=%s, mp.sock=%s",
+            tostring(mp.is_host), tostring(mp.in_game), tostring(mp.sock ~= nil))
         if mp.sock then
             pcall(function() send_msg({ type = "leave_room" }) end)
             pcall(function() mp.sock:close() end)
             mp.sock = nil
             mp.rx_buf = ""
         end
+        -- Clean up engine-side state so the next room isn't polluted by
+        -- stale handles. Same shape as pending_kick_cleanup (the only
+        -- other path that resets the full set correctly).
+        for _, entry in pairs(mp.puppets or {}) do
+            if entry.obj then pcall(function() safe_delete(entry.obj) end) end
+            if entry.nameplate then pcall(function() entry.nameplate:Delete() end) end
+        end
+        mp.puppets = {}
+        mp.peer_lasers = {}     -- new state from laser on/off protocol
         mp.is_host = false
+        mp.in_game = false      -- critical: stale in_game blocks future begin_game
+        mp.game_started_pending = false  -- critical: stale flag premature-triggers begin_game
+        mp.is_dead = false
+        mp.death_announced_at = nil
+        mp.local_player_obj = nil
+        mp.local_player_ptr = nil
+        mp.room_players = {}
+        mp.room_id = nil
+        mp.host_id = nil
+        mp.session_seed = nil
+        mp.pending_initial_players = nil
+        mp.handshake_queued = nil
+        mp.last_laser_t = nil
+        mp.laser_was_held = false
         disarm_esc_leaves_lobby()
         menu.SetPage("mp_lobby")
     end

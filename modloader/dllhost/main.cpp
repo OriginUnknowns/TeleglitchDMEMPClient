@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "lua52_min.h"
 #include "include/MinHook.h"
 #include <set>
@@ -354,6 +355,146 @@ static void* __fastcall hook_ExplodeCtor(void* self, void* edx,
     return r;
 }
 
+// =============== TLASER LIFETIME DIAGNOSTIC HOOKS ===============
+// Track every vt[22] call (per-tick laser update) and every FUN_0040e750
+// (mark-dead) so we can see exactly when our receiver-side laser stops
+// ticking — and whether the engine cleans up firer's lasers the same way
+// it doesn't clean ours. Tagged with a sequence id so individual lasers
+// can be correlated through their full lifetime.
+static int g_tlaser_id_counter = 0;
+struct TLaserDbg { void* obj; int id; int initial_b8; };
+#define TLASER_DBG_MAX 64
+static TLaserDbg g_tlaser_dbg[TLASER_DBG_MAX];
+static int       g_tlaser_dbg_n = 0;
+static int laser_dbg_id_for(void* obj) {
+    for (int i = 0; i < g_tlaser_dbg_n; ++i) {
+        if (g_tlaser_dbg[i].obj == obj) return g_tlaser_dbg[i].id;
+    }
+    return -1;
+}
+static void laser_dbg_register(void* obj, int initial_b8) {
+    if (g_tlaser_dbg_n >= TLASER_DBG_MAX) return;
+    g_tlaser_dbg[g_tlaser_dbg_n].obj = obj;
+    g_tlaser_dbg[g_tlaser_dbg_n].id  = ++g_tlaser_id_counter;
+    g_tlaser_dbg[g_tlaser_dbg_n].initial_b8 = initial_b8;
+    g_tlaser_dbg_n++;
+}
+static void laser_dbg_unregister(void* obj) {
+    for (int i = 0; i < g_tlaser_dbg_n; ++i) {
+        if (g_tlaser_dbg[i].obj == obj) {
+            g_tlaser_dbg[i] = g_tlaser_dbg[--g_tlaser_dbg_n];
+            return;
+        }
+    }
+}
+
+// Hook on TLaser vt[22] (FUN_00498770) — fires every tick the engine
+// processes the laser. Log per-tick state so we can see counter
+// decrement, dead-flag transitions, and start/end position progression.
+typedef void (__fastcall *Vt22Fn)(void* self);
+static Vt22Fn orig_TLaserTick = nullptr;
+static void __fastcall hook_TLaserTick(void* self, void* /*edx*/) {
+    int id = laser_dbg_id_for(self);
+    int b8_before = *(int*)((char*)self + 0xB8);
+    unsigned char dead_before = *((unsigned char*)self + 0x2E);
+    unsigned char enable = *((unsigned char*)self + 0xC8);
+    orig_TLaserTick(self);
+    int b8_after = *(int*)((char*)self + 0xB8);
+    unsigned char dead_after = *((unsigned char*)self + 0x2E);
+    float sx = *(float*)((char*)self + 0x88);
+    float sy = *(float*)((char*)self + 0x8C);
+    float ex = *(float*)((char*)self + 0x74);
+    float ey = *(float*)((char*)self + 0x78);
+    host_log("TLaser TICK id=%d obj=%p b8 %d->%d dead %d->%d en=%d start=(%.2f,%.2f) end=(%.2f,%.2f)",
+             id, self, b8_before, b8_after, (int)dead_before, (int)dead_after,
+             (int)enable, sx, sy, ex, ey);
+}
+
+// Hook on FUN_0040e750 — the "mark dead" call. Logs which laser the
+// engine has flagged for cleanup and at what counter value.
+typedef void (__fastcall *MarkDeadFn)(void* self);
+static MarkDeadFn orig_MarkDead = nullptr;
+static void __fastcall hook_MarkDead(void* self, void* /*edx*/) {
+    int id = laser_dbg_id_for(self);
+    int b8 = *(int*)((char*)self + 0xB8);
+    void** vt = *(void***)self;
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    bool is_laser = vt && ((BYTE*)vt == base + 0x1584bc);
+    host_log("MARK_DEAD obj=%p id=%d b8=%d is_laser=%d",
+             self, id, b8, (int)is_laser);
+    if (is_laser) laser_dbg_unregister(self);
+    orig_MarkDead(self);
+}
+
+// Body-NULL guard on FUN_004b2e30 — the actor anim/position update that
+// dereferences `*(this+0x50)` (Box2D body) and crashes if NULL. Our
+// receiver-side TLaser has body=NULL (the ctor doesn't make one for laser),
+// so without this guard the world-tick AVs the moment we register the
+// laser. The original function does nothing useful when body is NULL —
+// bail before the deref.
+typedef void (__thiscall *BodyAnimUpdateFn)(void* self, float param_1);
+static BodyAnimUpdateFn orig_BodyAnimUpdate = nullptr;
+static void __fastcall hook_BodyAnimUpdate(void* self, void* /*edx*/, float param_1) {
+    void* body = *(void**)((char*)self + 0x50);
+    if (!body) return;
+    orig_BodyAnimUpdate(self, param_1);
+}
+
+// TLaser ctor (0x497cd0) does NOT call TBullet ctor internally — it goes
+// straight to TProjectile base — so the g_pending_subclass tag relay won't
+// catch it. Write the ring entry directly. Arg shape (from disasm at
+// 0x46ebd3): muzzle_x, muzzle_y, stack_temp_ptr, const_0a, const_0b,
+// aim_float, owner, char_flag. Damage isn't a ctor arg — engine writes it
+// to obj+0xBC right AFTER the ctor returns, so we read it back then.
+// 7 stack args (RET 0x1c verified). Arg map from disasm at 0x46ebd3:
+//   a1=muzzle_x, a2=muzzle_y, a3=const0, a4=const0,
+//   a5=aim_float, a6=owner, a7=char_flag.
+typedef void* (__fastcall *_LaserCtorFn)(void* self, void* edx,
+                                         int a1, int a2, int a3, int a4,
+                                         int a5, int a6, int a7);
+static _LaserCtorFn orig_LaserCtor = nullptr;
+static void* __fastcall hook_LaserCtor(void* self, void* edx,
+                                       int a1, int a2, int a3, int a4,
+                                       int a5, int a6, int a7) {
+    union { int i; float f; } xf, yf;
+    xf.i = a1; yf.i = a2;
+    // Read aim angle from the ACTIVE PLAYER global DAT_005747a4 (= local
+    // TPlayer) at +0xB0 — that's the canonical angle field engine writes
+    // each think frame. owner via a6 was returning 0.200 consistently
+    // (might be a player sub-object, not the player itself, depending on
+    // which call site dispatched the ctor).
+    float aim_angle = 0.0f;
+    // DAT_005747a4 (RVA 0x1747a4) — defined as MAIN_PLAYER_RVA later but
+    // we can't forward-use a #define in C++, so spell out the RVA here.
+    HMODULE _m = GetModuleHandleA(NULL);
+    void* active = _m ? *(void**)((BYTE*)_m + 0x1747a4) : nullptr;
+    if (active && !IsBadReadPtr((char*)active + 0xB0, 4)) {
+        aim_angle = *(float*)((char*)active + 0xB0);
+    }
+    void* r = orig_LaserCtor(self, edx, a1, a2, a3, a4, a5, a6, a7);
+    // Diag: register for lifetime tracking (firer-side ctor).
+    laser_dbg_register(self, *(int*)((char*)self + 0xB8));
+    host_log("TLaser CTOR (firer) obj=%p id=%d initial_b8=%d",
+             self, laser_dbg_id_for(self), *(int*)((char*)self + 0xB8));
+    if (g_bullet_capture) {
+        int idx = g_bullet_write_idx % BULLET_RING_SIZE;
+        g_bullet_ring[idx].x = xf.f;
+        g_bullet_ring[idx].y = yf.f;
+        // Encode aim as (cos, sin) so the existing atan2 recovery on the
+        // broadcast path round-trips the angle correctly.
+        g_bullet_ring[idx].vx = (float)cos((double)aim_angle);
+        g_bullet_ring[idx].vy = (float)sin((double)aim_angle);
+        g_bullet_ring[idx].dmg = 0.0f;
+        g_bullet_ring[idx].force = 0.0f;
+        g_bullet_ring[idx].type = a6;      // owner ptr
+        g_bullet_ring[idx].subclass = 3;   // bullettypes.laser
+        g_bullet_write_idx++;
+        host_log("hook_LaserCtor: pos=(%.2f,%.2f) aim=%.3f owner=%p",
+                 xf.f, yf.f, aim_angle, (void*)(intptr_t)a6);
+    }
+    return r;
+}
+
 // Receiver-side: after Lua CreateBullet spawns a base TBullet, this swaps the
 // object's vtable to the target subclass. vt[20] dispatches the impact-effect
 // behavior (nail trail / explode AoE) so the visual + behavioral payload comes
@@ -368,6 +509,164 @@ static void* __fastcall hook_ExplodeCtor(void* self, void* edx,
 // Forward decls — bodies live further down.
 static void* resolve_entity(lua_State* L, int idx);
 static inline BYTE* mod_base();
+
+// ============================================================================
+// Subclass spawn natives — bypass Lua's CreateBullet (always TBullet) to
+// produce real TLaser / TCannon / etc. on the receiver. Each does:
+//   1. operator_new(SIZE)
+//   2. thiscall ctor (RVA + arg shape per subclass, from Ghidra ctor decomps)
+//   3. post-ctor field setup the engine does (damage at +0xBC/+0xC0 etc.)
+//   4. trigger vt[22] (one-shot "fire" call the engine makes right after)
+//   5. FUN_004b3a90 to register with engine + push the {pointer,objtype}
+//      table to Lua so the caller gets a normal entity handle.
+//
+// `operator_new` lives at the IAT slot 0x130398 (the engine calls it via
+// `CALL dword ptr [0x00530398]` — RVA 0x130398 holds the import thunk).
+// ============================================================================
+typedef void* (__cdecl *OperatorNewFn)(size_t);
+typedef void (__thiscall *RegisterFromLuaFn)(void* self, lua_State* L);
+typedef void (__thiscall *EntityVtFn)(void* self);
+// TLaser ctor cleans RET 0x1c → 7 stack args (verified via GetCtorRetPurge).
+// __fastcall pattern: ECX=this, EDX=ignored, then 7 args on stack.
+typedef void* (__fastcall *TLaserCtorFn)(void* self, void* edx,
+                                         int a1, int a2, int a3, int a4,
+                                         int a5, int a6, int a7);
+
+static OperatorNewFn     g_op_new       = nullptr;
+static RegisterFromLuaFn g_register     = nullptr;
+static TLaserCtorFn      g_tlaser_ctor  = nullptr;
+
+static bool init_subclass_spawn() {
+    if (g_op_new) return true;
+    BYTE* base = mod_base();
+    if (!base) return false;
+    // operator_new is an import — RVA 0x130398 holds the resolved thunk
+    // address (the engine calls `[0x530398]` indirectly throughout).
+    void** op_new_slot = (void**)(base + 0x130398);
+    if (IsBadReadPtr(op_new_slot, 4)) return false;
+    g_op_new      = (OperatorNewFn)(*op_new_slot);
+    g_register    = (RegisterFromLuaFn)(base + 0xb3a90);
+    g_tlaser_ctor = (TLaserCtorFn)(base + 0x97cd0);
+    host_log("init_subclass_spawn: op_new=%p register=%p tlaser=%p",
+             g_op_new, g_register, g_tlaser_ctor);
+    return g_op_new != nullptr;
+}
+
+// create_tlaser(x, y, angle, dmg, owner_ptr) — replicate a TLaser shot the
+// firer just made. Reconstructs the engine's lasgun-fire sequence on the
+// receiver so we get a real beam visual + raycast damage instead of a
+// vanilla TBullet replica.
+static int l_create_tlaser(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    typedef int    (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToNumberFn  lua_tonumber_p  = nullptr;
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p  = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    if (!init_subclass_spawn()) { api.pushnil(L); return 1; }
+
+    union { int i; float f; } x, y, ang;
+    x.f   = (float)lua_tonumber_p(L, 1, nullptr);
+    y.f   = (float)lua_tonumber_p(L, 2, nullptr);
+    ang.f = (float)lua_tonumber_p(L, 3, nullptr);
+    int dmg = lua_tointeger_p(L, 4, nullptr);
+    void* owner = resolve_entity(L, 5);
+    if (!owner) {
+        host_log("create_tlaser: no owner — bailing");
+        api.pushnil(L); return 1;
+    }
+
+    void* obj = g_op_new(0xE0);
+    if (!obj) { api.pushnil(L); return 1; }
+
+    // Ctor arg shape — 7 stack args (RET 0x1c, verified). Earlier 8-arg
+    // count was wrong; one of the PUSHes I counted near the call site was
+    // actually for the engine's `vt[0x58/4]` virtual call (the muzzle-pos
+    // getter), not for the TLaser ctor.
+    //   1: muzzle_x (float)
+    //   2: muzzle_y (float)
+    //   3: DAT_00573e00 — const 0
+    //   4: DAT_00573e04 — const 0
+    //   5: aim_float — engine passes player+0x114 (cached aim angle)
+    //   6: owner (TPlayer*)
+    //   7: char flag — pass 0 (not 1) to enter the ctor's
+    //      `if (param_7 == 0) FUN_0040e7c0(+0xC4, 30)` branch. Without
+    //      that init, vt[22]'s render gate
+    //      (`DAT_00558b04 < FUN_004b00b0(+0xC4)`) never opens and the
+    //      beam-render call inside vt[22] never fires → invisible beam.
+    g_tlaser_ctor(obj, nullptr,
+                  x.i, y.i, 0, 0, ang.i,
+                  (int)(intptr_t)owner, 0);
+
+    // Engine post-ctor sequence — damage at +0xBC/+0xC0 + active flag.
+    *(int*)((char*)obj + 0xBC) = dmg;
+    *(int*)((char*)obj + 0xC0) = dmg;
+    *((unsigned char*)obj + 0x6D) = 1;
+
+    // Diag: register for lifetime tracking (receiver-side native spawn).
+    host_log("create_tlaser RECEIVER obj=%p id=%d initial_b8=%d",
+             obj, laser_dbg_id_for(obj), *(int*)((char*)obj + 0xB8));
+
+    // Call vt[22] once + register. Engine's per-tick keeps calling vt[22]
+    // (extends beam, makes it visible). Engine never auto-kills these
+    // (+0xC8 decrement-enable stays 0 — same as firer's own lasers, but
+    // somehow firer's get cleaned up by a path we haven't identified).
+    // Lua side schedules a delayed mark_laser_dead via the returned
+    // pointer to clean up after the visual has rendered for a few frames.
+    void** vt = *(void***)obj;
+    if (vt && !IsBadReadPtr(vt + 22, 4)) {
+        EntityVtFn fire = (EntityVtFn)vt[22];
+        if (fire) fire(obj);
+    }
+    g_register(obj, L);
+    // g_register pushed a {pointer=,objtype=} table onto the Lua stack.
+    // Lua side reads .pointer and schedules the kill.
+    return 1;
+}
+
+// Read the local fire button (LMB) state — Win32 GetAsyncKeyState on
+// VK_LBUTTON. Used by the firer-side laser on/off state machine to
+// detect press/release transitions independently of TLaser ctor cadence
+// (lasgun's natural fire rate is too slow to make per-shot replication
+// look continuous on the receiver).
+static int l_lmb_pressed(lua_State* L) {
+    SHORT s = GetAsyncKeyState(VK_LBUTTON);
+    api.pushboolean(L, (s & 0x8000) ? 1 : 0);
+    return 1;
+}
+
+// Refresh an existing TLaser by re-calling its vt[22] — updates the beam
+// endpoint from the current owner state without re-allocating. Used by
+// the receiver to keep a held laser pointing at the firer's current aim.
+static int l_refresh_tlaser(lua_State* L) {
+    void* obj = resolve_entity(L, 1);
+    if (!obj || IsBadReadPtr(obj, 4)) { api.pushboolean(L, 0); return 1; }
+    void** vt = *(void***)obj;
+    if (vt && !IsBadReadPtr(vt + 22, 4)) {
+        EntityVtFn fire = (EntityVtFn)vt[22];
+        if (fire) fire(obj);
+    }
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// Set the laser's "dead" flag (+0x2E) so the engine's cleanup sweep frees
+// it. Called from Lua via a delayed coroutine after the visual has had
+// time to render. Without this every TLaser persists forever (engine's
+// auto-decrement at vt[22] is gated on +0xC8 which is 0 by default).
+static int l_mark_laser_dead(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadWritePtr((char*)e + 0x2E, 1)) {
+        api.pushboolean(L, 0);
+        return 1;
+    }
+    *((unsigned char*)e + 0x2E) = 1;
+    api.pushboolean(L, 1);
+    return 1;
+}
 
 static int l_swap_bullet_subclass(lua_State* L) {
     typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
@@ -769,6 +1068,26 @@ static int l_install_hook_bullet(lua_State* L) {
     MH_STATUS es = MH_CreateHook(explCtor, (LPVOID)&hook_ExplodeCtor, (LPVOID*)&orig_ExplodeCtor);
     if (es == MH_OK) es = MH_EnableHook(explCtor);
     host_log("exploding bullet ctor hook: status=%d", es);
+    BYTE* laserCtor = (BYTE*)m + 0x97cd0;
+    MH_STATUS ls = MH_CreateHook(laserCtor, (LPVOID)&hook_LaserCtor, (LPVOID*)&orig_LaserCtor);
+    if (ls == MH_OK) ls = MH_EnableHook(laserCtor);
+    host_log("laser ctor hook: status=%d", ls);
+
+    // Body-NULL guard for FUN_004b2e30 — see hook_BodyAnimUpdate doc above.
+    BYTE* bau = (BYTE*)m + 0xb2e30;
+    MH_STATUS bs2 = MH_CreateHook(bau, (LPVOID)&hook_BodyAnimUpdate, (LPVOID*)&orig_BodyAnimUpdate);
+    if (bs2 == MH_OK) bs2 = MH_EnableHook(bau);
+    host_log("body-anim-update guard: status=%d", bs2);
+
+    // Diagnostic hooks for laser lifetime tracking.
+    BYTE* tick = (BYTE*)m + 0x98770;
+    MH_STATUS ts = MH_CreateHook(tick, (LPVOID)&hook_TLaserTick, (LPVOID*)&orig_TLaserTick);
+    if (ts == MH_OK) ts = MH_EnableHook(tick);
+    host_log("tlaser tick diag hook: status=%d", ts);
+    BYTE* mdead = (BYTE*)m + 0xe750;
+    MH_STATUS mds = MH_CreateHook(mdead, (LPVOID)&hook_MarkDead, (LPVOID*)&orig_MarkDead);
+    if (mds == MH_OK) mds = MH_EnableHook(mdead);
+    host_log("mark-dead diag hook: status=%d", mds);
 
     // Bomb activate hook re-enabled with safer reads (see hook body).
     BYTE* bomb = (BYTE*)m + 0x70aa0;
@@ -2496,6 +2815,14 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "consume_bullet");
     api.pushcclosure(L, l_swap_bullet_subclass, 0);
     api.setfield(L, -2, "swap_bullet_subclass");
+    api.pushcclosure(L, l_create_tlaser, 0);
+    api.setfield(L, -2, "create_tlaser");
+    api.pushcclosure(L, l_mark_laser_dead, 0);
+    api.setfield(L, -2, "mark_laser_dead");
+    api.pushcclosure(L, l_lmb_pressed, 0);
+    api.setfield(L, -2, "lmb_pressed");
+    api.pushcclosure(L, l_refresh_tlaser, 0);
+    api.setfield(L, -2, "refresh_tlaser");
     api.pushcclosure(L, l_kill_actor, 0);
     api.setfield(L, -2, "kill_actor");
     api.pushcclosure(L, l_apply_damage, 0);
