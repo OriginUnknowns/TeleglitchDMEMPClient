@@ -338,6 +338,10 @@ if type(menu) == "table" and type(menu.SetPage) == "function" then
         if type(name) ~= "string" then
             return orig_SetPage(name, ...)
         end
+        -- (Was redirecting mainmenu→mp_pause; left intact for callers
+        -- that still navigate via Lua. The ENGINE's pause overlay
+        -- bypasses SetPage entirely — pause UI is provided by injecting
+        -- MP roster info into the mainmenu page itself, below.)
         if name == "mainmenu" and mp.in_game and not mp._pause_bypass then
             name = "mp_pause"
         end
@@ -349,7 +353,6 @@ if type(menu) == "table" and type(menu.SetState) == "function" then
     local orig_SetState = menu.SetState
     menu.SetState = function(state, val, ...)
         if state == "game" and val == false and mp.in_game then
-            logf("SetState('game', false) in MP — pre-targeting mp_pause")
             pcall(function() menu.SetPage("mp_pause") end)
         end
         return orig_SetState(state, val, ...)
@@ -400,9 +403,52 @@ local function unpack_u32_be(s)
     return a * 0x1000000 + b * 0x10000 + c * 0x100 + d
 end
 
+-- ---- Wire body codec (1 flag byte + payload) ----
+-- The frame on the socket is still [u32 BE total-len][body]; `body` is now
+-- [1 flag][payload]. flag bit0=1 → payload is [u32 BE uncompressed-len][raw
+-- DEFLATE]; flag 0 → payload is raw JSON. The relay compresses the expensive
+-- server→client direction (compress-once, fan-out-many). The client only needs
+-- to DECOMPRESS (native puff via MP_NATIVE.mp_inflate) and always SENDS raw —
+-- client→server is cheap ingress and this avoids needing a native encoder.
+
+-- Can we decode compressed frames? Announced to the relay in `hello` so it only
+-- compresses toward capable clients (native-less clients still get raw frames).
+local function mp_can_inflate()
+    return (_G.MP_NATIVE and _G.MP_NATIVE.mp_inflate) and true or false
+end
+
+-- Encode a message to a wire body (always flag 0 = raw, client sends uncompressed).
+local function encode_body(msg)
+    return "\0" .. json.encode(msg)
+end
+
+-- Decode a wire body to a message table, or nil on any error (caller drops it).
+local function decode_body(body)
+    if not body or #body < 1 then return nil end
+    local flag = string.byte(body, 1)
+    local payload = string.sub(body, 2)
+    local json_str
+    if flag % 2 == 1 then                       -- bit0 set → compressed
+        if #payload < 4 then return nil end
+        local ulen = unpack_u32_be(string.sub(payload, 1, 4))
+        local deflated = string.sub(payload, 5)
+        if not (_G.MP_NATIVE and _G.MP_NATIVE.mp_inflate) then
+            logf("decode_body: compressed frame but no native inflate — dropping")
+            return nil
+        end
+        json_str = _G.MP_NATIVE.mp_inflate(deflated, ulen)
+        if not json_str then logf("decode_body: inflate failed (ulen=%d)", ulen); return nil end
+    else
+        json_str = payload
+    end
+    local ok, m = pcall(json.decode, json_str)
+    if not ok then logf("decode_body: json error: %s", tostring(m)); return nil end
+    return m
+end
+
 local function send_msg(msg)
     if not mp.sock then return end
-    local body = json.encode(msg)
+    local body = encode_body(msg)
     local frame = pack_u32_be(#body) .. body
     -- Non-blocking socket: partial sends require a loop. Critical guard:
     -- bound the loop iterations + abort on no-progress, otherwise a
@@ -452,12 +498,7 @@ local function try_recv_msg()
     if #mp.rx_buf < 4 + len then return nil end
     local body = string.sub(mp.rx_buf, 5, 4 + len)
     mp.rx_buf = string.sub(mp.rx_buf, 5 + len)
-    local ok, msg = pcall(json.decode, body)
-    if not ok then
-        logf("json decode error: %s", tostring(msg))
-        return nil
-    end
-    return msg
+    return decode_body(body)   -- handles flag byte + optional inflate; nil on error
 end
 
 -- ============ HELPERS ============
@@ -2748,7 +2789,7 @@ end
 -- Synchronous frame send/recv used during the handshake. After handshake
 -- completes, net_tick_loop owns the socket and parses frames asynchronously.
 local function _send_frame(sock, msg)
-    local body = json.encode(msg)
+    local body = encode_body(msg)
     return sock:send(pack_u32_be(#body) .. body)
 end
 local function _recv_frame(sock)
@@ -2757,8 +2798,8 @@ local function _recv_frame(sock)
     local body_len = unpack_u32_be(len_bytes)
     local body_str, e2 = sock:receive(body_len)
     if not body_str then return nil, e2 end
-    local ok, m = pcall(json.decode, body_str)
-    if not ok then return nil, "bad json" end
+    local m = decode_body(body_str)
+    if not m then return nil, "bad frame" end
     return m
 end
 -- Read until we get the message type we want. Other messages (room_list,
@@ -2847,7 +2888,7 @@ local function connect_and_handshake(proposed_seed)
     logf("hello_ack: client_id=%s", tostring(ack.client_id))
 
     -- Send our hello (just name now — no auto-session).
-    local ok2, err2 = _send_frame(sock, { type = "hello", name = config.name })
+    local ok2, err2 = _send_frame(sock, { type = "hello", name = config.name, compress = mp_can_inflate() })
     if not ok2 then sock:close(); return false, err2 end
 
     local is_host = proposed_seed ~= nil
@@ -2975,6 +3016,10 @@ local function net_tick_loop()
             -- MP_FRAME_TICK doesn't fire after begin_game. This coroutine
             -- IS resumed on every tick (Wait yields go through lua_resume).
             pcall(tick_death_intercept)
+            -- Refresh injected mainmenu roster labels in-game so they're
+            -- already up-to-date when the user pauses (MP_FRAME_TICK
+            -- doesn't fire during gameplay; this coroutine does).
+            if apply_pause_labels then pcall(apply_pause_labels) end
             local now = socket.gettime()
             if mp.sock and now - mp.last_send >= send_interval then
                 local pl = player.GetPlayer()
@@ -3867,6 +3912,11 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_leaves_lobby then
             pcall(function() _G.MP_NATIVE.set_esc_leaves_lobby(false) end)
         end
+        -- (Was arming a native ESC swallow + Lua-side mp_pause swap.
+        -- Engine pause is a C++ overlay that ignores Lua menu state, so
+        -- this had no effect. Pause UI now lives as injected MP roster
+        -- buttons on the mainmenu page itself — kicks in automatically
+        -- when engine pauses and renders mainmenu.)
         -- Just clear our own force flag. The Lua-side puppet / mob /
         -- item maps are reset by the level.Clear wrap that level.StartFrom
         -- below invokes internally — re-clearing them here would race
@@ -4072,8 +4122,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             local body = mp.sock:receive(body_len)
             mp.sock:settimeout(0)
             if not body then break end
-            local ok, msg = pcall(json.decode, body)
-            if ok and msg then
+            local msg = decode_body(body)   -- flag byte + optional inflate
+            if msg then
                 drained = drained + 1
                 local lh = lobby_handlers[msg.type]
                 if lh then
@@ -4109,7 +4159,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         local ack = _recv_frame(sock)
         if not ack or ack.type ~= "hello_ack" then sock:close(); logf("Create: no hello_ack"); return end
         mp.my_id = ack.client_id
-        _send_frame(sock, { type = "hello", name = config.name })
+        _send_frame(sock, { type = "hello", name = config.name, compress = mp_can_inflate() })
         -- Create the room and wait for welcome.
         local room_name = (config.name or "Player") .. "'s Game"
         _send_frame(sock, { type = "create_room", name = room_name, seed = 1779843477 })
@@ -4140,7 +4190,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         local ack = _recv_frame(sock)
         if not ack or ack.type ~= "hello_ack" then sock:close(); return nil, "no hello_ack" end
         mp.my_id = ack.client_id
-        _send_frame(sock, { type = "hello", name = config.name })
+        _send_frame(sock, { type = "hello", name = config.name, compress = mp_can_inflate() })
         return sock
     end
 
@@ -4333,6 +4383,9 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.last_laser_t = nil
         mp.laser_was_held = false
         disarm_esc_leaves_lobby()
+        if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_opens_mp_pause then
+            pcall(function() _G.MP_NATIVE.set_esc_opens_mp_pause(false) end)
+        end
         menu.SetPage("mp_lobby")
     end
 
@@ -4614,15 +4667,24 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                  tostring(mp.in_game), tostring(mp.sock ~= nil),
                  tostring(mp.game_started_pending), tostring(mp.is_dead), hp_val)
         end
-        -- ESC pressed in the lobby waiting room → leave the room.
-        -- (Native hook latches the keypress + swallows the event; we
-        -- run the action here in safe Lua context.)
+        -- ESC dispatch — single g_esc_pressed latch in the native, two
+        -- consumer sites here based on current state:
+        --   * in_game        → swap to mp_pause + pause engine (game=false)
+        --   * waiting/lobby  → leave the room
+        -- Both upstream flags (set_esc_opens_mp_pause / set_esc_leaves_lobby)
+        -- share the same swallow path so the engine never sees the ESC.
         if _G.MP_NATIVE and _G.MP_NATIVE.check_esc_pressed then
             local was = false
             pcall(function() was = _G.MP_NATIVE.check_esc_pressed() end)
             if was then
-                logf("ESC in waiting room — calling lobby_leave_room")
-                pcall(lobby_leave_room)
+                if mp.in_game then
+                    logf("ESC in MP game — opening mp_pause")
+                    pcall(function() menu.SetPage("mp_pause") end)
+                    pcall(function() menu.SetState("game", false) end)
+                else
+                    logf("ESC in waiting room — calling lobby_leave_room")
+                    pcall(lobby_leave_room)
+                end
             end
         end
 
@@ -4802,6 +4864,10 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             -- On mp_kicked, ESC quits Teleglitch (same as clicking OK).
             if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_quits then
                 pcall(function() _G.MP_NATIVE.set_esc_quits(true) end)
+            end
+            -- Disarm the in-game ESC intercept — we're leaving MP.
+            if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_opens_mp_pause then
+                pcall(function() _G.MP_NATIVE.set_esc_opens_mp_pause(false) end)
             end
             if _G.MP_NATIVE and _G.MP_NATIVE.inject_esc then
                 pcall(function() _G.MP_NATIVE.inject_esc() end)
@@ -5049,6 +5115,27 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 end
             end
         end
+        -- Mirror the roster into the mainmenu page's injected slots so
+        -- the engine's pause overlay (which renders mainmenu directly)
+        -- shows the MP player list. Outside MP we leave them blank.
+        if mp.mainmenu_roster_btns then
+            for i = 1, 4 do
+                local btn = mp.mainmenu_roster_btns[i]
+                local p   = roster[i]
+                if btn and btn.pointer then
+                    local label = ""
+                    if mp.in_game and p then
+                        local nm = tostring(p.name or "?")
+                        local suffix = (p.is_host and "*" or "") .. (p.self and "(me)" or "")
+                        local prefix = i .. ":"
+                        local max_name = 15 - #prefix - #suffix
+                        if max_name < 1 then max_name = 1 end
+                        label = prefix .. nm:sub(1, max_name) .. suffix
+                    end
+                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, label) end)
+                end
+            end
+        end
     end
 
     -- Concrete implementation of the forward-declared apply_waiting_labels.
@@ -5096,6 +5183,25 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             local label = mp.is_host and "Start Game" or "Wait for host"
             pcall(function() _G.MP_NATIVE.set_button_label(mp.lobby_start_btn.pointer, label) end)
         end
+    end
+
+    -- ------------------------------------------------------------------
+    -- In-game pause roster injected into mainmenu.
+    -- The engine's pause overlay renders the mainmenu page directly
+    -- (bypassing menu.SetPage), so we can't swap to mp_pause via Lua.
+    -- Instead, add 4 player-slot buttons to the right column of
+    -- mainmenu. Labels are blank outside MP, and updated each tick to
+    -- show the roster while in_game. apply_pause_labels (which already
+    -- runs at MP_FRAME_TICK rate) writes into these too.
+    -- Positions: right column at x=144, rows below the Multiplayer btn.
+    -- ------------------------------------------------------------------
+    mp.mainmenu_roster_btns = {}
+    for i = 1, 4 do
+        local y = 126 + (i - 1) * 14
+        local b = mainmenu_page:AddButton(144, y, "",
+            "MP player slot",
+            function() end)
+        mp.mainmenu_roster_btns[i] = b
     end
 
     -- ------------------------------------------------------------------

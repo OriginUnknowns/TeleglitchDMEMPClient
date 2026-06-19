@@ -18,6 +18,7 @@ Push-Location $PSScriptRoot
 try {
     $sources = @(
         "main.cpp",
+        "puff\puff.c",
         "minhook\hook.c",
         "minhook\buffer.c",
         "minhook\trampoline.c",

@@ -24,7 +24,9 @@
 #include <math.h>
 #include "lua52_min.h"
 #include "include/MinHook.h"
+#include "puff/puff.h"   // Mark Adler's raw-DEFLATE reference inflate (zlib license)
 #include <set>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // Modloader host API exposed to native mods. Versioned so we can extend.
@@ -2470,6 +2472,12 @@ static volatile bool g_esc_quits = false;
 // swallowed). The Lua tick polls this from check_esc_pressed() and
 // runs the lobby-leave action when on mp_waiting.
 static volatile bool g_esc_leaves_lobby = false;
+// When true, ESC keydown is swallowed and g_esc_pressed latched, same as
+// g_esc_leaves_lobby but armed during in-game MP. Engine never sees the
+// ESC, so its vanilla pause overlay can't appear — Lua tick instead
+// flips menu state to "game=false" and switches the active page to
+// mp_pause, giving us a single canonical MP pause UI.
+static volatile bool g_esc_opens_mp_pause = false;
 static volatile bool g_esc_pressed      = false;
 // Low-level keyboard hook handle. Required because Teleglitch reads
 // keyboard via DirectInput / GetAsyncKeyState — its key events never
@@ -2534,9 +2542,10 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
                 lpMsg->message = WM_NULL;
                 lpMsg->wParam  = 0;
                 lpMsg->lParam  = 0;
-            } else if (g_esc_leaves_lobby) {
-                // Note the ESC for the Lua tick to consume and act on
-                // (it'll call lobby_leave_room when on mp_waiting).
+            } else if (g_esc_leaves_lobby || g_esc_opens_mp_pause) {
+                // Note the ESC for the Lua tick to consume and act on:
+                //   leaves_lobby → call lobby_leave_room
+                //   opens_mp_pause → SetPage(mp_pause) + SetState(game,false)
                 if (lpMsg->message == WM_KEYDOWN) g_esc_pressed = true;
                 lpMsg->message = WM_NULL;
                 lpMsg->wParam  = 0;
@@ -2697,7 +2706,7 @@ static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
                     PostMessageA(own, WM_CLOSE, 0, 0);
                     return 1;
                 }
-                if (g_esc_leaves_lobby) {
+                if (g_esc_leaves_lobby || g_esc_opens_mp_pause) {
                     g_esc_pressed = true;
                     return 1;
                 }
@@ -2842,6 +2851,68 @@ static int l_consume_chat_key(lua_State* L) {
         lua_pushnumber_p = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
     }
     lua_pushnumber_p(L, (double)c);
+    return 1;
+}
+
+// mp_inflate(deflated_bytes, uncompressed_len) -> string | nil
+// Raw-DEFLATE decompress (matches Node's zlib.deflateRaw on the relay). The
+// caller passes the exact uncompressed length (the relay prefixes it on the
+// wire) so we allocate once — no dynamic growth. Returns nil on any error so
+// the Lua side can drop the frame instead of crashing. Bounded to 16 MB to
+// stop a malformed/hostile frame from exhausting memory.
+#define MP_INFLATE_MAX (16u * 1024u * 1024u)
+static int l_mp_inflate(lua_State* L) {
+    typedef int (*LuaToIntegerFn)(lua_State*, int, int*);
+    typedef void (*LuaPushLStringFn)(lua_State*, const char*, size_t);
+    static LuaToIntegerFn   lua_tointeger_p  = nullptr;
+    static LuaPushLStringFn lua_pushlstring_p = nullptr;
+    if (!lua_tointeger_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tointeger_p   = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+        lua_pushlstring_p = (LuaPushLStringFn)GetProcAddress(lm, "lua_pushlstring");
+    }
+    if (!lua_tointeger_p || !lua_pushlstring_p) { api.pushnil(L); return 1; }
+
+    size_t srclen = 0;
+    const char* src = api.tolstring(L, 1, &srclen);
+    long ulen_signed = lua_tointeger_p(L, 2, nullptr);
+    if (!src || ulen_signed < 0 || (unsigned long)ulen_signed > MP_INFLATE_MAX) {
+        api.pushnil(L); return 1;
+    }
+    unsigned long ulen = (unsigned long)ulen_signed;
+    if (ulen == 0) { lua_pushlstring_p(L, "", 0); return 1; }
+
+    unsigned char* dest = (unsigned char*)malloc(ulen);
+    if (!dest) { api.pushnil(L); return 1; }
+    unsigned long destlen = ulen;        // available space (in) / written (out)
+    unsigned long sourcelen = (unsigned long)srclen;
+    int r = puff(dest, &destlen, (const unsigned char*)src, &sourcelen);
+    if (r == 0 && destlen == ulen) {
+        lua_pushlstring_p(L, (const char*)dest, destlen);
+    } else {
+        host_log("mp_inflate: puff failed r=%d destlen=%lu ulen=%lu srclen=%lu",
+                 r, destlen, ulen, (unsigned long)srclen);
+        api.pushnil(L);
+    }
+    free(dest);
+    return 1;
+}
+
+// set_esc_opens_mp_pause(bool) — armed by Lua during in-game MP. Same
+// swallow + latch as g_esc_leaves_lobby; the Lua tick dispatches on
+// mp.in_game to open mp_pause instead of leaving the lobby.
+static int l_set_esc_opens_mp_pause(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 0;
+    g_esc_opens_mp_pause = (on != 0);
+    if (!g_esc_opens_mp_pause && !g_esc_leaves_lobby) g_esc_pressed = false;
+    host_log("set_esc_opens_mp_pause(%d)", g_esc_opens_mp_pause ? 1 : 0);
+    api.pushboolean(L, 1);
     return 1;
 }
 
@@ -3045,12 +3116,16 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_esc_quits");
     api.pushcclosure(L, l_set_esc_leaves_lobby, 0);
     api.setfield(L, -2, "set_esc_leaves_lobby");
+    api.pushcclosure(L, l_set_esc_opens_mp_pause, 0);
+    api.setfield(L, -2, "set_esc_opens_mp_pause");
     api.pushcclosure(L, l_check_esc_pressed, 0);
     api.setfield(L, -2, "check_esc_pressed");
     api.pushcclosure(L, l_set_chat_capture, 0);
     api.setfield(L, -2, "set_chat_capture");
     api.pushcclosure(L, l_consume_chat_key, 0);
     api.setfield(L, -2, "consume_chat_key");
+    api.pushcclosure(L, l_mp_inflate, 0);
+    api.setfield(L, -2, "mp_inflate");
     return 1;  // return the table
 }
 
