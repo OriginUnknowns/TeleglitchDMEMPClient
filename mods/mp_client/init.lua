@@ -2354,15 +2354,12 @@ local function handle_bullet_fire(msg)
         end
         -- Track one active laser per peer. The first bullet_fire of a
         -- fire-stream spawns it; subsequent laser_keepalive messages
-        -- refresh it; laser_end (or a 0.5s grace timeout for stragglers)
-        -- kills it. Per-shot spawn-then-kill never matched the firer's
-        -- continuous look because lasgun fires 1-3 Hz — gaps too big.
+        -- refresh it; laser_end kills it. A stale-timeout coroutine
+        -- guards against the firer dropping a press+release within one
+        -- net-tick poll (no laser_end sent → laser would leak forever).
         mp.peer_lasers = mp.peer_lasers or {}
         local existing = mp.peer_lasers[msg.from]
         if existing and existing.obj and existing.obj.pointer then
-            -- Refresh existing laser instead of spawning new (avoids
-            -- visual stacking). vt[22] re-runs with owner's current
-            -- state, extending beam in updated aim direction.
             pcall(function() _G.MP_NATIVE.refresh_tlaser(existing.obj.pointer) end)
             existing.last_t = socket.gettime()
         else
@@ -2373,9 +2370,30 @@ local function handle_bullet_fire(msg)
                 if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
             end)
             if laser_obj and laser_obj.pointer then
-                mp.peer_lasers[msg.from] = {
-                    obj = laser_obj, last_t = socket.gettime(),
-                }
+                local entry = { obj = laser_obj, last_t = socket.gettime() }
+                mp.peer_lasers[msg.from] = entry
+                -- Stale-watcher: poll last_t every 50ms; if no refresh
+                -- for >200ms, kill the laser. This catches the firer
+                -- press+release-in-one-tick case where no laser_end ever
+                -- arrives. Keepalives bump last_t naturally.
+                local from_id = msg.from
+                local co = coroutine.create(function()
+                    pcall(function()
+                        while true do
+                            Wait(0.05)
+                            local cur = mp.peer_lasers and mp.peer_lasers[from_id]
+                            if cur ~= entry then return end  -- replaced or cleared
+                            if (socket.gettime() - cur.last_t) > 0.2 then
+                                if _G.MP_NATIVE.mark_laser_dead and cur.obj and cur.obj.pointer then
+                                    _G.MP_NATIVE.mark_laser_dead(cur.obj.pointer)
+                                end
+                                mp.peer_lasers[from_id] = nil
+                                return
+                            end
+                        end
+                    end)
+                end)
+                coroutine.resume(co)
             end
         end
         logf("bullet_fire: TLaser native spawn pos=(%.2f,%.2f) ang=%.3f dmg=%d",
@@ -2593,6 +2611,27 @@ local function handle_laser_end(msg)
     mp.peer_lasers[msg.from] = nil
 end
 
+-- ============ NETWORKED CHAT (state) ============
+-- Press T or Y in-game to open the chat box. While open, the native bridge
+-- (MP_NATIVE.set_chat_capture) makes kbd_ll_proc swallow ALL keyboard input,
+-- so the player can't move/shoot/use items while typing — see
+-- modloader/dllhost/main.cpp. Typed keys are drained via consume_chat_key().
+-- Only the state table lives here so the handlers table can route the "chat"
+-- message; the logic (chat.tick/render/send/...) is defined further down,
+-- after kp(), so it can poll the T/Y open keys.
+local chat = {
+    open       = false,
+    buffer     = "",
+    history    = {},    -- { {name=, text=, t=}, ... } oldest first
+    text_objs  = {},
+    text_cache = {},
+    MAX_LEN    = 100,   -- max chars typed per message
+    HISTORY_N  = 6,     -- messages retained on screen
+    FADE_SECS  = 9,     -- seconds a message stays visible after the box closes
+    LINE_DY    = 0.32,  -- world-units between rows
+    TOP_OFFSET = -1.5,  -- world-units from the player to the newest (bottom) row
+}
+
 local handlers = {
     welcome = handle_welcome,
     join = function(m) handle_join(m) end,
@@ -2608,6 +2647,7 @@ local handlers = {
     laser_keepalive = handle_laser_keepalive,
     laser_end = handle_laser_end,
     melee = handle_melee,
+    chat = function(m) chat.handle(m) end,
     item_picked = handle_item_picked,
     item_list = handle_item_list,
     container_list = handle_container_list,
@@ -3404,6 +3444,158 @@ local function kp(name)
     return ok and r == true
 end
 
+-- ============ NETWORKED CHAT (logic) ============
+-- State table `chat` is declared up by the handlers section. These functions
+-- live here so chat.tick can poll the T/Y open keys via kp(). Rendering reuses
+-- the dev menu's CreateTextObj cache pattern (recreate a line only when its
+-- text changes; reposition every frame so it follows the player).
+function chat.push(name, text)
+    table.insert(chat.history, { name = name or "?", text = text or "", t = socket.gettime() })
+    while #chat.history > chat.HISTORY_N do table.remove(chat.history, 1) end
+end
+
+function chat.handle(msg)
+    if not msg or type(msg.text) ~= "string" then return end
+    local name = (type(msg.name) == "string" and msg.name ~= "") and msg.name or "?"
+    chat.push(name, msg.text)
+    logf("chat: <%s> %s", name, msg.text)
+end
+
+function chat.clear_lines()
+    for _, t in ipairs(chat.text_objs) do
+        if t then pcall(function() t:Delete() end) end
+    end
+    chat.text_objs  = {}
+    chat.text_cache = {}
+end
+
+function chat.build_lines()
+    local lines = {}
+    local now = socket.gettime()
+    -- Always fade by age — opening the box must NOT resurrect old messages.
+    for _, h in ipairs(chat.history) do
+        if (now - h.t) < chat.FADE_SECS then
+            lines[#lines + 1] = h.name .. ": " .. h.text
+        end
+    end
+    if chat.open then
+        lines[#lines + 1] = "say> " .. chat.buffer .. "_"
+    end
+    return lines
+end
+
+function chat.render()
+    if not (level and level.IsLoaded and level.IsLoaded()) then
+        if #chat.text_objs > 0 then chat.clear_lines() end
+        return
+    end
+    local pl = player.GetPlayer()
+    if not pl then return end
+    local px, py = pl:GetPosition()
+    local lines = chat.build_lines()
+    if #lines == 0 then
+        if #chat.text_objs > 0 then chat.clear_lines() end
+        return
+    end
+    -- Newest line (input line) sits at TOP_OFFSET; older lines stack above it.
+    local function row_y(i, n) return py + chat.TOP_OFFSET + (n - i) * chat.LINE_DY end
+    while #chat.text_objs < #lines do
+        local idx = #chat.text_objs + 1
+        local obj
+        pcall(function() obj = CreateTextObj(px, row_y(idx, #lines), lines[idx]) end)
+        table.insert(chat.text_objs, obj)
+        table.insert(chat.text_cache, lines[idx])
+    end
+    while #chat.text_objs > #lines do
+        local last = table.remove(chat.text_objs)
+        table.remove(chat.text_cache)
+        if last then pcall(function() last:Delete() end) end
+    end
+    for i, txt in ipairs(lines) do
+        local ty  = row_y(i, #lines)
+        local obj = chat.text_objs[i]
+        if chat.text_cache[i] ~= txt then
+            if obj then pcall(function() obj:Delete() end) end
+            local newobj
+            pcall(function() newobj = CreateTextObj(px, ty, txt) end)
+            chat.text_objs[i]  = newobj
+            chat.text_cache[i] = txt
+        elseif obj then
+            pcall(function() obj:SetPosition(px, ty) end)
+        end
+    end
+end
+
+function chat.set_capture(on)
+    if _G.MP_NATIVE and _G.MP_NATIVE.set_chat_capture then
+        pcall(function() _G.MP_NATIVE.set_chat_capture(on) end)
+    end
+end
+
+-- Chat is only usable when connected to a room AND in a loaded level.
+function chat.available()
+    if not (mp.sock and level and level.IsLoaded and level.IsLoaded()) then return false end
+    return true
+end
+
+function chat.open_box()
+    if chat.open then return end
+    chat.open   = true
+    chat.buffer = ""
+    chat.set_capture(true)
+    logf("chat: opened")
+end
+
+function chat.close_box()
+    if not chat.open then return end
+    chat.open   = false
+    chat.buffer = ""
+    chat.set_capture(false)
+    logf("chat: closed")
+end
+
+function chat.send()
+    local txt = chat.buffer:gsub("^%s+", ""):gsub("%s+$", "")
+    chat.close_box()
+    if txt == "" then return end
+    if mp.sock then
+        send_msg({ type = "chat", text = txt })
+        chat.push(config.name or "me", txt)   -- echo our own message locally
+        logf("chat: sent '%s'", txt)
+    end
+end
+
+function chat.tick()
+    if chat.open then
+        -- Drain typed keys from the native ring (the engine sees none of these).
+        if _G.MP_NATIVE and _G.MP_NATIVE.consume_chat_key then
+            for _ = 1, 64 do
+                local c = _G.MP_NATIVE.consume_chat_key()
+                if not c or c == 0 then break end
+                c = math.floor(c)
+                if c == 13 then          -- Enter -> send + close
+                    chat.send()
+                    break
+                elseif c == 27 then      -- Escape -> cancel
+                    chat.close_box()
+                    break
+                elseif c == 8 then       -- Backspace
+                    chat.buffer = chat.buffer:sub(1, -2)
+                elseif c >= 32 and c <= 126 then
+                    if #chat.buffer < chat.MAX_LEN then
+                        chat.buffer = chat.buffer .. string.char(c)
+                    end
+                end
+            end
+        end
+        -- Lost the connection / left the level while typing → release input.
+        if not chat.available() then chat.close_box() end
+    elseif chat.available() and (kp("t") or kp("y")) then
+        chat.open_box()
+    end
+    chat.render()
+end
+
 -- Manual "pick up nearest tracked item" — bypasses engine pickup so we can
 -- exercise the network path while we figure out a real pickup-detection mechanism.
 -- Works on BOTH host and joiner. Bound to Numpad -.
@@ -3433,6 +3625,9 @@ end
 
 -- Key names from lua/keys.lua — keypad +, arrow up/down, return/kp_enter.
 local function dev_menu_tick()
+    -- Networked chat: poll T/Y to open, drain typed keys, render. Wrapped in
+    -- pcall so a chat error never blocks the bullet/hit draining below.
+    pcall(chat.tick)
     -- Drain native hit events and forward to host as mob_damage. Each event
     -- is a c-side entity address; we match against our local puppet pointers
     -- to find the mp mob id. Deduplicate via a short cooldown per id.
@@ -3480,15 +3675,14 @@ local function dev_menu_tick()
         -- laser_keepalive at 10Hz with current muzzle + aim. Receiver
         -- maintains a single persistent TLaser and refreshes it on each
         -- keepalive. On LMB release, broadcast laser_end → receiver kills.
-        if _G.MP_NATIVE and _G.MP_NATIVE.lmb_pressed and mp.sock then
+        if _G.MP_NATIVE and _G.MP_NATIVE.lmb_state and mp.sock then
             local now = socket.gettime()
-            local lmb = _G.MP_NATIVE.lmb_pressed()
+            local lmb_now, lmb_transitioned = _G.MP_NATIVE.lmb_state()
             -- Tight window: 200ms (vs old 500). If reloading or out of
             -- ammo, no new laser ctor fires → window expires within 200ms
-            -- → we treat the laser as ended and broadcast laser_end so
-            -- the receiver kills its beam even though LMB is still held.
+            -- → we treat the laser as ended.
             local recent_laser = (now - (mp.last_laser_t or 0)) < 0.2
-            local should_be_active = lmb and recent_laser
+            local should_be_active = lmb_now and recent_laser
             local pl_for_aim = player.GetPlayer()
             if should_be_active and pl_for_aim then
                 if (now - (mp.last_laser_keepalive_t or 0)) > 0.1 then
@@ -3500,10 +3694,16 @@ local function dev_menu_tick()
                 end
                 mp.laser_was_held = true
             elseif mp.laser_was_held and not should_be_active then
-                -- Transition active→inactive — either LMB released OR
-                -- ammo ran out / reload kicked in (no recent ctor).
                 send_msg({ type = "laser_end", from = mp.my_id })
                 mp.laser_was_held = false
+            elseif (not mp.laser_was_held) and lmb_transitioned and not lmb_now and recent_laser then
+                -- The "press+release between polls" case: GetAsyncKeyState
+                -- low bit caught a press cycle we never saw at high bit.
+                -- A laser shot just fired (recent_laser); we never marked
+                -- ourselves as held, so the normal active→inactive branch
+                -- above won't fire — but we still need to tell the
+                -- receiver to end the beam right away.
+                send_msg({ type = "laser_end", from = mp.my_id })
             end
         end
         -- Drain bomb activation events from the native hook. Hook captures

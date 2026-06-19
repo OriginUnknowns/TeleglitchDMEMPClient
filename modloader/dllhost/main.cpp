@@ -601,7 +601,20 @@ static int l_create_tlaser(lua_State* L) {
                   x.i, y.i, 0, 0, ang.i,
                   (int)(intptr_t)owner, 0);
 
-    // Engine post-ctor sequence — damage at +0xBC/+0xC0 + active flag.
+    // Engine post-ctor sequence. Two damage-related field sets:
+    //   +0xB0 (float): bullet damage read by FUN_0044dd70, called from
+    //                  TActor/TPlayer vt[29] (the dispatch for bullet
+    //                  category 0x100 = laser). TPlayer + TActor share
+    //                  this vt[29] — both read +0xB0 and call vt[24]
+    //                  TakeDamage with it. Without this write, players
+    //                  take garbage/0 damage.
+    //   +0xBC/+0xC0:   direction vector vt[22]'s raycast reads. Must
+    //                  stay as ints the engine writes (writing damage
+    //                  here broke the visual entirely — vt[22] reads
+    //                  it as a 2-float direction).
+    union { int i; float f; } dmgf;
+    dmgf.f = (float)dmg;
+    *(int*)((char*)obj + 0xB0) = dmgf.i;
     *(int*)((char*)obj + 0xBC) = dmg;
     *(int*)((char*)obj + 0xC0) = dmg;
     *((unsigned char*)obj + 0x6D) = 1;
@@ -636,6 +649,19 @@ static int l_lmb_pressed(lua_State* L) {
     SHORT s = GetAsyncKeyState(VK_LBUTTON);
     api.pushboolean(L, (s & 0x8000) ? 1 : 0);
     return 1;
+}
+
+// Returns two values: current_down (high bit), transitioned_since_last
+// (low bit — set if LMB was pressed at any point between this call and
+// the previous one, even if released before the call returned). Used by
+// the firer-side laser on/off state machine to detect press+release
+// cycles that happen between net-tick polls (otherwise the receiver's
+// laser would stick on for the stale-watcher's full timeout).
+static int l_lmb_state(lua_State* L) {
+    SHORT s = GetAsyncKeyState(VK_LBUTTON);
+    api.pushboolean(L, (s & 0x8000) ? 1 : 0);
+    api.pushboolean(L, (s & 0x0001) ? 1 : 0);
+    return 2;
 }
 
 // Refresh an existing TLaser by re-calling its vt[22] — updates the beam
@@ -2569,6 +2595,71 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
     return r;
 }
 
+// ============ NETWORKED CHAT — key capture ============
+// When g_chat_capture is true, kbd_ll_proc translates keydowns to ASCII,
+// pushes them into g_chat_ring, and SWALLOWS every key (returns 1) so the
+// engine's DirectInput / GetAsyncKeyState never sees them — the player can't
+// move / shoot / use items while the chat box is open ("blocks input"). The
+// Lua frame tick drains the ring via consume_chat_key() and builds the typed
+// string. Mirrors the g_bullet_ring single-producer/single-consumer pattern.
+// NO Lua calls happen in the hook (it runs on an input-dispatch thread) — per
+// the thread-safety rule, only flags + ring writes here; Lua drains on the
+// main thread.
+static volatile bool g_chat_capture = false;
+// Shift state tracked in-hook: we can't trust GetAsyncKeyState for a key we
+// may be swallowing, so we watch the L/R shift up/down ourselves.
+static bool g_chat_shift = false;
+#define CHAT_RING_SIZE 256
+static int g_chat_ring[CHAT_RING_SIZE] = {0};
+static volatile int g_chat_write_idx = 0;
+static int g_chat_read_idx = 0;
+
+static void chat_ring_push(int code) {
+    int idx = g_chat_write_idx % CHAT_RING_SIZE;
+    g_chat_ring[idx] = code;
+    g_chat_write_idx++;
+}
+
+// US-layout virtual-key -> ASCII. Returns 0 for keys we don't type (the hook
+// still swallows them). Control keys map to their ASCII control codes so the
+// Lua side can branch: Enter=13 (send), Backspace=8 (delete), Escape=27
+// (cancel).
+static int chat_vk_to_ascii(DWORD vk, bool shift, bool caps) {
+    if (vk >= 'A' && vk <= 'Z') {
+        bool upper = (shift != caps);  // XOR: shift OR caps, not both
+        return upper ? (int)vk : (int)(vk - 'A' + 'a');
+    }
+    if (vk >= '0' && vk <= '9') {
+        if (!shift) return (int)vk;
+        static const char* sym = ")!@#$%^&*(";  // 0..9 shifted (US)
+        return (int)sym[vk - '0'];
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return (int)('0' + (vk - VK_NUMPAD0));
+    switch (vk) {
+        case VK_SPACE:     return ' ';
+        case VK_RETURN:    return 13;   // send
+        case VK_BACK:      return 8;    // backspace
+        case VK_ESCAPE:    return 27;   // cancel
+        case VK_OEM_1:     return shift ? ':' : ';';
+        case VK_OEM_PLUS:  return shift ? '+' : '=';
+        case VK_OEM_COMMA: return shift ? '<' : ',';
+        case VK_OEM_MINUS: return shift ? '_' : '-';
+        case VK_OEM_PERIOD:return shift ? '>' : '.';
+        case VK_OEM_2:     return shift ? '?' : '/';
+        case VK_OEM_3:     return shift ? '~' : '`';
+        case VK_OEM_4:     return shift ? '{' : '[';
+        case VK_OEM_5:     return shift ? '|' : '\\';
+        case VK_OEM_6:     return shift ? '}' : ']';
+        case VK_OEM_7:     return shift ? '"' : '\'';
+        case VK_DECIMAL:   return '.';
+        case VK_MULTIPLY:  return '*';
+        case VK_ADD:       return '+';
+        case VK_SUBTRACT:  return '-';
+        case VK_DIVIDE:    return '/';
+    }
+    return 0;
+}
+
 // Low-level keyboard hook. Per MSDN this must return quickly (within
 // the LowLevelHooksTimeout) or Windows silently unhooks us. The
 // callback also runs on whatever thread posted the key event, so any
@@ -2577,6 +2668,26 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
 static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+        // Chat capture takes priority: while the chat box is open we swallow
+        // EVERY key so the engine sees no input, and record typed chars. Only
+        // active when our window is foreground (don't eat keys after alt-tab).
+        if (g_chat_capture && p) {
+            HWND fg = GetForegroundWindow();
+            if (g_our_hwnd && fg == g_our_hwnd) {
+                bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+                bool up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+                DWORD vk  = p->vkCode;
+                if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
+                    if (down) g_chat_shift = true;
+                    else if (up) g_chat_shift = false;
+                } else if (down) {
+                    bool caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
+                    int c = chat_vk_to_ascii(vk, g_chat_shift, caps);
+                    if (c) chat_ring_push(c);
+                }
+                return 1;  // block the engine from seeing any key while typing
+            }
+        }
         if (p && p->vkCode == VK_ESCAPE &&
             (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
             HWND fg  = GetForegroundWindow();
@@ -2694,6 +2805,43 @@ static int l_check_esc_pressed(lua_State* L) {
     if (was) host_log("check_esc_pressed -> TRUE (leaves_lobby=%d quits=%d suppress=%d)",
                       g_esc_leaves_lobby ? 1 : 0, g_esc_quits ? 1 : 0, g_suppress_esc ? 1 : 0);
     api.pushboolean(L, was ? 1 : 0);
+    return 1;
+}
+
+// set_chat_capture(bool) — arm/disarm chat key capture. While armed,
+// kbd_ll_proc swallows all keys (engine sees no input) and records typed
+// chars into g_chat_ring. On arm we discard any stray queued keys and reset
+// shift so the box starts clean.
+static int l_set_chat_capture(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    int on = lua_toboolean_p ? lua_toboolean_p(L, 1) : 0;
+    g_chat_capture = (on != 0);
+    if (g_chat_capture) {
+        g_chat_read_idx = g_chat_write_idx;  // drop anything queued before open
+        g_chat_shift = false;
+    }
+    host_log("set_chat_capture(%d)", g_chat_capture ? 1 : 0);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// consume_chat_key() — drain one captured key. Returns the ASCII/control code
+// as a number, or nil when the ring is empty. The Lua tick loops until nil.
+static int l_consume_chat_key(lua_State* L) {
+    if (g_chat_read_idx >= g_chat_write_idx) { api.pushnil(L); return 1; }
+    int c = g_chat_ring[g_chat_read_idx % CHAT_RING_SIZE];
+    g_chat_read_idx++;
+    static LuaPushNumberFn lua_pushnumber_p = nullptr;
+    if (!lua_pushnumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_pushnumber_p = (LuaPushNumberFn)GetProcAddress(lm, "lua_pushnumber");
+    }
+    lua_pushnumber_p(L, (double)c);
     return 1;
 }
 
@@ -2821,6 +2969,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "mark_laser_dead");
     api.pushcclosure(L, l_lmb_pressed, 0);
     api.setfield(L, -2, "lmb_pressed");
+    api.pushcclosure(L, l_lmb_state, 0);
+    api.setfield(L, -2, "lmb_state");
     api.pushcclosure(L, l_refresh_tlaser, 0);
     api.setfield(L, -2, "refresh_tlaser");
     api.pushcclosure(L, l_kill_actor, 0);
@@ -2897,6 +3047,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_esc_leaves_lobby");
     api.pushcclosure(L, l_check_esc_pressed, 0);
     api.setfield(L, -2, "check_esc_pressed");
+    api.pushcclosure(L, l_set_chat_capture, 0);
+    api.setfield(L, -2, "set_chat_capture");
+    api.pushcclosure(L, l_consume_chat_key, 0);
+    api.setfield(L, -2, "consume_chat_key");
     return 1;  // return the table
 }
 

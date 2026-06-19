@@ -1,5 +1,42 @@
 # Known Issues
 
+## 🟡 Networked TLaser does almost no damage (2026-06-19)
+
+Lasgun fired through the on/off replication protocol does ~0.2hp per
+shot instead of the engine's 16hp. One clip = ~3hp instead of ~240hp.
+Affects every path that goes through `create_tlaser` on the receiver:
+
+| Firer | Target | Path                       | Damage |
+|-------|--------|----------------------------|--------|
+| Host  | Mob    | Host's local TLaser raycast | ✅ full |
+| Host  | Joiner | Receiver-spawned TLaser    | ❌ ~0.2hp/shot |
+| Joiner| Mob    | Receiver(host)-spawned TLaser | ❌ ~0.2hp/shot |
+| Joiner| Host   | Receiver(host)-spawned TLaser | ❌ ~0.2hp/shot |
+
+**Why:** We write our `dmg` int (16) to `+0xBC` / `+0xC0` post-ctor like
+the engine does — but those fields are NOT damage. Engine reads them as
+floats inside `FUN_0044db40` (raycast) as a direction/range vector,
+NOT as damage. The actual damage value lives on the `+0xCC` sub-object
+(probably `TRayCastBulletCallback` — its vtable is at 0x5587f4). The
+callback's `ReportFixture` (Box2D standard) applies damage when an
+actor fixture is hit; we haven't yet located which field of the sub-
+object holds the damage value.
+
+**What we tried**:
+- Writing damage as float bit pattern (`union { int i; float f; }`) to
+  `+0xBC`/`+0xC0` broke the beam visual entirely (vt[22]'s raycast
+  reads these as a direction vector, not damage — float values gave
+  bogus direction).
+
+**Fix path:**
+- Decompile `FUN_004c4760` (creates the +0xCC sub-object) to see where
+  it reads the damage init.
+- Decompile `TRayCastBulletCallback::ReportFixture` (in the sub-object's
+  vtable) to see what field it reads when applying damage.
+- Find the offset on the callback sub-object that holds the damage int
+  (likely 4-byte field initialized from some constant during ctor).
+- Write our `dmg` to that offset on the sub-object post-ctor.
+
 ## 🟡 Weapon-subclass replication gap (2026-06-17)
 
 Partially fixed. `TNail` (nailguns) and `TExplodingBullet` (rocket
