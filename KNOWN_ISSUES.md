@@ -110,21 +110,25 @@ the new native instead of `CreateBullet` + `swap_bullet_subclass`.
 
 `operator_new` address: TBC (search for any caller of size 0xc0).
 
-## 🟡 Cannon impact (shrapnel) gated — no damage on hit (2026-06-19)
+## 🟡 Cannon AoE explosion / shrapnel gated (2026-06-19)
 
-**Resolved:** the firer-side crash that fired on every shot was not in
-the impact handler — it was our own `hook_CannonCtor` declaring the
-wrong number of stack args (6 instead of 7, RET 0x1c confirmed via
-Ghidra). The mismatch corrupted the dispatcher's stack and the next
-operation AV'd. Same fix on `hook_ActorBulletDispatch` (RET 0x1c = 7,
-not 5). Cannon now fires + replicates via `hook_CannonCtor` →
+**Resolved:** the firer-side crash that fired on every cannon shot was
+our own `hook_CannonCtor` declaring the wrong number of stack args
+(6 instead of 7, RET 0x1c confirmed via Ghidra). The mismatch corrupted
+the dispatcher's stack and the next operation AV'd. Same defect on
+`hook_ActorBulletDispatch` (RET 0x1c = 7, not 5). Cannon now fires
+without crashing and replicates via `hook_CannonCtor` →
 `bullet_fire {subclass=8}` → `create_cannon` native on the receiver.
+**Direct-hit damage works** (cannon bullet's vt[11] → vt[19] → vt[28]
+TakeDamage path is untouched) — kills mobs/players on contact.
 
-**Still gated:** the impact handler `FUN_00497770` (called from cannon
-vt[22]) spawns 20 TNail shrapnel + an AoE entity. One of the nails
-hitting a TPlayer puppet on the firer AVs (even with `set_invulnerable`
-on the puppet). Workaround installed: `hook_CannonBoom` no-ops the
-whole impact handler. Cannon shoots and flies but **does no damage**.
+**Gated:** the impact handler `FUN_00497770` (called from cannon vt[22])
+normally spawns 20 TNail shrapnel + an AoE entity + screen shake AFTER
+the direct hit. One of those shrapnel nails colliding with a TPlayer
+puppet on the firer AVs (even with `set_invulnerable` on the puppet),
+so `hook_CannonBoom` no-ops the whole impact handler. Cannon still does
+its main damage; just no AoE spray and no explosion FX.
+
 Fix path: per-nail collision filter that skips puppet bodies (or hook
 the nail-on-actor dispatch and short-circuit when the actor is in our
 puppet registry), then unhook `FUN_00497770`.
