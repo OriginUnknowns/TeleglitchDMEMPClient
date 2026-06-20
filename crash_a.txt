@@ -1,0 +1,184 @@
+﻿
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+   EnableRedirectToChakraJsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 46
+
+Microsoft (R) Windows Debugger Version 10.0.29547.1002 X86
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [E:\projects\TMEMultiplayerClient\crash_a.dmp]
+User Mini Dump File with Full Memory : Only application data is available
+
+Symbol search path is: srv*
+Executable search path is: 
+Windows 10 Version 26200 MP (8 procs) Free x86 compatible
+Product: WinNt, suite: SingleUserTS
+Edition build lab: 26100.1.amd64fre.ge_release.240331-1435
+Debug session time: Sat Jun 20 17:56:04.000 2026 (UTC - 5:00)
+System Uptime: 2 days 7:07:23.821
+Process Uptime: 0 days 0:00:27.000
+................................................................
+..............................................
+Loading unloaded module list
+.
+This dump file has an exception of interest stored in it.
+The stored exception information can be accessed via .ecxr
+(12790.12948): Access violation - code c0000005 (first/second chance not available)
+For analysis of this file, run !analyze -v
+*** WARNING: Unable to verify checksum for Teleglitch.exe
+eax=1ec05588 ebx=00000001 ecx=1ec05588 edx=00ba831c esi=004ff678 edi=004ff6c4
+eip=00667894 esp=004ff678 ebp=004ff6d0 iopl=0         nv up ei pl zr na pe nc
+cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010246
+Teleglitch+0x17894:
+00667894 8b4228          mov     eax,dword ptr [edx+28h] ds:002b:00ba8344=????????
+0:000> .echo === analyzing cannon crash ===
+=== analyzing cannon crash ===
+0:000> .ecxr
+eax=1ec05588 ebx=00000001 ecx=1ec05588 edx=00ba831c esi=004ff678 edi=004ff6c4
+eip=00667894 esp=004ff678 ebp=004ff6d0 iopl=0         nv up ei pl zr na pe nc
+cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010246
+Teleglitch+0x17894:
+00667894 8b4228          mov     eax,dword ptr [edx+28h] ds:002b:00ba8344=????????
+0:000> .echo --- stack walk (kn 50) ---
+--- stack walk (kn 50) ---
+0:000> kn 50
+ # ChildEBP RetAddr      
+WARNING: Stack unwind information not available. Following frames may be wrong.
+00 004ff6d0 006872fc     Teleglitch+0x17894
+01 004ff744 00682be8     Teleglitch+0x372fc
+02 004ff758 0068288c     Teleglitch+0x32be8
+03 004ff7e8 0075dea6     Teleglitch+0x3288c
+04 004ff7fc 0075df57     Teleglitch+0x10dea6
+05 004ff81c 0075d6e4     Teleglitch+0x10df57
+06 004ff868 75d85d49     Teleglitch+0x10d6e4
+07 004ff878 76f2d83b     kernel32!BaseThreadInitThunk+0x19
+08 004ff8d0 76f2d7c1     ntdll!__RtlUserThreadStart+0x2b
+09 004ff8e0 00000000     ntdll!_RtlUserThreadStart+0x1b
+0:000> .echo --- registers ---
+--- registers ---
+0:000> r
+Last set context:
+eax=1ec05588 ebx=00000001 ecx=1ec05588 edx=00ba831c esi=004ff678 edi=004ff6c4
+eip=00667894 esp=004ff678 ebp=004ff6d0 iopl=0         nv up ei pl zr na pe nc
+cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010246
+Teleglitch+0x17894:
+00667894 8b4228          mov     eax,dword ptr [edx+28h] ds:002b:00ba8344=????????
+0:000> .echo --- disassembly at fault EIP ---
+--- disassembly at fault EIP ---
+0:000> u . L20
+Teleglitch+0x17894:
+00667894 8b4228          mov     eax,dword ptr [edx+28h]
+00667897 ffd0            call    eax
+00667899 3bf4            cmp     esi,esp
+0066789b e8796e1000      call    Teleglitch+0x11e719 (0076e719)
+006678a0 ebc0            jmp     Teleglitch+0x17862 (00667862)
+006678a2 6890766600      push    offset Teleglitch+0x17690 (00667690)
+006678a7 8b4dec          mov     ecx,dword ptr [ebp-14h]
+006678aa e8b1dbffff      call    Teleglitch+0x15460 (00665460)
+006678af 6890766600      push    offset Teleglitch+0x17690 (00667690)
+006678b4 8b4dec          mov     ecx,dword ptr [ebp-14h]
+006678b7 83c108          add     ecx,8
+006678ba e8a1dbffff      call    Teleglitch+0x15460 (00665460)
+006678bf 6890766600      push    offset Teleglitch+0x17690 (00667690)
+006678c4 8b4dec          mov     ecx,dword ptr [ebp-14h]
+006678c7 83c12c          add     ecx,2Ch
+006678ca e891dbffff      call    Teleglitch+0x15460 (00665460)
+006678cf 52              push    edx
+006678d0 8bcd            mov     ecx,ebp
+006678d2 50              push    eax
+006678d3 8d1508796600    lea     edx,[Teleglitch+0x17908 (00667908)]
+006678d9 e8e56d1000      call    Teleglitch+0x11e6c3 (0076e6c3)
+006678de 58              pop     eax
+006678df 5a              pop     edx
+006678e0 8b4df4          mov     ecx,dword ptr [ebp-0Ch]
+006678e3 64890d00000000  mov     dword ptr fs:[0],ecx
+006678ea 59              pop     ecx
+006678eb 5f              pop     edi
+006678ec 5e              pop     esi
+006678ed 8b4df0          mov     ecx,dword ptr [ebp-10h]
+006678f0 33cd            xor     ecx,ebp
+006678f2 e8f1560f00      call    Teleglitch+0x10cfe8 (0075cfe8)
+006678f7 83c44c          add     esp,4Ch
+0:000> .echo --- bytes around fault EIP-0x10 .. EIP+0x10 ---
+--- bytes around fault EIP-0x10 .. EIP+0x10 ---
+0:000> db . - 0x10 L0x40
+00667884  ff 8b 00 89 45 b4 8b 4d-b4 8b 11 8b f4 8b 4d b4  ....E..M......M.
+00667894  8b 42 28 ff d0 3b f4 e8-79 6e 10 00 eb c0 68 90  .B(..;..yn....h.
+006678a4  76 66 00 8b 4d ec e8 b1-db ff ff 68 90 76 66 00  vf..M......h.vf.
+006678b4  8b 4d ec 83 c1 08 e8 a1-db ff ff 68 90 76 66 00  .M.........h.vf.
+0:000> .echo --- stack contents ESP+0 .. ESP+0x80 ---
+--- stack contents ESP+0 .. ESP+0x80 ---
+0:000> dds esp L0x20
+004ff678  e3d993cb
+004ff67c  004ff738
+004ff680  004ff6d8
+004ff684  1ec05588
+004ff688  cccccccc
+004ff68c  11976918
+004ff690  cccccccc
+004ff694  cccccccc
+004ff698  1ee1afc0
+004ff69c  cccccccc
+004ff6a0  0c21a7a0
+004ff6a4  cccccccc
+004ff6a8  cccccccc
+004ff6ac  cccccccc
+004ff6b0  cccccccc
+004ff6b4  cccccccc
+004ff6b8  cccccccc
+004ff6bc  0c21a7a0
+004ff6c0  e3d993cb
+004ff6c4  004ff738
+004ff6c8  00771a68 Teleglitch+0x121a68
+004ff6cc  ffffffff
+004ff6d0  004ff744
+004ff6d4  006872fc Teleglitch+0x372fc
+004ff6d8  e3d9925f
+004ff6dc  004ff7e8
+004ff6e0  004ff74c
+004ff6e4  cccccccc
+004ff6e8  cccccccc
+004ff6ec  cccccccc
+004ff6f0  cccccccc
+004ff6f4  cccccccc
+0:000> .echo --- if ECX is an object, dump first 32 bytes ---
+--- if ECX is an object, dump first 32 bytes ---
+0:000> dd @ecx L8
+1ec05588  00ba831c 3f800000 3f800000 3f800000
+1ec05598  3f800000 69746e65 00007974 7ff7a516
+0:000> .echo --- if EDX is a pointer, dump 32 bytes ---
+--- if EDX is a pointer, dump 32 bytes ---
+0:000> dd @edx L8
+00ba831c  ???????? ???????? ???????? ????????
+00ba832c  ???????? ???????? ???????? ????????
+0:000> q
+quit:
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files\WindowsApps\Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe\x86\Visualizers\winrt.natvis'

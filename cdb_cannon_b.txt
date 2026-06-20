@@ -1,0 +1,3 @@
+.echo === cannon cdb B — capture first-chance AV
+sxe -c ".dump /ma E:\\projects\\TMEMultiplayerClient\\crash_b.dmp; .echo CRASHED_B; kn 60; .ecxr; r; q" av
+g

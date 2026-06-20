@@ -333,18 +333,29 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
 // before the call so hook_BulletCtor stamps the ring entry, and clear it on
 // return. Subclass ids match Lua's bullettypes table:
 //   1 = nails, 2 = explode (0 = normal).
-typedef void* (__fastcall *SubBulletCtorFn)(void* self, void* edx,
-                                            int a1, int a2, int a3, int a4,
-                                            int a5, int a6, int a7, int a8);
-static SubBulletCtorFn orig_NailCtor = nullptr;
-static SubBulletCtorFn orig_ExplodeCtor = nullptr;
+//
+// Stack-arg counts (RET purge confirmed via GetCannonPurge):
+//   TNail            (FUN_00497200)  RET 0x24 = 9 stack args
+//   TExplodingBullet (FUN_00497140)  RET 0x20 = 8 stack args
+// The two had the same typedef historically; nail needs ONE more arg.
+// Cannon's boom spawns 20 TNail in a row, so a 4-byte stack drift per
+// nail accumulates inside the boom frame and clobbers locals → crash
+// later in the boom (looked like a "puppet AV" but was our own bug).
+typedef void* (__fastcall *NailCtorFn)(void* self, void* edx,
+                                       int a1, int a2, int a3, int a4,
+                                       int a5, int a6, int a7, int a8, int a9);
+typedef void* (__fastcall *ExplodeCtorFn)(void* self, void* edx,
+                                          int a1, int a2, int a3, int a4,
+                                          int a5, int a6, int a7, int a8);
+static NailCtorFn    orig_NailCtor    = nullptr;
+static ExplodeCtorFn orig_ExplodeCtor = nullptr;
 
 static void* __fastcall hook_NailCtor(void* self, void* edx,
                                       int a1, int a2, int a3, int a4,
-                                      int a5, int a6, int a7, int a8) {
+                                      int a5, int a6, int a7, int a8, int a9) {
     int prev = g_pending_subclass;
     g_pending_subclass = 1;  // bullettypes.nails
-    void* r = orig_NailCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    void* r = orig_NailCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8, a9);
     g_pending_subclass = prev;
     return r;
 }
@@ -395,6 +406,7 @@ static void __fastcall hook_SteamStats(void* self, void* edx, void* name) {
 // exit lets us tell whether the crash is inside vt[11] (entry but no
 // exit) or somewhere else in the engine's per-frame loop (no entry).
 static BYTE* g_cannon_vftable_va = nullptr;  // populated at hook install
+static bool is_registered_puppet(void* self);  // body lives near the puppet registry, below
 typedef void (__fastcall *Vt11Fn)(void* self);
 static Vt11Fn orig_Vt11 = nullptr;
 static int    g_vt11_cannon_calls = 0;
@@ -426,43 +438,70 @@ static void __fastcall hook_Vt11(void* self) {
 // FUN_0044f210 — actor bullet dispatch. RET 0x1c = 7 stack args, not 5
 // (Ghidra decomp under-counted). Wrong arg count = stack imbalance →
 // caller (vt[11]) crashes after we return.
+//
+// PUPPET FILTER: when a cannon shrapnel nail collides with a TPlayer
+// puppet on the firer's host, the original dispatch AVs deep inside
+// the engine's nail-on-actor path (likely the puppet's render-gated /
+// kinematic / hooked-think state confuses the nail's response handler).
+// Short-circuit: if the actor is a registered puppet AND the bullet is
+// a TNail, return without calling orig. The puppet doesn't take damage
+// locally — that's correct: the real damage is replicated to the
+// actual remote player on their own client.
 typedef void (__fastcall *ActorBulletDispatchFn)(void* self, void* edx,
                                                  int bullet, int p2, int p3, int p4,
                                                  int p5, int p6, int p7);
 static ActorBulletDispatchFn orig_ActorBulletDispatch = nullptr;
+static BYTE* g_nail_vftable_va = nullptr;  // populated at hook install
 static void __fastcall hook_ActorBulletDispatch(void* self, void* edx,
                                                 int bullet, int p2, int p3, int p4,
                                                 int p5, int p6, int p7) {
-    void* bvt = (bullet ? *(void**)bullet : nullptr);
-    int   tag = (bullet ? *(int*)((char*)bullet + 0x5c) : -1);
-    bool is_cannon = (bvt && bvt == (void*)g_cannon_vftable_va);
-    if (is_cannon) {
-        void* actor_vt = *(void**)self;
-        unsigned char invuln = *((unsigned char*)self + 0xfc);
-        host_log("DISPATCH cannon actor=%p actor_vt=%p invuln=%u bullet=%p bvt=%p tag=%d "
-                 "-> actor vt[28] @ %p",
-                 self, actor_vt, invuln, (void*)bullet, bvt, tag,
-                 actor_vt ? *(void**)((char*)actor_vt + 0x70) : nullptr);
+    if (is_registered_puppet(self)) {
+        // Puppet on the host shouldn't be damaged locally — the real
+        // damage is replicated to the remote player via bullet_fire.
+        // The vanilla engine path (case 0x20 explosion / case 8 shrapnel
+        // nail) AVs on puppets because the puppet's render-gated /
+        // kinematic state confuses the engine's response handler. Short-
+        // circuit the whole dispatch.
+        return;
     }
     orig_ActorBulletDispatch(self, edx, bullet, p2, p3, p4, p5, p6, p7);
-    if (is_cannon) {
-        host_log("DISPATCH cannon RETURN actor=%p (survived)", self);
-    }
 }
 
 // FUN_00497770 — cannon impact handler. Spawns 20 TNail shrapnel + AoE
-// entity. The shrapnel-vs-puppet path AVs on the firer (one of the nails
-// hits a remote-player puppet on the host and the engine's collision
-// path mishandles the puppet's hooked state). No-op'd as a workaround:
-// cannon fires + flies + impacts visually, but no shrapnel/AoE damage.
-// TODO: gate per-nail collision against puppets instead of skipping the
-// whole impact, so cannon does real damage to mobs.
+// entity. Skip-orig version dodged the firer-side AV but cost the AoE
+// damage + explosion FX. Now: pass through and let the spec'd nail-vs-
+// puppet filter (in hook_ActorBulletDispatch below) catch the unsafe
+// collision so cannon does real damage.
+// Skip orig — cannon's boom spawns 20 TNail shrapnel + a TPlahvatus AoE
+// entity. The AoE damages the firer too, which triggers the engine's
+// damage-tally iterator in FUN_00417720 (TPlayer damage handler). That
+// iterator walks an internal "attackers" list that's getting Lua TValue
+// corruption mixed in (see task #2 heap corruptor — confirmed via cdb
+// dump: ECX entity has "entity" ASCII + NaN-boxed Lua TValues at +0x14+).
+// Cannon does damage via direct hit (vt[28] TakeDamage on contact),
+// which is unaffected. No shrapnel + no AoE explosion FX until the
+// heap corruptor is fixed.
 typedef void (__fastcall *CannonBoomFn)(int self);
 static CannonBoomFn orig_CannonBoom = nullptr;
 static void __fastcall hook_CannonBoom(int self) {
-    // Skip orig — no shrapnel, no AoE, no shake. Prevents the
-    // shrapnel-vs-puppet AV.
     (void)self;
+}
+
+// FUN_0048e9b0 — TPlahvatus (explosion entity) ctor called inside the
+// cannon's boom. Wraps body-init (FUN_004ccd50, same one our puppet
+// think guard already touches). Bracketing it lets us tell whether it
+// completes successfully or AVs mid-init.
+typedef void* (__fastcall *PlahvatusCtorFn)(void* self, void* edx,
+                                            int p1, int p2, int p3);
+static PlahvatusCtorFn orig_PlahvatusCtor = nullptr;
+static int g_plah_calls = 0;
+static void* __fastcall hook_PlahvatusCtor(void* self, void* edx,
+                                           int p1, int p2, int p3) {
+    int n = ++g_plah_calls;
+    host_log("PLAH #%d ENTRY self=%p p1=%08x p2=%08x p3=%08x", n, self, p1, p2, p3);
+    void* r = orig_PlahvatusCtor(self, edx, p1, p2, p3);
+    host_log("PLAH #%d RETURN ret=%p", n, r);
+    return r;
 }
 
 // TCannonBullet ctor (0x497660) — cannon (bullettypes.cannon=8). Like
@@ -1431,13 +1470,18 @@ static int l_install_hook_bullet(lua_State* L) {
     MH_STATUS cs = MH_CreateHook(cannonCtor, (LPVOID)&hook_CannonCtor, (LPVOID*)&orig_CannonCtor);
     if (cs == MH_OK) cs = MH_EnableHook(cannonCtor);
     host_log("cannon ctor hook: status=%d", cs);
-    BYTE* cannonBoom = (BYTE*)m + 0x97770;  // FUN_00497770 — no-op'd to dodge puppet AV
+    BYTE* cannonBoom = (BYTE*)m + 0x97770;  // FUN_00497770 — bracket only
     MH_STATUS cbs = MH_CreateHook(cannonBoom, (LPVOID)&hook_CannonBoom, (LPVOID*)&orig_CannonBoom);
     if (cbs == MH_OK) cbs = MH_EnableHook(cannonBoom);
-    host_log("cannon boom no-op hook: status=%d", cbs);
-    // Cache the relocated TCannonBullet vftable VA so the actor bullet
-    // dispatch hook can identify cannon bullets cheaply.
-    g_cannon_vftable_va = (BYTE*)m + 0x158454;  // file RVA = 0x158454
+    host_log("cannon boom hook: status=%d", cbs);
+    BYTE* plahCtor = (BYTE*)m + 0x8e9b0;  // FUN_0048e9b0 — TPlahvatus (explosion) ctor
+    MH_STATUS ps = MH_CreateHook(plahCtor, (LPVOID)&hook_PlahvatusCtor, (LPVOID*)&orig_PlahvatusCtor);
+    if (ps == MH_OK) ps = MH_EnableHook(plahCtor);
+    host_log("plahvatus ctor hook: status=%d", ps);
+    // Cache the relocated vftable VAs so the actor bullet dispatch hook
+    // can identify subclasses cheaply (file RVAs from ghidra dumps).
+    g_cannon_vftable_va = (BYTE*)m + 0x158454;  // TCannonBullet::vftable
+    g_nail_vftable_va   = (BYTE*)m + 0x15831c;  // TNail::vftable
     BYTE* actorDispatch = (BYTE*)m + 0x4f210;   // FUN_0044f210 (= shared TPlayer/TActor vt[19])
     MH_STATUS ds = MH_CreateHook(actorDispatch, (LPVOID)&hook_ActorBulletDispatch,
                                  (LPVOID*)&orig_ActorBulletDispatch);

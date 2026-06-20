@@ -2802,6 +2802,65 @@ local chat = {
     TOP_OFFSET = -1.5,  -- world-units from the player to the newest (bottom) row
 }
 
+-- ============ GAME OVER ============
+-- Relay broadcasts `game_over { players:[{name,kills,score,...}] }` once all
+-- players die. We show the custom mp_gameover menu page (a real menu page, not
+-- a world overlay, so it's screen-space and unaffected by the dead-spectator
+-- camera). Transition mirrors the proven kick flow: set pending → net_tick_loop
+-- flips engine game→menu via inject_esc + SetPage, and MP_FRAME_TICK re-forces
+-- the page (the engine resets the active page on pause). Button labels are
+-- capped at 15 chars by set_button_label's SSO write, so stats are packed into
+-- short codes across two columns. mp.gameover_btns is filled at page creation.
+local gameover_players = {}
+
+local function fmt_go_a(s)   -- kills / score / accuracy  e.g. "K5 S120 45%"
+    return string.format("K%d S%d %d%%", s.kills or 0, s.score or 0, s.accuracy or 0)
+end
+local function fmt_go_b(s)   -- items / hp lost / friendly fire  e.g. "I8 HP-340 FF0"
+    return string.format("I%d HP-%d FF%d", s.items or 0, s.hp_lost or 0, s.ff or 0)
+end
+
+local function populate_gameover()
+    if not (mp.gameover_btns and _G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
+    for i = 1, 4 do
+        local row = mp.gameover_btns[i]
+        local p = gameover_players[i]
+        if row then
+            local function setl(btn, txt)
+                if btn and btn.pointer then
+                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, txt) end)
+                end
+            end
+            setl(row.name, p and tostring(p.name or "?") or "")
+            setl(row.a,    p and fmt_go_a(p) or "")
+            setl(row.b,    p and fmt_go_b(p) or "")
+        end
+    end
+end
+
+local function handle_game_over(m)
+    if mp.gameover_shown then return end
+    mp.gameover_shown = true
+    gameover_players = (type(m.players) == "table") and m.players or {}
+    mp.pending_gameover = true   -- net_tick_loop performs the screen transition
+    logf("GAME OVER received: %d players", #gameover_players)
+end
+
+-- Flip from the (spectating) game into the mp_gameover menu page. Runs from
+-- net_tick_loop, which fires reliably in-game; the re-force loop in
+-- MP_FRAME_TICK then keeps the page up at menu state.
+local function mp_show_gameover()
+    populate_gameover()
+    mp.in_game = false              -- stops the mp_pause re-force + death intercept
+    mp.force_gameover_page = true
+    mp._pause_bypass = true
+    pcall(function() menu.SetPage("mp_gameover") end)
+    mp._pause_bypass = false
+    if _G.MP_NATIVE and _G.MP_NATIVE.inject_esc then
+        pcall(function() _G.MP_NATIVE.inject_esc() end)   -- engine game→menu state
+    end
+end
+
 local handlers = {
     welcome = handle_welcome,
     join = function(m) handle_join(m) end,
@@ -2833,6 +2892,7 @@ local handlers = {
     join_failed  = handle_join_failed,
     game_started = handle_game_started,
     kicked       = handle_kicked,
+    game_over    = handle_game_over,
 }
 
 -- Build a mob snapshot from the host's tracked mobs. Filters out dead/invalid entries.
@@ -3156,6 +3216,11 @@ local function net_tick_loop()
             -- MP_FRAME_TICK doesn't fire after begin_game. This coroutine
             -- IS resumed on every tick (Wait yields go through lua_resume).
             pcall(tick_death_intercept)
+            -- Game over: relay said all players are dead → show the results page.
+            if mp.pending_gameover then
+                mp.pending_gameover = false
+                pcall(mp_show_gameover)
+            end
             local now = socket.gettime()
             if mp.sock and now - mp.last_send >= send_interval then
                 local pl = player.GetPlayer()
@@ -4070,6 +4135,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.local_player_ptr = nil
         stats.reset()              -- fresh per-run scoreboard
         mp.gameover_shown = false
+        mp.pending_gameover = false
+        mp.force_gameover_page = false
         local seed = mp.session_seed or 1779843477
         logf("begin_game: seed=%s is_host=%s room='%s'",
             tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
@@ -4695,6 +4762,38 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end)
     logf("MP page mp_waiting: ok=%s err=%s", tostring(pok2), tostring(perr2))
 
+    -- ----- mp_gameover: end-of-run scoreboard -----
+    -- One row per player (up to 4): name + two packed stat columns (button
+    -- labels are SSO-capped at 15 chars). Filled by populate_gameover() from
+    -- the relay's game_over payload. Return to Lobby tears down and goes back.
+    local pok3, perr3 = pcall(function()
+        local page = menu.AddPage("mp_gameover", "mp_lobby")
+        if not page then error("AddPage('mp_gameover') returned nil") end
+        pcall(function() page:AddBackground("gfx/menubg.bmp") end)
+        page:AddButton(21, 36, "-- GAME OVER --", "All players have died", function() end)
+        page:AddButton(20,  58, "PLAYER",  "", function() end)
+        page:AddButton(120, 58, "K=kills S=score", "", function() end)
+        page:AddButton(215, 58, "I=items HP-=lost", "", function() end)
+        mp.gameover_btns = {}
+        for i = 1, 4 do
+            local y = 78 + (i - 1) * 16
+            mp.gameover_btns[i] = {
+                name = page:AddButton(20,  y, "",  "", function() end),
+                a    = page:AddButton(120, y, "",  "", function() end),
+                b    = page:AddButton(215, y, "",  "", function() end),
+            }
+        end
+        local ret = page:AddButton(21, 168, "Return to Lobby",
+            "Leave the room and return to the lobby",
+            function()
+                mp.force_gameover_page = false
+                mp.gameover_shown = false
+                pcall(lobby_leave_room)
+            end)
+        mp.gameover_return_btn = ret
+    end)
+    logf("MP page mp_gameover: ok=%s err=%s", tostring(pok3), tostring(perr3))
+
     -- Background auto-refresh: hook user32!PeekMessageA per frame and
     -- call _G.MP_FRAME_TICK at ~10Hz. Engine-tracked coroutines (Wait)
     -- crash at title-menu state, but a Win32-API hook fires every frame
@@ -5005,6 +5104,18 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 pcall(function() _G.MP_NATIVE.inject_esc() end)
             end
             return
+        end
+
+        -- Same engine page-reset issue as the kick path: keep re-forcing
+        -- mp_gameover until the user clicks Return to Lobby (clears the flag).
+        if mp.force_gameover_page then
+            local now = (socket and socket.gettime) and socket.gettime() or os.time()
+            if (now - (mp._last_go_force or 0)) >= 0.5 then
+                mp._pause_bypass = true
+                pcall(function() menu.SetPage("mp_gameover") end)
+                mp._pause_bypass = false
+                mp._last_go_force = now
+            end
         end
 
         -- The engine's native ESC handler resets the active page to

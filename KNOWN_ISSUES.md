@@ -110,28 +110,40 @@ the new native instead of `CreateBullet` + `swap_bullet_subclass`.
 
 `operator_new` address: TBC (search for any caller of size 0xc0).
 
-## 🟡 Cannon AoE explosion / shrapnel gated (2026-06-19)
+## 🟡 Cannon AoE / shrapnel gated — blocked by heap corruptor (2026-06-20)
 
-**Resolved:** the firer-side crash that fired on every cannon shot was
-our own `hook_CannonCtor` declaring the wrong number of stack args
-(6 instead of 7, RET 0x1c confirmed via Ghidra). The mismatch corrupted
-the dispatcher's stack and the next operation AV'd. Same defect on
-`hook_ActorBulletDispatch` (RET 0x1c = 7, not 5). Cannon now fires
-without crashing and replicates via `hook_CannonCtor` →
-`bullet_fire {subclass=8}` → `create_cannon` native on the receiver.
-**Direct-hit damage works** (cannon bullet's vt[11] → vt[19] → vt[28]
-TakeDamage path is untouched) — kills mobs/players on contact.
+**Resolved (firer-side crash on fire):** our own `hook_CannonCtor`
+declared the wrong number of stack args (6 instead of 7, RET 0x1c
+confirmed via Ghidra). Stack imbalance corrupted the dispatcher's frame
+and the next op AV'd. Same defect on `hook_ActorBulletDispatch`
+(RET 0x1c = 7, not 5) and `hook_NailCtor` (RET 0x24 = 9, not 8 — the
+nail miscount is what made cannon shrapnel-spawn crash, because the
+boom function spawns 20 nails in a row so the per-call 4-byte drift
+compounds inside the boom's frame).
 
-**Gated:** the impact handler `FUN_00497770` (called from cannon vt[22])
-normally spawns 20 TNail shrapnel + an AoE entity + screen shake AFTER
-the direct hit. One of those shrapnel nails colliding with a TPlayer
-puppet on the firer AVs (even with `set_invulnerable` on the puppet),
-so `hook_CannonBoom` no-ops the whole impact handler. Cannon still does
-its main damage; just no AoE spray and no explosion FX.
+**Working now:** cannon fires + replicates (`hook_CannonCtor` →
+`bullet_fire {subclass=8}` → `create_cannon` native on the receiver) +
+direct-hit damage works on contact (kills teammates/mobs).
 
-Fix path: per-nail collision filter that skips puppet bodies (or hook
-the nail-on-actor dispatch and short-circuit when the actor is in our
-puppet registry), then unhook `FUN_00497770`.
+**Gated:** `hook_CannonBoom` no-ops `FUN_00497770` (the cannon impact
+handler that spawns 20 TNail shrapnel + a TPlahvatus AoE entity).
+Reason — **cdb dump caught the real crash** in the engine's TPlayer
+damage-tally iterator (`FUN_00417720`):
+```
+ecx=1ec05588 edx=00ba831c
+[ecx] = 00ba831c                              ; "vtable"
+1ec05588  00ba831c 3f800000 3f800000 3f800000  ; entity contents
+1ec05598  3f800000 69746e65 00007974 7ff7a516  ; "enti" "ty\0\0" + Lua NaN-box
+```
+The "entity" the iterator dereferenced is actually a **Lua TValue
+array** — the recurring lua52 heap corruptor (task #2) is bleeding Lua
+table memory into the engine's attacker list. Cannon's TPlahvatus AoE
+hits the firer themselves, the damage handler iterates attackers, one
+entry is a corrupted Lua-table pointer → AV.
+
+Fix path: cannon AoE unblocks once task #2 (heap corruptor) is fixed.
+Not a cannon-specific bug — cannon just produces enough rapid heap
+operations to trigger it reliably.
 
 ## 🟡 Shotgun (5-pellet rapid fire) crashes remote client (2026-06-17)
 

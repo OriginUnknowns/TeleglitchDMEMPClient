@@ -1,0 +1,17 @@
+.echo === analyzing cannon crash ===
+.ecxr
+.echo --- stack walk (kn 50) ---
+kn 50
+.echo --- registers ---
+r
+.echo --- disassembly at fault EIP ---
+u . L20
+.echo --- bytes around fault EIP-0x10 .. EIP+0x10 ---
+db . - 0x10 L0x40
+.echo --- stack contents ESP+0 .. ESP+0x80 ---
+dds esp L0x20
+.echo --- if ECX is an object, dump first 32 bytes ---
+dd @ecx L8
+.echo --- if EDX is a pointer, dump 32 bytes ---
+dd @edx L8
+q
