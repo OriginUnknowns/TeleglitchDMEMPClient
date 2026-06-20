@@ -1,5 +1,37 @@
 # Known Issues
 
+## 🟡 AGL grenade fuse drifts between firer and receiver (2026-06-19)
+
+Networked AGL (`bullettypes.explode2` / TAdhesiveGrenade) explodes at
+different wall-clock times on firer vs receiver. The longer the flight
+before impact, the wider the gap. Firer behaves as if the fuse only
+starts ticking after the grenade sticks; receiver fuses from spawn.
+
+**What was tried:**
+1. Lua-side fuse pre-advance (write `+0xB8 += 0.02..0.05` after ctor) —
+   makes short-throw explosions misalign in the other direction; no
+   single constant works because the firer's "fuse from impact"
+   behavior makes the offset travel-time-dependent.
+2. Native hook on vt[23] @ 0x495e20 (the per-tick fuse + movement
+   step). Hook calls orig (so movement runs) then restores +0xB8 to
+   its pre-call value whenever `vx*vx + vy*vy > 0.25` (still flying).
+   Goal: receiver only fuses after impact, matching firer. Result:
+   still mismatched — either the velocity gate isn't tight, or the
+   firer's gate lives elsewhere (engine-side per-tick dispatch may
+   skip vt[23] on flying grenades; we couldn't find it in vt[11] or
+   FUN_00498f50).
+
+**Where to look next:**
+- Find the engine caller of vt[23] (search xrefs to vftable+0x5c on
+  TAdhesiveGrenade) — there may be a "stuck" predicate gating the
+  call that isn't visible from vt[23] alone.
+- TAdhesiveGrenade `+0x6D` (set to 0 in ctor) — vt[11] case 0x10
+  (wall hit) checks it before calling `FUN_0040e750(+0x2E = 1)`. Could
+  be the "is stuck" flag.
+
+For now: cosmetic. Grenades still explode and damage; just the visual
+beat between two clients can be off by hundreds of ms.
+
 ## 🟡 Networked TLaser does almost no damage (2026-06-19)
 
 Lasgun fired through the on/off replication protocol does ~0.2hp per
@@ -78,18 +110,24 @@ the new native instead of `CreateBullet` + `swap_bullet_subclass`.
 
 `operator_new` address: TBC (search for any caller of size 0xc0).
 
-## 🔴 Cannon firer-side crash (2026-06-17)
+## 🟡 Cannon impact (shrapnel) gated — no damage on hit (2026-06-19)
 
-Repro: equip cannon (`itemtable.cannon`, bullettype 8) and fire. The
-**firer** AVs (not the receiver — joiner doesn't even know the shot
-happened, since cannon ctor bypasses TBullet and our hook misses it).
-No captured crash log yet — next session needs a cdb-attached repro to
-confirm root cause. Most plausible suspect: cannon's vt[20] explosion
-runs an AoE damage scan over actors near the impact, hitting the
-joiner's TPlayer puppet on the host. The puppet has set_invulnerable=1
-so TakeDamage short-circuits, but the scan or screen-shake path may
-touch state the cannon doesn't expect (puppet's hooked think,
-render-gated body, etc.).
+**Resolved:** the firer-side crash that fired on every shot was not in
+the impact handler — it was our own `hook_CannonCtor` declaring the
+wrong number of stack args (6 instead of 7, RET 0x1c confirmed via
+Ghidra). The mismatch corrupted the dispatcher's stack and the next
+operation AV'd. Same fix on `hook_ActorBulletDispatch` (RET 0x1c = 7,
+not 5). Cannon now fires + replicates via `hook_CannonCtor` →
+`bullet_fire {subclass=8}` → `create_cannon` native on the receiver.
+
+**Still gated:** the impact handler `FUN_00497770` (called from cannon
+vt[22]) spawns 20 TNail shrapnel + an AoE entity. One of the nails
+hitting a TPlayer puppet on the firer AVs (even with `set_invulnerable`
+on the puppet). Workaround installed: `hook_CannonBoom` no-ops the
+whole impact handler. Cannon shoots and flies but **does no damage**.
+Fix path: per-nail collision filter that skips puppet bodies (or hook
+the nail-on-actor dispatch and short-circuit when the actor is in our
+puppet registry), then unhook `FUN_00497770`.
 
 ## 🟡 Shotgun (5-pellet rapid fire) crashes remote client (2026-06-17)
 

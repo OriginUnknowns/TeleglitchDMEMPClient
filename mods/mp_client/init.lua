@@ -446,6 +446,72 @@ local function decode_body(body)
     return m
 end
 
+-- ============ PER-PLAYER RUN STATS ============
+-- Each client accumulates its own stats during a run and ships a snapshot in
+-- player_died; the relay collects them and returns the full set in game_over,
+-- which the mp_gameover screen renders. Kills use a simple "did I damage this
+-- mob shortly before it died" heuristic (co-op has no clean attribution) —
+-- both the killer and a recent assister may get credit; good enough for a
+-- scoreboard. friendly fire + crafted are Phase 2 (need new hooks) → stay 0.
+local stats = { data = nil, recently_damaged = {}, _last_hp = nil }
+
+function stats.reset()
+    stats.data = { kills = 0, score = 0, shots = 0, hits = 0, items = 0,
+                   hp_lost = 0, hp_gained = 0, ff = 0, crafted = 0 }
+    stats.recently_damaged = {}
+    stats._last_hp = nil
+end
+
+function stats.add(field, n)
+    if stats.data then stats.data[field] = (stats.data[field] or 0) + (n or 1) end
+end
+
+-- Record that WE damaged this mob (used for kill credit on its death).
+function stats.note_damage(mob_id)
+    if mob_id and stats.data then stats.recently_damaged[mob_id] = socket.gettime() end
+end
+
+-- A mob died: if we damaged it in the last 2s, take the kill + its score.
+function stats.note_mob_died(mob_id, mob_type)
+    if not (stats.data and mob_id) then return end
+    local t = stats.recently_damaged[mob_id]
+    if t and (socket.gettime() - t) <= 2.0 then
+        stats.data.kills = stats.data.kills + 1
+        local sc = 10
+        local ms = _G.monsterstats
+        if ms and mob_type and ms[mob_type] and type(ms[mob_type].scoreforkill) == "number" then
+            sc = ms[mob_type].scoreforkill
+        end
+        stats.data.score = stats.data.score + sc
+        stats.recently_damaged[mob_id] = nil
+    end
+end
+
+-- Poll HP and accumulate damage taken / healing received.
+function stats.note_hp(hp)
+    if not (stats.data) or type(hp) ~= "number" then return end
+    if stats._last_hp ~= nil then
+        local d = hp - stats._last_hp
+        if d < 0 then stats.data.hp_lost = stats.data.hp_lost - d
+        elseif d > 0 then stats.data.hp_gained = stats.data.hp_gained + d end
+    end
+    stats._last_hp = hp
+end
+
+-- Build the payload sent in player_died (accuracy derived from hits/shots).
+function stats.snapshot()
+    local d = stats.data or {}
+    local shots = d.shots or 0
+    return {
+        kills = d.kills or 0, score = d.score or 0,
+        shots = shots, hits = d.hits or 0,
+        accuracy = shots > 0 and math.floor((d.hits or 0) / shots * 100 + 0.5) or 0,
+        items = d.items or 0, crafted = d.crafted or 0,
+        hp_lost = math.floor(d.hp_lost or 0), hp_gained = math.floor(d.hp_gained or 0),
+        ff = d.ff or 0,
+    }
+end
+
 local function send_msg(msg)
     if not mp.sock then return end
     local body = encode_body(msg)
@@ -876,6 +942,7 @@ local function broadcast_pickup_of_type(type_name, px, py)
     if mp.sock then
         send_msg({ type = "item_picked", id = best_id, picker_id = mp.my_id })
     end
+    stats.add("items")   -- we collected an item
     logf("inv diff: picked id=%s type=%s d=%.2f BROADCAST",
         tostring(best_id), type_name, math.sqrt(best_d2))
 end
@@ -1083,6 +1150,7 @@ local function broadcast_ammo_pickup(px, py)
     if mp.sock then
         send_msg({ type = "item_picked", id = best_id, picker_id = mp.my_id })
     end
+    stats.add("items")   -- we collected ammo
     logf("ammo diff: picked id=%s type=%s d=%.2f BROADCAST",
         tostring(best_id), entry.type, math.sqrt(best_d2))
 end
@@ -1409,7 +1477,7 @@ local function tick_death_intercept()
             if _G.MP_NATIVE.set_fire_gate then _G.MP_NATIVE.set_fire_gate(target_ptr, 1) end
         end)
         pcall(refresh_objective_string)
-        if mp.sock then pcall(function() send_msg({ type = "player_died" }) end) end
+        if mp.sock then pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end) end
     end
     if mp.is_dead then
         -- Keep pinning so any incoming damage can't tip HP <= 0.
@@ -1461,6 +1529,7 @@ local function tick_death_intercept()
     else
         pcall(function() if pl.GetHealth then hp = pl:GetHealth() end end)
     end
+    stats.note_hp(hp)   -- accumulate damage taken / healing received
     mp._last_logged_hp = mp._last_logged_hp or -1
     if hp ~= mp._last_logged_hp then
         logf("DEATH poll: hp=%s", tostring(hp))
@@ -1491,7 +1560,7 @@ local function tick_death_intercept()
             if _G.MP_NATIVE.set_render_gate then _G.MP_NATIVE.set_render_gate(target_ptr, 1) end
         end)
         pcall(refresh_objective_string)
-        if mp.sock then pcall(function() send_msg({ type = "player_died" }) end) end
+        if mp.sock then pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end) end
     end
 end
 
@@ -2281,6 +2350,9 @@ end
 
 local function handle_mob_damage(msg)
     if not mp.is_host or type(msg.id) ~= "number" or type(msg.dmg) ~= "number" then return end
+    -- Note a joiner damaged this mob, so the host doesn't also claim the kill.
+    mp.joiner_dmg_t = mp.joiner_dmg_t or {}
+    mp.joiner_dmg_t[msg.id] = socket.gettime()
     for ptr, info in pairs(mp.host_mobs) do
         if info.id == msg.id and info.obj then
             -- Try the native HP poke (works for Soldat subclasses). For mob
@@ -2442,6 +2514,61 @@ local function handle_bullet_fire(msg)
         return
     end
 
+    -- AGL (explode2=5) — uses TAdhesiveGrenade (TProjectile base, not
+    -- TBullet), so a vtable swap on a vanilla TBullet doesn't give a
+    -- working sticky-grenade. Native create_adhgrenade builds the real
+    -- thing directly.
+    -- Cannon (bullettype=8) — TCannonBullet uses TProjectile base, not
+    -- TBullet, so a vtable swap on vanilla TBullet doesn't reproduce its
+    -- impact (which spawns 20 shrapnel nails). Native create_cannon
+    -- builds the real thing directly.
+    if msg.subclass == 8 and _G.MP_NATIVE and _G.MP_NATIVE.create_cannon then
+        local owner_ptr = owner and owner.pointer
+        if owner_ptr then
+            local ang = msg.angle or 0
+            local speed = msg.speed or 15
+            local vx = math.cos(ang) * speed
+            local vy = math.sin(ang) * speed
+            local cdmg = (type(msg.dmg) == "number" and msg.dmg > 0) and msg.dmg or 60
+            pcall(function()
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
+                _G.MP_NATIVE.create_cannon(msg.x, msg.y, vx, vy, cdmg, owner_ptr)
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
+            end)
+            logf("bullet_fire: cannon native spawn pos=(%.2f,%.2f) ang=%.3f dmg=%d",
+                 msg.x, msg.y, ang, cdmg)
+        else
+            logf("create_cannon SKIP: no owner_ptr")
+        end
+        return
+    end
+
+    if msg.subclass == 5 and _G.MP_NATIVE and _G.MP_NATIVE.create_adhgrenade then
+        local owner_ptr = owner and owner.pointer
+        if owner_ptr then
+            local ang = msg.angle or 0
+            local speed = msg.speed or 12
+            local vx = math.cos(ang) * speed
+            local vy = math.sin(ang) * speed
+            -- Fuse sync handled natively by hook_AdhFuseTick — it restores
+            -- +0xB8 after vt[23]'s increment whenever the grenade is still
+            -- moving (vx^2+vy^2 > 0.25). Result: fuse only ticks after the
+            -- grenade stops (impact), matching the firer. So no Lua-side
+            -- pre-advance needed.
+            local fuse_advance = 0
+            pcall(function()
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
+                _G.MP_NATIVE.create_adhgrenade(msg.x, msg.y, vx, vy, owner_ptr, fuse_advance)
+                if _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(true) end
+            end)
+            logf("bullet_fire: AGL native spawn pos=(%.2f,%.2f) ang=%.3f fuse_adv=%.3f",
+                 msg.x, msg.y, ang, fuse_advance)
+        else
+            logf("create_adhgrenade SKIP: no owner_ptr")
+        end
+        return
+    end
+
     local bullet_obj
     pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_capture then _G.MP_NATIVE.set_capture(false) end
@@ -2506,6 +2633,8 @@ local function handle_mob_died(msg)
     if mp.is_host or not msg.id then return end
     local entry = mp.mob_puppets[msg.id]
     if not entry then return end
+    stats.note_mob_died(msg.id, entry.type)   -- kill credit if we damaged it
+
     -- Untrack FIRST so the snapshot handler never SetPositions a dying/freed
     -- object (that path calls native abort, which pcall can't catch).
     mp.mob_puppets[msg.id] = nil
@@ -2575,9 +2704,9 @@ local function handle_kicked(m)
     mp.kicked_reason = reason
     if mp.sock then pcall(function() mp.sock:close() end); mp.sock = nil end
     if mp.in_game then
-        -- Mid-game disconnect: need the full "Disconnected from Room"
-        -- notification + restart Teleglitch path (level + puppet state
-        -- can't be safely unwound here).
+        -- Mid-game disconnect: set pending; net_tick_loop runs
+        -- run_kick_cleanup on the next coroutine tick (MP_FRAME_TICK
+        -- doesn't fire in-game, so we can't rely on its cleanup path).
         mp.pending_kick_cleanup = true
     else
         -- Still in lobby/waiting room → no level loaded, no MP entities
@@ -2711,6 +2840,7 @@ local function build_mob_snapshot()
     local mobs = {}
     local dead_ids = {}
     local dead_ptrs = {}
+    local dead_types = {}   -- id -> mob type, for host kill scoring
     -- Build "alive in world" pointer set so we never call methods on a
     -- freed C++ entity (vtable becomes NULL, hard-crashes the host).
     local alive_set = {}
@@ -2743,6 +2873,7 @@ local function build_mob_snapshot()
             if info.miss >= MISS_LIMIT then
                 table.insert(dead_ids, info.id)
                 table.insert(dead_ptrs, ptr)
+                dead_types[info.id] = info.type
             else
                 -- Not confirmed dead yet — keep last known position in the
                 -- snapshot so the puppet doesn't flicker or get re-spawned.
@@ -2769,6 +2900,7 @@ local function build_mob_snapshot()
                 -- Confirmed dead: GetHealth <= 0 (real death, not a scan miss).
                 table.insert(dead_ids, info.id)
                 table.insert(dead_ptrs, ptr)
+                dead_types[info.id] = info.type
             end
         end
     end
@@ -2781,6 +2913,14 @@ local function build_mob_snapshot()
             send_msg({ type = "mob_died", id = id })
             logf("mob_died broadcast id=%d", id)
         end
+        -- Host kill credit: take it unless a joiner damaged this mob recently
+        -- (in which case the joiner claims the kill on its own mob_died).
+        local jt = (mp.joiner_dmg_t or {})[id]
+        if not (jt and (socket.gettime() - jt) <= 2.0) then
+            stats.note_damage(id)
+            stats.note_mob_died(id, dead_types[id])
+        end
+        if mp.joiner_dmg_t then mp.joiner_dmg_t[id] = nil end
     end
     return mobs
 end
@@ -3016,10 +3156,6 @@ local function net_tick_loop()
             -- MP_FRAME_TICK doesn't fire after begin_game. This coroutine
             -- IS resumed on every tick (Wait yields go through lua_resume).
             pcall(tick_death_intercept)
-            -- Refresh injected mainmenu roster labels in-game so they're
-            -- already up-to-date when the user pauses (MP_FRAME_TICK
-            -- doesn't fire during gameplay; this coroutine does).
-            if apply_pause_labels then pcall(apply_pause_labels) end
             local now = socket.gettime()
             if mp.sock and now - mp.last_send >= send_interval then
                 local pl = player.GetPlayer()
@@ -3340,7 +3476,7 @@ local function build_dev_categories()
         end },
         { label = "Force send player_died", run = function()
             if mp.sock then
-                pcall(function() send_msg({ type = "player_died" }) end)
+                pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end)
                 logf("dev: forced player_died send")
             end
         end },
@@ -3691,6 +3827,7 @@ local function dev_menu_tick()
         for _ = 1, 16 do
             local x, y, vx, vy, dmg, force, btype, subclass = _G.MP_NATIVE.consume_bullet()
             if not x then break end
+            stats.add("shots")   -- a real local shot (replicated bullets are mute-captured)
             local angle = math.atan2(vy, vx)
             -- Engine ctor gives vx/vy in PER-TICK world units (very small;
             -- sqrt -> ~1-3). Lua CreateBullet's `speed` arg is in the larger
@@ -3794,6 +3931,8 @@ local function dev_menu_tick()
             if not addr or addr == 0 then break end
             local mob_id = _G.MP_HIT_PUPPET_ADDRS[addr]
             if mob_id then
+                stats.add("hits")            -- shot landed on a mob
+                stats.note_damage(mob_id)    -- kill credit if it dies soon
                 local last = _G.MP_HIT_COOLDOWN[mob_id] or 0
                 if (now - last) > 0.1 then
                     _G.MP_HIT_COOLDOWN[mob_id] = now
@@ -3929,6 +4068,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.death_announced_at = nil
         mp.local_player_obj = nil  -- repopulated by death-intercept block on first tick
         mp.local_player_ptr = nil
+        stats.reset()              -- fresh per-run scoreboard
+        mp.gameover_shown = false
         local seed = mp.session_seed or 1779843477
         logf("begin_game: seed=%s is_host=%s room='%s'",
             tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
@@ -3988,15 +4129,11 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     if not pl or not pl.GiveItem then return end
                     local prev = in_giveitem
                     in_giveitem = true
-                    -- Loadout uses only bullettype.normal weapons, the
-                    -- shape our hooks cover end-to-end. Cannon (own ctor),
-                    -- agl (explode2), lasgun (laser), tesla (electro)
-                    -- need extra subclass support — see KNOWN_ISSUES.md.
                     -- Ammo types from relvad.lua: pump→ppammo, rifle→riammo,
-                    -- smg→pyammo, lasgun→battery (ammotype 5).
+                    -- smg→pyammo, lasgun→battery, agl→pexpammo, cannon→cannonammo.
                     local STARTER = {
-                        weapons = { "pump", "rifle", "smg", "lasgun" },
-                        ammo    = { "ppammo", "riammo", "pyammo", "battery" },
+                        weapons = { "pump", "rifle", "smg", "lasgun", "agl", "cannon" },
+                        ammo    = { "ppammo", "riammo", "pyammo", "battery", "pexpammo", "cannonammo" },
                     }
                     for _, w in ipairs(STARTER.weapons) do
                         pcall(function() pl:GiveItem(w) end)
@@ -4725,7 +4862,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     end)
                     pcall(refresh_objective_string)
                     if mp.sock then
-                        pcall(function() send_msg({ type = "player_died" }) end)
+                        pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end)
                     end
                 end
                 if mp.is_dead then
@@ -4794,7 +4931,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                         -- Tell the server (other clients can mark us dead
                         -- in their rosters once the server forwards it).
                         if mp.sock then
-                            pcall(function() send_msg({ type = "player_died" }) end)
+                            pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end)
                         end
                     end
                 end
@@ -4824,9 +4961,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             mp.local_player_ptr = nil
             mp.room_players = {}
             mp.game_started_pending = false
-            -- Same cross-session cleanup as Disconnect: destroy engine
-            -- entities first, then drop the Lua bookkeeping so the
-            -- next join is clean.
             for _, entry in pairs(mp.puppets or {}) do
                 if type(entry) == "table" then
                     if entry.obj then pcall(function() safe_delete(entry.obj) end) end
@@ -4861,11 +4995,9 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             if _G.MP_NATIVE and _G.MP_NATIVE.set_suppress_esc then
                 pcall(function() _G.MP_NATIVE.set_suppress_esc(true) end)
             end
-            -- On mp_kicked, ESC quits Teleglitch (same as clicking OK).
             if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_quits then
                 pcall(function() _G.MP_NATIVE.set_esc_quits(true) end)
             end
-            -- Disarm the in-game ESC intercept — we're leaving MP.
             if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_opens_mp_pause then
                 pcall(function() _G.MP_NATIVE.set_esc_opens_mp_pause(false) end)
             end
@@ -5115,27 +5247,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 end
             end
         end
-        -- Mirror the roster into the mainmenu page's injected slots so
-        -- the engine's pause overlay (which renders mainmenu directly)
-        -- shows the MP player list. Outside MP we leave them blank.
-        if mp.mainmenu_roster_btns then
-            for i = 1, 4 do
-                local btn = mp.mainmenu_roster_btns[i]
-                local p   = roster[i]
-                if btn and btn.pointer then
-                    local label = ""
-                    if mp.in_game and p then
-                        local nm = tostring(p.name or "?")
-                        local suffix = (p.is_host and "*" or "") .. (p.self and "(me)" or "")
-                        local prefix = i .. ":"
-                        local max_name = 15 - #prefix - #suffix
-                        if max_name < 1 then max_name = 1 end
-                        label = prefix .. nm:sub(1, max_name) .. suffix
-                    end
-                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, label) end)
-                end
-            end
-        end
     end
 
     -- Concrete implementation of the forward-declared apply_waiting_labels.
@@ -5186,25 +5297,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end
 
     -- ------------------------------------------------------------------
-    -- In-game pause roster injected into mainmenu.
-    -- The engine's pause overlay renders the mainmenu page directly
-    -- (bypassing menu.SetPage), so we can't swap to mp_pause via Lua.
-    -- Instead, add 4 player-slot buttons to the right column of
-    -- mainmenu. Labels are blank outside MP, and updated each tick to
-    -- show the roster while in_game. apply_pause_labels (which already
-    -- runs at MP_FRAME_TICK rate) writes into these too.
-    -- Positions: right column at x=144, rows below the Multiplayer btn.
-    -- ------------------------------------------------------------------
-    mp.mainmenu_roster_btns = {}
-    for i = 1, 4 do
-        local y = 126 + (i - 1) * 14
-        local b = mainmenu_page:AddButton(144, y, "",
-            "MP player slot",
-            function() end)
-        mp.mainmenu_roster_btns[i] = b
-    end
-
-    -- ------------------------------------------------------------------
     -- Main-menu entry — single Multiplayer button. Just navigates; the
     -- relay connection happens when the user clicks Create or Join.
     -- ------------------------------------------------------------------
@@ -5238,6 +5330,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             newgame_btn:SetNext("right", mp_btn)
         end
     end)
+
 end)
 if not _mp_integration_ok then
     logf("MP MENU INTEGRATION FAILED: %s", tostring(_mp_integration_err))

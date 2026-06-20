@@ -51,10 +51,12 @@ static FILE* g_log = nullptr;
 static void host_log(const char* fmt, ...) {
     if (!g_log) g_log = fopen("modloader/dllhost.log", "a");
     if (!g_log) return;
-    // Prefix every line with our PID so two-instance logs are
-    // distinguishable. Both instances append to the same file; without
-    // this we can't tell which one fired a hook / called a native.
-    fprintf(g_log, "[%lu] ", (unsigned long)GetCurrentProcessId());
+    // Timestamped + PID-tagged. Two instances append to the same file;
+    // without these tags we can't tell which one fired a hook, nor when.
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(g_log, "[%02d:%02d:%02d.%03d %lu] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            (unsigned long)GetCurrentProcessId());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(g_log, fmt, ap);
@@ -355,6 +357,225 @@ static void* __fastcall hook_ExplodeCtor(void* self, void* edx,
     void* r = orig_ExplodeCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
     g_pending_subclass = prev;
     return r;
+}
+
+// FUN_00436aa0 — called from the shoot dispatcher right after every
+// ctor (cannon / nail / bullet / grenade / etc.) with (bullet, player,
+// stats_obj). Decomp shows it's a stats hit-counter, not a register-
+// with-engine call. We hook + log to see whether the post-ctor crash
+// happens before, during, or after this call.
+typedef void* (__cdecl *PostCtorStatsFn)(unsigned arg1, unsigned arg2, void* stats);
+static PostCtorStatsFn orig_PostCtorStats = nullptr;
+static int g_pcs_calls = 0;
+static void* __cdecl hook_PostCtorStats(unsigned arg1, unsigned arg2, void* stats) {
+    ++g_pcs_calls;
+    int n = g_pcs_calls;
+    host_log("PostCtorStats #%d ENTRY a1=%08x a2=%08x stats=%p", n, arg1, arg2, stats);
+    void* r = orig_PostCtorStats(arg1, arg2, stats);
+    host_log("PostCtorStats #%d RETURN", n);
+    return r;
+}
+
+// FUN_0049ee40 — Steam stats counter, called after FUN_00436aa0 in the
+// shoot dispatcher. Hook + log to bracket the post-ctor sequence.
+typedef void (__fastcall *SteamStatsFn)(void* self, void* edx, void* name);
+static SteamStatsFn orig_SteamStats = nullptr;
+static int g_ss_calls = 0;
+static void __fastcall hook_SteamStats(void* self, void* edx, void* name) {
+    ++g_ss_calls;
+    int n = g_ss_calls;
+    host_log("SteamStats #%d ENTRY self=%p name=%p", n, self, name);
+    orig_SteamStats(self, edx, name);
+    host_log("SteamStats #%d RETURN", n);
+}
+
+// FUN_00498ad0 — TCannonBullet / TBullet / TAdhesiveGrenade vt[11]
+// (per-tick movement + collision). Shared across multiple subclasses;
+// we filter on cannon vftable so we only log cannons. Logging entry +
+// exit lets us tell whether the crash is inside vt[11] (entry but no
+// exit) or somewhere else in the engine's per-frame loop (no entry).
+static BYTE* g_cannon_vftable_va = nullptr;  // populated at hook install
+typedef void (__fastcall *Vt11Fn)(void* self);
+static Vt11Fn orig_Vt11 = nullptr;
+static int    g_vt11_cannon_calls = 0;
+static void __fastcall hook_Vt11(void* self) {
+    bool is_cannon = (self && *(void**)self == (void*)g_cannon_vftable_va);
+    if (is_cannon) {
+        ++g_vt11_cannon_calls;
+        host_log("VT11 cannon ENTRY #%d self=%p pos=(%.3f,%.3f) vel=(%.3f,%.3f) "
+                 "alive_byte=%u 6c=%u 6e=%u",
+                 g_vt11_cannon_calls, self,
+                 *(float*)((char*)self + 0x74), *(float*)((char*)self + 0x78),
+                 *(float*)((char*)self + 0x90), *(float*)((char*)self + 0x94),
+                 *((unsigned char*)self + 0x2e),
+                 *((unsigned char*)self + 0x6c),
+                 *((unsigned char*)self + 0x6e));
+    }
+    orig_Vt11(self);
+    if (is_cannon) {
+        host_log("VT11 cannon RETURN #%d self=%p (survived)", g_vt11_cannon_calls, self);
+    }
+}
+
+// FUN_0044f210 — TPlayer::vt[19] / TActor::vt[19]: the per-actor bullet
+// dispatch. vt[11] of a flying bullet calls this when its raycast hits
+// an actor. Switches on bullet's +0x5c subclass tag: case 8 → vt[28]
+// (the cannon/TBullet path), 0x10 → vt[26], 0x20 → vt[27], 0x100 → vt[29]
+// (laser). Logging every call here is too noisy globally — we only log
+// when the bullet looks like a CANNON (vtable matches TCannonBullet's).
+// FUN_0044f210 — actor bullet dispatch. RET 0x1c = 7 stack args, not 5
+// (Ghidra decomp under-counted). Wrong arg count = stack imbalance →
+// caller (vt[11]) crashes after we return.
+typedef void (__fastcall *ActorBulletDispatchFn)(void* self, void* edx,
+                                                 int bullet, int p2, int p3, int p4,
+                                                 int p5, int p6, int p7);
+static ActorBulletDispatchFn orig_ActorBulletDispatch = nullptr;
+static void __fastcall hook_ActorBulletDispatch(void* self, void* edx,
+                                                int bullet, int p2, int p3, int p4,
+                                                int p5, int p6, int p7) {
+    void* bvt = (bullet ? *(void**)bullet : nullptr);
+    int   tag = (bullet ? *(int*)((char*)bullet + 0x5c) : -1);
+    bool is_cannon = (bvt && bvt == (void*)g_cannon_vftable_va);
+    if (is_cannon) {
+        void* actor_vt = *(void**)self;
+        unsigned char invuln = *((unsigned char*)self + 0xfc);
+        host_log("DISPATCH cannon actor=%p actor_vt=%p invuln=%u bullet=%p bvt=%p tag=%d "
+                 "-> actor vt[28] @ %p",
+                 self, actor_vt, invuln, (void*)bullet, bvt, tag,
+                 actor_vt ? *(void**)((char*)actor_vt + 0x70) : nullptr);
+    }
+    orig_ActorBulletDispatch(self, edx, bullet, p2, p3, p4, p5, p6, p7);
+    if (is_cannon) {
+        host_log("DISPATCH cannon RETURN actor=%p (survived)", self);
+    }
+}
+
+// FUN_00497770 — cannon impact handler. Spawns 20 TNail shrapnel + AoE
+// entity. The shrapnel-vs-puppet path AVs on the firer (one of the nails
+// hits a remote-player puppet on the host and the engine's collision
+// path mishandles the puppet's hooked state). No-op'd as a workaround:
+// cannon fires + flies + impacts visually, but no shrapnel/AoE damage.
+// TODO: gate per-nail collision against puppets instead of skipping the
+// whole impact, so cannon does real damage to mobs.
+typedef void (__fastcall *CannonBoomFn)(int self);
+static CannonBoomFn orig_CannonBoom = nullptr;
+static void __fastcall hook_CannonBoom(int self) {
+    // Skip orig — no shrapnel, no AoE, no shake. Prevents the
+    // shrapnel-vs-puppet AV.
+    (void)self;
+}
+
+// TCannonBullet ctor (0x497660) — cannon (bullettypes.cannon=8). Like
+// AGL, it calls TProjectile (FUN_00498920) as its base — not TBullet —
+// so hook_BulletCtor never fires. Capture directly here. Signature: 6
+// stack args (x, y, vx, vy, dmg, owner).
+// Cannon ctor takes 7 stack args (RET 0x1c confirmed) — Ghidra's decomp
+// only showed 6, but the binary pops 28 bytes. Last arg (a7) is unused
+// inside the ctor body but the caller pushes it. Mismatch = stack
+// imbalance → next dispatcher op crashes (security cookie / EIP).
+typedef void* (__fastcall *CannonCtorFn)(void* self, void* edx,
+                                         int a1, int a2, int a3, int a4,
+                                         int a5, int a6, int a7);
+static CannonCtorFn orig_CannonCtor = nullptr;
+static void* __fastcall hook_CannonCtor(void* self, void* edx,
+                                        int a1, int a2, int a3, int a4,
+                                        int a5, int a6, int a7) {
+    union { int i; float f; } px, py, vx, vy, dmgf;
+    px.i = a1; py.i = a2; vx.i = a3; vy.i = a4; dmgf.i = a5;
+    host_log("CANNON ctor ENTRY self=%p args: x=%.3f y=%.3f vx=%.3f vy=%.3f dmg=%.3f owner=%08x a7=%08x",
+             self, px.f, py.f, vx.f, vy.f, dmgf.f, (unsigned)a6, (unsigned)a7);
+    // MSVC __thiscall ctors return `this` in EAX. Must propagate
+    // orig's return value or callers read EAX = garbage from our hook
+    // and the next op on the bullet AVs.
+    void* ret = orig_CannonCtor(self, edx, a1, a2, a3, a4, a5, a6, a7);
+    // Post-ctor field dump — read what the engine actually wrote so we
+    // can spot bad init (e.g. velocity blowup, missing vtable). Field
+    // offsets per TProjectile/TCannonBullet ctor: vtable=+0x00,
+    // type_tag=+0x5c (8), pos=+0x74/+0x78, vel=+0x90/+0x94, dmg=+0xb8,
+    // alive_byte=+0x2e, mask_byte=+0x6e.
+    void* vt    = *(void**)self;
+    int   tag   = *(int*)((char*)self + 0x5c);
+    float ppx   = *(float*)((char*)self + 0x74);
+    float ppy   = *(float*)((char*)self + 0x78);
+    float pvx   = *(float*)((char*)self + 0x90);
+    float pvy   = *(float*)((char*)self + 0x94);
+    float pdmg  = *(float*)((char*)self + 0xb8);
+    unsigned char mask = *((unsigned char*)self + 0x6e);
+    unsigned char alive = *((unsigned char*)self + 0x2e);
+    host_log("CANNON ctor RETURN self=%p ret=%p vt=%p tag=%d pos=(%.3f,%.3f) vel=(%.3f,%.3f) "
+             "dmg=%.3f alive_byte=%u mask_byte=%u",
+             self, ret, vt, tag, ppx, ppy, pvx, pvy, pdmg, alive, mask);
+    if (g_bullet_capture) {
+        int idx = g_bullet_write_idx % BULLET_RING_SIZE;
+        g_bullet_ring[idx].x = px.f;
+        g_bullet_ring[idx].y = py.f;
+        g_bullet_ring[idx].vx = vx.f;
+        g_bullet_ring[idx].vy = vy.f;
+        g_bullet_ring[idx].dmg = dmgf.f;
+        g_bullet_ring[idx].force = 0.0f;
+        g_bullet_ring[idx].type = 8;
+        g_bullet_ring[idx].subclass = 8;
+        g_bullet_write_idx++;
+    }
+    return ret;
+}
+
+// vt[23] @ 0x495e20 — TAdhesiveGrenade per-tick step: moves the grenade
+// AND increments the fuse counter (+0xB8). Engine increments fuse
+// unconditionally each tick, so the receiver's mid-flight grenade ticks
+// fuse from spawn while the firer's grenade observably fuses only after
+// impact (probable engine-side gate we haven't found). To match: gate
+// here in our hook — call orig so movement runs, then if velocity is
+// still high (still flying), restore the pre-call fuse value so the
+// increment is effectively undone. Once the grenade stops (impact),
+// fuse ticks normally on both sides.
+typedef void (__fastcall *AdhFuseTickFn)(void* self);
+static AdhFuseTickFn orig_AdhFuseTick = nullptr;
+static void __fastcall hook_AdhFuseTick(void* self) {
+    if (!self) { return; }
+    float pre_fuse = *(float*)((char*)self + 0xB8);
+    orig_AdhFuseTick(self);
+    float vx = *(float*)((char*)self + 0x90);
+    float vy = *(float*)((char*)self + 0x94);
+    if ((vx*vx + vy*vy) > 0.25f) {
+        *(float*)((char*)self + 0xB8) = pre_fuse;
+    }
+}
+
+// TAdhesiveGrenade ctor (0x4958b0) — AGL (bullettypes.explode2=5). Unlike
+// TNail/TExplodingBullet, this calls TProjectile (FUN_00498920) as its
+// base — NOT the TBullet ctor — so our hook_BulletCtor never fires for
+// AGL shots. We capture the args directly here and write a ring entry
+// just like hook_BulletCtor would, tagged subclass=5 (explode2). Args
+// match the AGL ctor signature: 5 stack args (x, y, vx, vy, owner).
+typedef void (__fastcall *AdhgrenadeCtorFn)(void* self, void* edx,
+                                            int a1, int a2, int a3, int a4,
+                                            int a5);
+static AdhgrenadeCtorFn orig_AdhgrenadeCtor = nullptr;
+static void __fastcall hook_AdhgrenadeCtor(void* self, void* edx,
+                                           int a1, int a2, int a3, int a4,
+                                           int a5) {
+    orig_AdhgrenadeCtor(self, edx, a1, a2, a3, a4, a5);
+    if (!g_bullet_capture) return;
+    union { int i; float f; } px, py, vx, vy;
+    px.i = a1; py.i = a2; vx.i = a3; vy.i = a4;
+    int idx = g_bullet_write_idx % BULLET_RING_SIZE;
+    g_bullet_ring[idx].x = px.f;
+    g_bullet_ring[idx].y = py.f;
+    g_bullet_ring[idx].vx = vx.f;
+    g_bullet_ring[idx].vy = vy.f;
+    // Damage is hardcoded inside the ctor (DAT_00558ab8 written to +0xB8);
+    // we read it back from the constructed object so the receiver gets the
+    // engine's authoritative value rather than a Lua-side guess.
+    union { int i; float f; } dmgback;
+    dmgback.i = *(int*)((char*)self + 0xB8);
+    g_bullet_ring[idx].dmg = dmgback.f;
+    g_bullet_ring[idx].force = 0.0f;
+    g_bullet_ring[idx].type = 5;          // bullettypes.explode2
+    g_bullet_ring[idx].subclass = 5;
+    g_bullet_write_idx++;
+    host_log("hook_AdhgrenadeCtor: pos=(%.2f,%.2f) vel=(%.2f,%.2f) dmg=%.1f",
+             px.f, py.f, vx.f, vy.f, dmgback.f);
 }
 
 // =============== TLASER LIFETIME DIAGNOSTIC HOOKS ===============
@@ -664,6 +885,108 @@ static int l_lmb_state(lua_State* L) {
     api.pushboolean(L, (s & 0x8000) ? 1 : 0);
     api.pushboolean(L, (s & 0x0001) ? 1 : 0);
     return 2;
+}
+
+// create_adhgrenade(x, y, vx, vy, owner_ptr) — spawn an AGL grenade on
+// the receiver. Mirrors how the engine builds TAdhesiveGrenade: a 0xC0
+// object, __thiscall ctor at 0x4958b0 with (x, y, vx, vy, owner), then
+// register-from-lua so the engine picks it up like a normal entity.
+typedef void (__fastcall *AdhgrenadeCtorCallFn)(void* self, void* edx,
+                                                int a1, int a2, int a3, int a4,
+                                                int a5);
+static int l_create_adhgrenade(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    static LuaToNumberFn lua_tonumber_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+    }
+    if (!init_subclass_spawn()) { api.pushnil(L); return 1; }
+
+    union { int i; float f; } x, y, vx, vy;
+    x.f  = (float)lua_tonumber_p(L, 1, nullptr);
+    y.f  = (float)lua_tonumber_p(L, 2, nullptr);
+    vx.f = (float)lua_tonumber_p(L, 3, nullptr);
+    vy.f = (float)lua_tonumber_p(L, 4, nullptr);
+    void* owner = resolve_entity(L, 5);
+    // Optional arg 6: pre-advance the fuse counter (+0xB8 float) by this
+    // amount. vt[23] increments +0xB8 each tick by _DAT_00558a9c and
+    // explodes when it reaches DAT_00558bb0 (~1.0). Adding a small
+    // fraction here compensates for network latency so the receiver's
+    // grenade explodes ~same wall-clock time as the firer's.
+    float fuse_advance = (float)lua_tonumber_p(L, 6, nullptr);
+    if (!owner) {
+        host_log("create_adhgrenade: no owner — bailing");
+        api.pushnil(L); return 1;
+    }
+
+    void* obj = g_op_new(0xC0);
+    if (!obj) { api.pushnil(L); return 1; }
+
+    // Mute the ctor hook for this call — we're SPAWNING for the receiver
+    // and don't want to re-broadcast our own replicated grenade.
+    bool prev_capture = g_bullet_capture;
+    g_bullet_capture = false;
+    AdhgrenadeCtorCallFn ctor = (AdhgrenadeCtorCallFn)(mod_base() + 0x958b0);
+    ctor(obj, nullptr, x.i, y.i, vx.i, vy.i, (int)(intptr_t)owner);
+    g_bullet_capture = prev_capture;
+
+    if (fuse_advance > 0.0f) {
+        float* fuse = (float*)((char*)obj + 0xB8);
+        *fuse += fuse_advance;
+    }
+
+    g_register(obj, L);
+    host_log("create_adhgrenade RECEIVER obj=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f) fuse_adv=%.3f",
+             obj, x.f, y.f, vx.f, vy.f, fuse_advance);
+    return 1;  // FUN_004b3a90 pushes the entity table for us
+}
+
+// create_cannon(x, y, vx, vy, dmg, owner_ptr) — spawn a TCannonBullet on
+// the receiver. Mirrors how the engine builds one: 0xBC object, ctor at
+// 0x497660 with (x, y, vx, vy, dmg, owner), then register-from-lua so
+// the engine ticks it like any other entity. On impact, vt[22] →
+// FUN_00497770 spawns the shrapnel + explosion automatically.
+typedef void (__fastcall *CannonCtorCallFn)(void* self, void* edx,
+                                            int a1, int a2, int a3, int a4,
+                                            int a5, int a6, int a7);
+static int l_create_cannon(lua_State* L) {
+    typedef double (*LuaToNumberFn)(lua_State*, int, int*);
+    typedef int    (*LuaToIntegerFn)(lua_State*, int, int*);
+    static LuaToNumberFn  lua_tonumber_p  = nullptr;
+    static LuaToIntegerFn lua_tointeger_p = nullptr;
+    if (!lua_tonumber_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_tonumber_p  = (LuaToNumberFn)GetProcAddress(lm, "lua_tonumberx");
+        lua_tointeger_p = (LuaToIntegerFn)GetProcAddress(lm, "lua_tointegerx");
+    }
+    if (!init_subclass_spawn()) { api.pushnil(L); return 1; }
+
+    union { int i; float f; } x, y, vx, vy, dmgf;
+    x.f  = (float)lua_tonumber_p(L, 1, nullptr);
+    y.f  = (float)lua_tonumber_p(L, 2, nullptr);
+    vx.f = (float)lua_tonumber_p(L, 3, nullptr);
+    vy.f = (float)lua_tonumber_p(L, 4, nullptr);
+    dmgf.f = (float)lua_tonumber_p(L, 5, nullptr);
+    void* owner = resolve_entity(L, 6);
+    if (!owner) {
+        host_log("create_cannon: no owner — bailing");
+        api.pushnil(L); return 1;
+    }
+
+    void* obj = g_op_new(0xBC);
+    if (!obj) { api.pushnil(L); return 1; }
+
+    bool prev_capture = g_bullet_capture;
+    g_bullet_capture = false;
+    CannonCtorCallFn ctor = (CannonCtorCallFn)(mod_base() + 0x97660);
+    ctor(obj, nullptr, x.i, y.i, vx.i, vy.i, dmgf.i, (int)(intptr_t)owner, 0);
+    g_bullet_capture = prev_capture;
+
+    g_register(obj, L);
+    host_log("create_cannon RECEIVER obj=%p pos=(%.2f,%.2f) vel=(%.2f,%.2f) dmg=%.1f",
+             obj, x.f, y.f, vx.f, vy.f, dmgf.f);
+    return 1;
 }
 
 // Refresh an existing TLaser by re-calling its vt[22] — updates the beam
@@ -1096,6 +1419,42 @@ static int l_install_hook_bullet(lua_State* L) {
     MH_STATUS es = MH_CreateHook(explCtor, (LPVOID)&hook_ExplodeCtor, (LPVOID*)&orig_ExplodeCtor);
     if (es == MH_OK) es = MH_EnableHook(explCtor);
     host_log("exploding bullet ctor hook: status=%d", es);
+    BYTE* adhCtor = (BYTE*)m + 0x958b0;  // TAdhesiveGrenade ctor (AGL / explode2)
+    MH_STATUS as = MH_CreateHook(adhCtor, (LPVOID)&hook_AdhgrenadeCtor, (LPVOID*)&orig_AdhgrenadeCtor);
+    if (as == MH_OK) as = MH_EnableHook(adhCtor);
+    host_log("adhesive grenade ctor hook: status=%d", as);
+    BYTE* adhFuse = (BYTE*)m + 0x95e20;  // TAdhesiveGrenade vt[23] — fuse + movement
+    MH_STATUS afs = MH_CreateHook(adhFuse, (LPVOID)&hook_AdhFuseTick, (LPVOID*)&orig_AdhFuseTick);
+    if (afs == MH_OK) afs = MH_EnableHook(adhFuse);
+    host_log("adhesive grenade fuse hook: status=%d", afs);
+    BYTE* cannonCtor = (BYTE*)m + 0x97660;  // TCannonBullet ctor (cannon / type 8)
+    MH_STATUS cs = MH_CreateHook(cannonCtor, (LPVOID)&hook_CannonCtor, (LPVOID*)&orig_CannonCtor);
+    if (cs == MH_OK) cs = MH_EnableHook(cannonCtor);
+    host_log("cannon ctor hook: status=%d", cs);
+    BYTE* cannonBoom = (BYTE*)m + 0x97770;  // FUN_00497770 — no-op'd to dodge puppet AV
+    MH_STATUS cbs = MH_CreateHook(cannonBoom, (LPVOID)&hook_CannonBoom, (LPVOID*)&orig_CannonBoom);
+    if (cbs == MH_OK) cbs = MH_EnableHook(cannonBoom);
+    host_log("cannon boom no-op hook: status=%d", cbs);
+    // Cache the relocated TCannonBullet vftable VA so the actor bullet
+    // dispatch hook can identify cannon bullets cheaply.
+    g_cannon_vftable_va = (BYTE*)m + 0x158454;  // file RVA = 0x158454
+    BYTE* actorDispatch = (BYTE*)m + 0x4f210;   // FUN_0044f210 (= shared TPlayer/TActor vt[19])
+    MH_STATUS ds = MH_CreateHook(actorDispatch, (LPVOID)&hook_ActorBulletDispatch,
+                                 (LPVOID*)&orig_ActorBulletDispatch);
+    if (ds == MH_OK) ds = MH_EnableHook(actorDispatch);
+    host_log("actor bullet dispatch hook: status=%d cannon_vt=%p", ds, g_cannon_vftable_va);
+    BYTE* vt11 = (BYTE*)m + 0x98ad0;  // shared per-tick (TCannonBullet / TBullet / TAdhesiveGrenade)
+    MH_STATUS v11s = MH_CreateHook(vt11, (LPVOID)&hook_Vt11, (LPVOID*)&orig_Vt11);
+    if (v11s == MH_OK) v11s = MH_EnableHook(vt11);
+    host_log("vt[11] hook: status=%d", v11s);
+    BYTE* pcs = (BYTE*)m + 0x36aa0;  // FUN_00436aa0 — post-ctor stats
+    MH_STATUS pcss = MH_CreateHook(pcs, (LPVOID)&hook_PostCtorStats, (LPVOID*)&orig_PostCtorStats);
+    if (pcss == MH_OK) pcss = MH_EnableHook(pcs);
+    host_log("post-ctor stats hook: status=%d", pcss);
+    BYTE* ss2 = (BYTE*)m + 0x9ee40;  // FUN_0049ee40 — Steam stats counter
+    MH_STATUS sss = MH_CreateHook(ss2, (LPVOID)&hook_SteamStats, (LPVOID*)&orig_SteamStats);
+    if (sss == MH_OK) sss = MH_EnableHook(ss2);
+    host_log("steam stats hook: status=%d", sss);
     BYTE* laserCtor = (BYTE*)m + 0x97cd0;
     MH_STATUS ls = MH_CreateHook(laserCtor, (LPVOID)&hook_LaserCtor, (LPVOID*)&orig_LaserCtor);
     if (ls == MH_OK) ls = MH_EnableHook(laserCtor);
@@ -2787,6 +3146,30 @@ static int l_inject_esc(lua_State* L) {
     return 1;
 }
 
+// simulate_esc() — fire an ESC keystroke via SendInput so it appears in
+// the system keyboard buffer. Unlike inject_esc (PostMessage), this
+// reaches DirectInput, which is how Teleglitch reads keys at gameplay
+// time. Used to force the engine to pause from Lua (e.g. after a
+// mid-game kick). Caller MUST own foreground focus — SendInput targets
+// the focused window. Pass-through count is bumped so our own kbd_ll /
+// PeekMessageA hooks don't swallow the event.
+static int l_simulate_esc(lua_State* L) {
+    g_pass_esc_count = 2;
+    INPUT inputs[2] = {0};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_ESCAPE;
+    inputs[0].ki.wScan = MapVirtualKeyA(VK_ESCAPE, MAPVK_VK_TO_VSC);
+    inputs[0].ki.dwFlags = 0;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_ESCAPE;
+    inputs[1].ki.wScan = MapVirtualKeyA(VK_ESCAPE, MAPVK_VK_TO_VSC);
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    host_log("simulate_esc: SendInput sent=%u (of 2)", sent);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 // set_esc_leaves_lobby(bool) — when true, the hook records ESC keydowns
 // into g_esc_pressed (and swallows the message). The Lua tick polls
 // via check_esc_pressed() and triggers lobby_leave_room.
@@ -3036,6 +3419,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "swap_bullet_subclass");
     api.pushcclosure(L, l_create_tlaser, 0);
     api.setfield(L, -2, "create_tlaser");
+    api.pushcclosure(L, l_create_adhgrenade, 0);
+    api.setfield(L, -2, "create_adhgrenade");
+    api.pushcclosure(L, l_create_cannon, 0);
+    api.setfield(L, -2, "create_cannon");
     api.pushcclosure(L, l_mark_laser_dead, 0);
     api.setfield(L, -2, "mark_laser_dead");
     api.pushcclosure(L, l_lmb_pressed, 0);
@@ -3112,6 +3499,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_suppress_esc");
     api.pushcclosure(L, l_inject_esc, 0);
     api.setfield(L, -2, "inject_esc");
+    api.pushcclosure(L, l_simulate_esc, 0);
+    api.setfield(L, -2, "simulate_esc");
     api.pushcclosure(L, l_set_esc_quits, 0);
     api.setfield(L, -2, "set_esc_quits");
     api.pushcclosure(L, l_set_esc_leaves_lobby, 0);
