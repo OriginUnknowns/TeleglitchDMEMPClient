@@ -110,40 +110,48 @@ the new native instead of `CreateBullet` + `swap_bullet_subclass`.
 
 `operator_new` address: TBC (search for any caller of size 0xc0).
 
-## 🟡 Cannon AoE / shrapnel gated — blocked by heap corruptor (2026-06-20)
+## 🟢 Cannon AoE shipped via Lua-handle-aware AV recovery (2026-06-22)
 
-**Resolved (firer-side crash on fire):** our own `hook_CannonCtor`
-declared the wrong number of stack args (6 instead of 7, RET 0x1c
-confirmed via Ghidra). Stack imbalance corrupted the dispatcher's frame
-and the next op AV'd. Same defect on `hook_ActorBulletDispatch`
-(RET 0x1c = 7, not 5) and `hook_NailCtor` (RET 0x24 = 9, not 8 — the
-nail miscount is what made cannon shrapnel-spawn crash, because the
-boom function spawns 20 nails in a row so the per-call 4-byte drift
-compounds inside the boom's frame).
+Fully working — cannon now fires, replicates, hits, AoE-explodes, and
+shrapnel-sprays just like single-player. Two layers got us there:
 
-**Working now:** cannon fires + replicates (`hook_CannonCtor` →
-`bullet_fire {subclass=8}` → `create_cannon` native on the receiver) +
-direct-hit damage works on contact (kills teammates/mobs).
+1. **Arity bugs in our own hooks (resolved 2026-06-19/20).** Ghidra's
+   decomp under-counted stack args on multiple ctor/dispatch hooks. The
+   real shapes (confirmed via `GetCannonPurge.java` reading the RET
+   purge byte):
+     - `hook_CannonCtor` 6→7 args (RET 0x1c)
+     - `hook_NailCtor` 8→9 args (RET 0x24) — *this* was the cannon
+       boom crash: it spawns 20 nails in a row, the per-call 4-byte
+       stack drift compounded inside the boom frame and clobbered
+       locals on the way out
+     - `hook_ActorBulletDispatch` 5→7 args (RET 0x1c on FUN_0044f210)
 
-**Gated:** `hook_CannonBoom` no-ops `FUN_00497770` (the cannon impact
-handler that spawns 20 TNail shrapnel + a TPlahvatus AoE entity).
-Reason — **cdb dump caught the real crash** in the engine's TPlayer
-damage-tally iterator (`FUN_00417720`):
-```
-ecx=1ec05588 edx=00ba831c
-[ecx] = 00ba831c                              ; "vtable"
-1ec05588  00ba831c 3f800000 3f800000 3f800000  ; entity contents
-1ec05598  3f800000 69746e65 00007974 7ff7a516  ; "enti" "ty\0\0" + Lua NaN-box
-```
-The "entity" the iterator dereferenced is actually a **Lua TValue
-array** — the recurring lua52 heap corruptor (task #2) is bleeding Lua
-table memory into the engine's attacker list. Cannon's TPlahvatus AoE
-hits the firer themselves, the damage handler iterates attackers, one
-entry is a corrupted Lua-table pointer → AV.
+2. **`mp_damage_tally_veh` vectored exception handler.** Cannon's
+   TPlahvatus AoE damages the firer themselves; the engine's damage
+   tally then iterates an "attackers" list, and entries get poisoned
+   by the long-running heap corruptor (task #2) — the buffer's memory
+   gets recycled to Lua TValue arrays that have the engine's own
+   `lua_setfield(L,"entity",…)` imprint at +0x14.
 
-Fix path: cannon AoE unblocks once task #2 (heap corruptor) is fixed.
-Not a cannon-specific bug — cannon just produces enough rapid heap
-operations to trigger it reliably.
+   The VEH matches any `mov <reg>,[<reg>+disp8]; call <same-reg>`
+   pattern (general virtual-call shape) whose operand reads from one of
+   those Lua-handle-shaped objects, and skips 5 bytes past the call.
+   The fingerprint check is the literal `"entity"` string at +0x14
+   (`0x69746e65 0x00007974`) — engine emits exactly that on every Lua
+   handle table it builds, and no genuine C++ entity has that layout,
+   so it can't false-positive. Catches both observed crash sites
+   (`FUN_00417720` vt[10] @ +0x17894 and `FUN_00419330` vt[13] @
+   +0x19757) and any other accessor that gets added later without
+   needing per-site enumeration.
+
+**Remaining cosmetic:** receiver-side cannon flies faster than the
+firer's (`speed = 15` fixed in Lua bullet_fire dispatch vs the engine's
+natural ~2.7 units/tick from the weapon table). So the replicated
+cannon arrives at impact earlier than the firer's. Visual only — both
+sides spawn their own cannon and damage applies locally on each, so
+the gameplay outcome is the same. Fix is one Lua tweak in
+`init.lua` bullet_fire dispatch (subclass == 8 branch) to send +use
+the real per-shot speed instead of the hardcoded 15.
 
 ## 🟡 Shotgun (5-pellet rapid fire) crashes remote client (2026-06-17)
 

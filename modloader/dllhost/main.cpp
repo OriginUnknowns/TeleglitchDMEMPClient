@@ -300,6 +300,8 @@ static int g_bullet_read_idx = 0;
 // amplify infinitely.
 static volatile bool g_bullet_capture = true;
 
+static void track_entity_birth(void* ptr, unsigned short tag);  // body defined further down (near the damage-tally VEH)
+
 static void* __fastcall hook_BulletCtor(void* self, void* edx,
                                         int a1, int a2, int a3, int a4,
                                         int a5, int a6, int a7, int a8) {
@@ -325,7 +327,10 @@ static void* __fastcall hook_BulletCtor(void* self, void* edx,
         host_log("hook_BulletCtor #%d: pos=(%.2f,%.2f) vel=(%.2f,%.2f) dmg=%.1f type=%d force=%.2f",
                  g_bullet_count, px.f, py.f, vx.f, vy.f, dmgf.f, a6, forcef.f);
     }
-    return orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    void* r = orig_BulletCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
+    // Track for the damage-tally crash forensics (tag 1 = TBullet base).
+    track_entity_birth(r, 1);
+    return r;
 }
 
 // Subclass ctor hooks — both TExplodingBullet (0x497140) and TNail (0x497200)
@@ -357,6 +362,7 @@ static void* __fastcall hook_NailCtor(void* self, void* edx,
     g_pending_subclass = 1;  // bullettypes.nails
     void* r = orig_NailCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8, a9);
     g_pending_subclass = prev;
+    track_entity_birth(r, 2);  // TNail
     return r;
 }
 
@@ -367,6 +373,7 @@ static void* __fastcall hook_ExplodeCtor(void* self, void* edx,
     g_pending_subclass = 2;  // bullettypes.explode
     void* r = orig_ExplodeCtor(self, edx, a1, a2, a3, a4, a5, a6, a7, a8);
     g_pending_subclass = prev;
+    track_entity_birth(r, 3);  // TExplode
     return r;
 }
 
@@ -467,24 +474,148 @@ static void __fastcall hook_ActorBulletDispatch(void* self, void* edx,
     orig_ActorBulletDispatch(self, edx, bullet, p2, p3, p4, p5, p6, p7);
 }
 
-// FUN_00497770 — cannon impact handler. Spawns 20 TNail shrapnel + AoE
-// entity. Skip-orig version dodged the firer-side AV but cost the AoE
-// damage + explosion FX. Now: pass through and let the spec'd nail-vs-
-// puppet filter (in hook_ActorBulletDispatch below) catch the unsafe
-// collision so cannon does real damage.
-// Skip orig — cannon's boom spawns 20 TNail shrapnel + a TPlahvatus AoE
-// entity. The AoE damages the firer too, which triggers the engine's
-// damage-tally iterator in FUN_00417720 (TPlayer damage handler). That
-// iterator walks an internal "attackers" list that's getting Lua TValue
-// corruption mixed in (see task #2 heap corruptor — confirmed via cdb
-// dump: ECX entity has "entity" ASCII + NaN-boxed Lua TValues at +0x14+).
-// Cannon does damage via direct hit (vt[28] TakeDamage on contact),
-// which is unaffected. No shrapnel + no AoE explosion FX until the
-// heap corruptor is fixed.
+// FUN_00497770 — cannon impact handler. Spawns 20 TNail shrapnel + a
+// TPlahvatus AoE entity. Now runs naturally; the actual crash lives
+// downstream in FUN_00417720 (the TPlayer damage-tally iterator) and
+// is caught by hook_DamageTally below.
 typedef void (__fastcall *CannonBoomFn)(int self);
 static CannonBoomFn orig_CannonBoom = nullptr;
 static void __fastcall hook_CannonBoom(int self) {
-    (void)self;
+    orig_CannonBoom(self);
+}
+
+// FUN_00417720 — TPlayer damage-tally iterator. Walks an internal
+// "attackers" list and calls vt[10] on each entry. One or more entries
+// is actually a Lua TValue array (cdb-confirmed: entity contents have
+// "entity" ASCII + NaN-boxed values where C++ object state should be)
+// — the long-running lua52 heap corruptor (task #2) bleeding Lua memory
+// into engine entity lists. Reading vt[10] on those poisoned entries
+// AVs at the specific instruction `mov eax,[edx+28h]` at engine+0x17894.
+//
+// Tracking strategy: register a ring of every TPlayer-class ctor we hook
+// (TBullet / TNail / TExplode / TCannon / TAdhesive / TPlahvatus etc).
+// When the VEH below fires, look up the ECX (= corrupted "entity") in
+// the ring — if it matches a known ctor, we know what kind it was and
+// when it was created. Combined with the dump of its current contents,
+// that pins which entity got freed-then-Lua-repurposed.
+//
+// Recovery still happens (skip 5 bytes past the bad call) so gameplay
+// continues, but every recovery emits a forensics dump we can mine.
+#define ENTITY_TRACK_RING 256
+struct EntityBirth { void* ptr; DWORD ms; unsigned short tag; unsigned short pad; };
+static EntityBirth g_entity_births[ENTITY_TRACK_RING] = {0};
+static volatile int g_entity_births_write = 0;
+static void track_entity_birth(void* ptr, unsigned short tag) {
+    if (!ptr) return;
+    int idx = (g_entity_births_write++) % ENTITY_TRACK_RING;
+    g_entity_births[idx].ptr = ptr;
+    g_entity_births[idx].ms  = GetTickCount();
+    g_entity_births[idx].tag = tag;
+}
+// Tag enum (short id we put in the log so it's compact):
+//   1=TBullet  2=TNail  3=TExplode  5=TAdhesive  8=TCannon  20=TPlahvatus
+static const char* entity_tag_name(unsigned short t) {
+    switch (t) {
+        case 1: return "TBullet";
+        case 2: return "TNail";
+        case 3: return "TExplode";
+        case 5: return "TAdhesive";
+        case 8: return "TCannon";
+        case 20: return "TPlahvatus";
+        default: return "?";
+    }
+}
+static const EntityBirth* find_entity_birth(void* ptr) {
+    for (int i = 0; i < ENTITY_TRACK_RING; ++i) {
+        if (g_entity_births[i].ptr == ptr) return &g_entity_births[i];
+    }
+    return nullptr;
+}
+
+// The damage-tally iteration site comes in many flavors — vt[10] in
+// FUN_00417720 (EIP 0x17894), vt[13] in FUN_00419330 (EIP 0x19757), and
+// likely others as the engine touches each entity for additional
+// accessors. All share the byte pattern `mov eax,[edx+N]; call eax`
+// (5 bytes total). Rather than enumerate EIPs, we identify by the
+// CORRUPTED ENTITY shape: if the "entity" at ECX has the Lua-table
+// fingerprint (the literal string "entity" at +0x14, which is the
+// engine's setfield(L, "entity", value) imprint on every Lua handle
+// table it builds), skip the 5-byte virtual call. The genuine engine
+// path never hits this guard because real C++ entities never have
+// "entity"/0x69746e65/0x00007974 at offset +0x14.
+static int g_damage_tally_recoveries = 0;
+static int g_damage_tally_dumps      = 0;
+static bool looks_like_lua_entity_table(void* ecx) {
+    if (IsBadReadPtr(ecx, 0x1C)) return false;
+    unsigned int* p = (unsigned int*)ecx;
+    return p[5] == 0x69746e65u             /* "enti" */
+        && (p[6] & 0x0000FFFFu) == 0x00007974u  /* "ty\0" */;
+}
+// Examine the iterated "entity" for the Lua-handle fingerprint via the
+// context registers. Different iterators load the vtable into different
+// registers before the virtual call; we need to identify which register
+// holds the entity pointer per the instruction encoding.
+static LONG WINAPI mp_damage_tally_veh(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    BYTE* eip = (BYTE*)info->ContextRecord->Eip;
+    if (IsBadReadPtr(eip, 5)) return EXCEPTION_CONTINUE_SEARCH;
+    // Match `mov <dst>,[<src>+disp8]; call <dst>` for any reg pair.
+    // ModR/M with mod=01 → byte = 01 reg r/m (reg=dst, r/m=src).
+    // Following `call <dst>` is FF /2 register form → FF (C0|0x10|dst).
+    if (eip[0] != 0x8B) return EXCEPTION_CONTINUE_SEARCH;
+    BYTE modrm = eip[1];
+    if ((modrm & 0xC0) != 0x40) return EXCEPTION_CONTINUE_SEARCH;  // mod != 01 → bail
+    BYTE dst = (modrm >> 3) & 0x07;
+    BYTE src = modrm & 0x07;
+    if (src == 4 /* SIB */ || src == 5 /* ebp special */) return EXCEPTION_CONTINUE_SEARCH;
+    if (eip[3] != 0xFF) return EXCEPTION_CONTINUE_SEARCH;
+    if ((eip[4] & 0xF8) != 0xD0) return EXCEPTION_CONTINUE_SEARCH;  // call <reg>
+    if ((eip[4] & 0x07) != dst)   return EXCEPTION_CONTINUE_SEARCH;  // must call the just-loaded reg
+    BYTE disp = eip[2];
+    // Pick the source register's value from the CONTEXT — that's the
+    // pointer being dereferenced (the corrupted "vtable").
+    const CONTEXT* c = info->ContextRecord;
+    DWORD vtable = 0;
+    switch (src) {
+        case 0: vtable = c->Eax; break;
+        case 1: vtable = c->Ecx; break;
+        case 2: vtable = c->Edx; break;
+        case 3: vtable = c->Ebx; break;
+        case 6: vtable = c->Esi; break;
+        case 7: vtable = c->Edi; break;
+    }
+    // The "entity" pointer for this iteration step is whatever object
+    // PRODUCED that vtable. Caller path varies; ECX is almost always the
+    // `this` pointer, but if it isn't shaped right, also try the value
+    // at *vtable (sometimes the "vtable" register is actually an entity
+    // pointer chain). Fingerprint either one.
+    bool match_ecx = looks_like_lua_entity_table((void*)c->Ecx);
+    bool match_eax = looks_like_lua_entity_table((void*)c->Eax);
+    bool match_edx = looks_like_lua_entity_table((void*)c->Edx);
+    if (!match_ecx && !match_eax && !match_edx) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    ++g_damage_tally_recoveries;
+    if (g_damage_tally_dumps < 32) {
+        ++g_damage_tally_dumps;
+        void* entity = match_ecx ? (void*)c->Ecx : (match_eax ? (void*)c->Eax : (void*)c->Edx);
+        unsigned int* p = (unsigned int*)entity;
+        static const char* regs[] = { "eax","ecx","edx","ebx","esp","ebp","esi","edi" };
+        host_log("DamageTally AV recovered #%d EIP=%p (mov %s,[%s+0x%02x]; call %s) "
+                 "vtable=%08x entity=%p {%08x %08x %08x %08x %08x %08x %08x %08x}",
+                 g_damage_tally_recoveries, eip,
+                 regs[dst], regs[src], disp, regs[dst],
+                 vtable, entity,
+                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+    // mov+call together = 3+2 = 5 bytes.
+    info->ContextRecord->Eip = (DWORD)(eip + 5);
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // FUN_0048e9b0 — TPlahvatus (explosion entity) ctor called inside the
@@ -501,6 +632,7 @@ static void* __fastcall hook_PlahvatusCtor(void* self, void* edx,
     host_log("PLAH #%d ENTRY self=%p p1=%08x p2=%08x p3=%08x", n, self, p1, p2, p3);
     void* r = orig_PlahvatusCtor(self, edx, p1, p2, p3);
     host_log("PLAH #%d RETURN ret=%p", n, r);
+    track_entity_birth(r, 20);  // TPlahvatus
     return r;
 }
 
@@ -556,6 +688,7 @@ static void* __fastcall hook_CannonCtor(void* self, void* edx,
         g_bullet_ring[idx].subclass = 8;
         g_bullet_write_idx++;
     }
+    track_entity_birth(ret, 8);  // TCannon
     return ret;
 }
 
@@ -595,6 +728,7 @@ static void __fastcall hook_AdhgrenadeCtor(void* self, void* edx,
                                            int a1, int a2, int a3, int a4,
                                            int a5) {
     orig_AdhgrenadeCtor(self, edx, a1, a2, a3, a4, a5);
+    track_entity_birth(self, 5);  // TAdhesiveGrenade
     if (!g_bullet_capture) return;
     union { int i; float f; } px, py, vx, vy;
     px.i = a1; py.i = a2; vx.i = a3; vy.i = a4;
@@ -1470,10 +1604,18 @@ static int l_install_hook_bullet(lua_State* L) {
     MH_STATUS cs = MH_CreateHook(cannonCtor, (LPVOID)&hook_CannonCtor, (LPVOID*)&orig_CannonCtor);
     if (cs == MH_OK) cs = MH_EnableHook(cannonCtor);
     host_log("cannon ctor hook: status=%d", cs);
-    BYTE* cannonBoom = (BYTE*)m + 0x97770;  // FUN_00497770 — bracket only
+    BYTE* cannonBoom = (BYTE*)m + 0x97770;  // FUN_00497770 — pass-through
     MH_STATUS cbs = MH_CreateHook(cannonBoom, (LPVOID)&hook_CannonBoom, (LPVOID*)&orig_CannonBoom);
     if (cbs == MH_OK) cbs = MH_EnableHook(cannonBoom);
     host_log("cannon boom hook: status=%d", cbs);
+    // VEH targets any AV whose `mov eax,[edx+N]; call eax` pattern is
+    // dereferencing a Lua-handle-table-shaped object (detected by the
+    // engine's own setfield(L,"entity",...) imprint at +0x14). Catches
+    // every accessor in the damage tally chain (vt[10], vt[13], etc.)
+    // without enumerating EIPs. Genuine entities never look like that
+    // at +0x14 — the guard is unforgeable.
+    AddVectoredExceptionHandler(1, mp_damage_tally_veh);
+    host_log("damage tally VEH armed (Lua-handle-shape match)");
     BYTE* plahCtor = (BYTE*)m + 0x8e9b0;  // FUN_0048e9b0 — TPlahvatus (explosion) ctor
     MH_STATUS ps = MH_CreateHook(plahCtor, (LPVOID)&hook_PlahvatusCtor, (LPVOID*)&orig_PlahvatusCtor);
     if (ps == MH_OK) ps = MH_EnableHook(plahCtor);
@@ -3072,6 +3214,9 @@ static int chat_vk_to_ascii(DWORD vk, bool shift, bool caps) {
     return 0;
 }
 
+// Test hotkey (KP*) press flag — set by kbd_ll_proc, drained by consume_testkey.
+static volatile bool g_testkey_pressed = false;
+
 // Low-level keyboard hook. Per MSDN this must return quickly (within
 // the LowLevelHooksTimeout) or Windows silently unhooks us. The
 // callback also runs on whatever thread posted the key event, so any
@@ -3118,6 +3263,16 @@ static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
                 }
             }
         }
+        // Test hotkey (KP*): flag a press for the Lua menu tick to consume.
+        // The engine reads menu input natively, so input.KeyDown never reaches
+        // Lua at the title menu — this LL hook does. Not swallowed; the engine
+        // ignores KP* at the menu anyway.
+        if (p && p->vkCode == VK_MULTIPLY &&
+            (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            if (g_our_hwnd && GetForegroundWindow() == g_our_hwnd) {
+                g_testkey_pressed = true;
+            }
+        }
     }
     return CallNextHookEx(g_kbd_ll_hook, nCode, wParam, lParam);
 }
@@ -3158,6 +3313,179 @@ static int l_arm_frame_tick(lua_State* L) {
         host_log("SetWindowsHookExA(WH_KEYBOARD_LL) -> %p", g_kbd_ll_hook);
     }
     g_frame_tick_armed = true;
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// ---- Screen-space render hook (wglSwapBuffers) ----
+// The engine renders the frame, then calls opengl32!wglSwapBuffers to present.
+// We hook it and invoke Lua MP_RENDER just BEFORE the real swap — that runs
+// inside the live render pass (GL context current, back buffer drawn), which is
+// the only place the engine's immediate-mode DrawText actually draws. Same
+// main-thread + nest-depth discipline as MP_FRAME_TICK. At swap time the engine
+// is in native render code (not inside a lua_resume), so nest_depth is 0.
+typedef BOOL (WINAPI *WglSwapBuffersFn)(HDC);
+static WglSwapBuffersFn orig_wglSwapBuffers = nullptr;
+static volatile bool g_render_armed = false;
+static volatile bool g_in_render    = false;
+
+// GL entry points used to set a fixed 320x240 ortho (with a 4:3 letterboxed
+// viewport) before MP_RENDER, so DrawText coords are window-size-independent.
+typedef void (WINAPI *GLvoidFn)(void);
+typedef void (WINAPI *GLviewportFn)(int, int, int, int);
+typedef void (WINAPI *GLmatrixModeFn)(unsigned int);
+typedef void (WINAPI *GLorthoFn)(double, double, double, double, double, double);
+typedef void (WINAPI *GLenumFn)(unsigned int);
+typedef void (WINAPI *GLclearFn)(unsigned int);
+typedef void (WINAPI *GLclearColorFn)(float, float, float, float);
+static GLviewportFn   p_glViewport     = nullptr;
+static GLmatrixModeFn p_glMatrixMode   = nullptr;
+static GLorthoFn      p_glOrtho        = nullptr;
+static GLvoidFn       p_glLoadIdentity = nullptr;
+static GLvoidFn       p_glPushMatrix   = nullptr;
+static GLvoidFn       p_glPopMatrix    = nullptr;
+static GLenumFn       p_glDisable      = nullptr;
+static GLenumFn       p_glEnable       = nullptr;
+static GLclearFn      p_glClear        = nullptr;
+static GLclearColorFn p_glClearColor   = nullptr;
+static bool g_gl_loaded = false;
+#define MP_GL_PROJECTION 0x1701
+#define MP_GL_MODELVIEW  0x1700
+#define MP_GL_DEPTH_TEST 0x0B71
+#define MP_GL_COLOR_BUFFER_BIT 0x4000
+
+static void mp_load_gl() {
+    if (g_gl_loaded) return;
+    HMODULE gl = GetModuleHandleA("opengl32.dll");
+    if (!gl) return;
+    p_glViewport     = (GLviewportFn)GetProcAddress(gl, "glViewport");
+    p_glMatrixMode   = (GLmatrixModeFn)GetProcAddress(gl, "glMatrixMode");
+    p_glOrtho        = (GLorthoFn)GetProcAddress(gl, "glOrtho");
+    p_glLoadIdentity = (GLvoidFn)GetProcAddress(gl, "glLoadIdentity");
+    p_glPushMatrix   = (GLvoidFn)GetProcAddress(gl, "glPushMatrix");
+    p_glPopMatrix    = (GLvoidFn)GetProcAddress(gl, "glPopMatrix");
+    p_glDisable      = (GLenumFn)GetProcAddress(gl, "glDisable");
+    p_glEnable       = (GLenumFn)GetProcAddress(gl, "glEnable");
+    p_glClear        = (GLclearFn)GetProcAddress(gl, "glClear");
+    p_glClearColor   = (GLclearColorFn)GetProcAddress(gl, "glClearColor");
+    g_gl_loaded = p_glViewport && p_glMatrixMode && p_glOrtho &&
+                  p_glLoadIdentity && p_glPushMatrix && p_glPopMatrix &&
+                  p_glDisable && p_glEnable && p_glClear && p_glClearColor;
+}
+
+// The engine's 2D-UI ortho setup (FUN_004b56d0, __cdecl(width,height)), called
+// after the world render and before the HUD. We hook it to glClear→black on the
+// first call per frame when the game-over screen is up, blacking the world so
+// the HUD + deferred scoreboard text render on a black background.
+typedef void (__cdecl *Begin2DFn)(float, float);
+static Begin2DFn orig_begin2d = nullptr;
+static volatile bool g_gameover_bg   = false;   // set from Lua when the screen is up
+static volatile bool g_begin2d_cleared = false; // per-frame guard, reset at swap
+
+static void __cdecl hook_begin2d(float w, float h) {
+    orig_begin2d(w, h);   // (begin-2D clear approach abandoned; clear now at swap)
+}
+
+static BOOL WINAPI hook_wglSwapBuffers(HDC hdc) {
+    if (g_render_armed && !g_in_render
+        && g_L && api.getglobal && (orig_lua_pcallk || api.pcall)
+        && g_main_tid != 0 && GetCurrentThreadId() == g_main_tid
+        && g_lua_nest_depth == 0) {
+        g_in_render = true;
+        // Set a fixed 320x240 ortho on a 4:3 letterboxed viewport so the
+        // overlay is the same size/position at any window size. DrawText's
+        // texture/blend state at swap time already works (the probe rendered);
+        // only the projection needed fixing.
+        mp_load_gl();
+        bool gl_ok = false;
+        if (g_gl_loaded) {
+            int w = 0, h = 0;
+            HWND hw = g_our_hwnd ? g_our_hwnd : find_our_hwnd();
+            RECT rc;
+            if (hw && GetClientRect(hw, &rc)) { w = rc.right - rc.left; h = rc.bottom - rc.top; }
+            if (w > 0 && h > 0) {
+                int vw, vh, vx, vy;
+                if (w * 3 >= h * 4) { vh = h; vw = h * 4 / 3; vx = (w - vw) / 2; vy = 0; }
+                else                { vw = w; vh = w * 3 / 4; vx = 0; vy = (h - vh) / 2; }
+                p_glMatrixMode(MP_GL_PROJECTION); p_glPushMatrix(); p_glLoadIdentity();
+                p_glOrtho(0.0, 320.0, 240.0, 0.0, -1.0, 1.0);
+                p_glMatrixMode(MP_GL_MODELVIEW);  p_glPushMatrix(); p_glLoadIdentity();
+                p_glViewport(vx, vy, vw, vh);
+                // Painter's order for the overlay (backdrop behind, text on top).
+                p_glDisable(MP_GL_DEPTH_TEST);
+                // Game-over backdrop: erase the finished frame to black here, then
+                // the scoreboard DrawText below draws on top of the black.
+                if (g_gameover_bg) {
+                    p_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    p_glClear(MP_GL_COLOR_BUFFER_BIT);
+                }
+                gl_ok = true;
+            }
+        }
+        api.getglobal(g_L, "MP_RENDER");
+        int rc = orig_lua_pcallk
+            ? orig_lua_pcallk(g_L, 0, 0, 0, 0, nullptr)
+            : api.pcall(g_L, 0, 0, 0, 0, nullptr);
+        if (rc != 0) {
+            const char* err = api.tolstring(g_L, -1, nullptr);
+            static int s_n = 0;
+            if ((s_n++ % 200) == 0) host_log("MP_RENDER error (#%d): %s", s_n, err ? err : "?");
+            api.settop(g_L, -2);
+        }
+        if (gl_ok) {
+            p_glEnable(MP_GL_DEPTH_TEST);   // restore for the engine's next frame
+            p_glMatrixMode(MP_GL_PROJECTION); p_glPopMatrix();
+            p_glMatrixMode(MP_GL_MODELVIEW);  p_glPopMatrix();
+        }
+        g_in_render = false;
+    }
+    g_begin2d_cleared = false;   // re-arm the per-frame black clear for next frame
+    return orig_wglSwapBuffers(hdc);
+}
+
+// arm_render() — install the wglSwapBuffers hook (once) and enable MP_RENDER.
+static int l_arm_render(lua_State* L) {
+    if (!orig_wglSwapBuffers) {
+        HMODULE gl = GetModuleHandleA("opengl32.dll");
+        if (!gl) gl = LoadLibraryA("opengl32.dll");
+        void* target = gl ? (void*)GetProcAddress(gl, "wglSwapBuffers") : nullptr;
+        if (!target) { host_log("arm_render: wglSwapBuffers not found"); api.pushboolean(L, 0); return 1; }
+        MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_wglSwapBuffers, (LPVOID*)&orig_wglSwapBuffers);
+        host_log("MH_CreateHook(wglSwapBuffers @%p): status=%d", target, s);
+        if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+        s = MH_EnableHook(target);
+        host_log("MH_EnableHook(wglSwapBuffers): status=%d", s);
+        if (s != MH_OK) { api.pushboolean(L, 0); return 1; }
+    }
+    // Also hook the 2D-UI ortho setup so we can black the world behind the
+    // game-over screen. Address is static (exe base 0x400000, no ASLR).
+    if (!orig_begin2d) {
+        // base + RVA (0x4b56d0 - 0x400000) to survive ASLR, like the other hooks.
+        void* target = (void*)((BYTE*)GetModuleHandleA(NULL) + 0xb56d0);
+        MH_STATUS s = MH_CreateHook(target, (LPVOID)&hook_begin2d, (LPVOID*)&orig_begin2d);
+        host_log("MH_CreateHook(begin2d @%p): status=%d", target, s);
+        if (s == MH_OK) {
+            s = MH_EnableHook(target);
+            host_log("MH_EnableHook(begin2d): status=%d", s);
+        }
+    }
+    g_render_armed = true;
+    host_log("arm_render: MP_RENDER armed");
+    api.pushboolean(L, 1);
+    return 1;
+}
+
+// set_gameover_bg(bool) — when true, the begin2d hook clears the framebuffer to
+// black once per frame (the game-over screen's backdrop).
+static int l_set_gameover_bg(lua_State* L) {
+    typedef int (*LuaToBoolFn)(lua_State*, int);
+    static LuaToBoolFn lua_toboolean_p = nullptr;
+    if (!lua_toboolean_p) {
+        HMODULE lm = GetModuleHandleA("lua52.dll");
+        lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
+    }
+    g_gameover_bg = lua_toboolean_p ? (lua_toboolean_p(L, 1) != 0) : false;
+    host_log("set_gameover_bg(%d)", g_gameover_bg ? 1 : 0);
     api.pushboolean(L, 1);
     return 1;
 }
@@ -3240,6 +3568,15 @@ static int l_check_esc_pressed(lua_State* L) {
     g_esc_pressed = false;
     if (was) host_log("check_esc_pressed -> TRUE (leaves_lobby=%d quits=%d suppress=%d)",
                       g_esc_leaves_lobby ? 1 : 0, g_esc_quits ? 1 : 0, g_suppress_esc ? 1 : 0);
+    api.pushboolean(L, was ? 1 : 0);
+    return 1;
+}
+
+// consume_testkey() — atomic read+clear of the KP* test-hotkey flag. Lua polls
+// this from the menu tick (input.KeyDown doesn't reach Lua at the title menu).
+static int l_consume_testkey(lua_State* L) {
+    bool was = g_testkey_pressed;
+    g_testkey_pressed = false;
     api.pushboolean(L, was ? 1 : 0);
     return 1;
 }
@@ -3440,7 +3777,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     // realloc the table's array repeatedly mid-population, and under full page heap
     // those guard-paged grows turn lua52's trailing TValue write into a hard fault
     // (the recurring heap corruptor — see KNOWN_ISSUES.md). 18 = the field count below.
-    api.createtable(L, 0, 33);
+    api.createtable(L, 0, 80);   // MUST be >= the number of setfields below;
+                                 // under-hinting reallocs mid-build → heap corruption
     api.pushcclosure(L, l_hello, 0);
     api.setfield(L, -2, "hello");
     api.pushcclosure(L, l_log, 0);
@@ -3553,6 +3891,12 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_esc_opens_mp_pause");
     api.pushcclosure(L, l_check_esc_pressed, 0);
     api.setfield(L, -2, "check_esc_pressed");
+    api.pushcclosure(L, l_consume_testkey, 0);
+    api.setfield(L, -2, "consume_testkey");
+    api.pushcclosure(L, l_arm_render, 0);
+    api.setfield(L, -2, "arm_render");
+    api.pushcclosure(L, l_set_gameover_bg, 0);
+    api.setfield(L, -2, "set_gameover_bg");
     api.pushcclosure(L, l_set_chat_capture, 0);
     api.setfield(L, -2, "set_chat_capture");
     api.pushcclosure(L, l_consume_chat_key, 0);
