@@ -179,6 +179,22 @@ static DWORD         g_last_interp_ms    = 0;
 // piggy-back MP_FRAME_TICK on the same (main) thread.
 static int g_lua_nest_depth = 0;
 
+// Cross-thread mutex for OUR injected Lua entry points (MP_RENDER in the swap
+// hook and the MP_FRAME_TICK fallback in the PeekMessageA hook). The frame-tick
+// fallback can fire on a non-main thread (NVIDIA's GL driver pumps PeekMessageA
+// on a worker thread), so it can otherwise touch g_L at the same instant the
+// main-thread swap hook is running MP_RENDER → concurrent lua_State access →
+// heap corruption (STATUS_LONGJUMP / lua52 AV). Both sites try-acquire this with
+// InterlockedCompareExchange and SKIP (never block) if the other holds it, which
+// serializes all our Lua entries without any chance of deadlock.
+static volatile LONG g_lua_entry_busy = 0;
+static inline bool lua_entry_try_acquire() {
+    return InterlockedCompareExchange(&g_lua_entry_busy, 1, 0) == 0;
+}
+static inline void lua_entry_release() {
+    InterlockedExchange(&g_lua_entry_busy, 0);
+}
+
 typedef int (*LuaResumeFn)(lua_State* L, lua_State* from, int nargs);
 typedef int (*LuaPcallkFn)(lua_State* L, int nargs, int nresults,
                            int errfunc, intptr_t ctx, void* k);
@@ -784,26 +800,31 @@ static void laser_dbg_unregister(void* obj) {
     }
 }
 
+// FF victim pointer (our local TPlayer), set from Lua via set_ff_watch_player.
+// The laser deals damage inside its per-tick raycast (not via ApplyBulletDamage),
+// so we detect laser friendly fire by watching OUR hp across the tick.
+static void* g_ff_local_player = nullptr;
+static void ff_record_laser_hit(void* laser, float hp_before);  // defined after the hit ring
+
 // Hook on TLaser vt[22] (FUN_00498770) — fires every tick the engine
 // processes the laser. Log per-tick state so we can see counter
 // decrement, dead-flag transitions, and start/end position progression.
 typedef void (__fastcall *Vt22Fn)(void* self);
 static Vt22Fn orig_TLaserTick = nullptr;
 static void __fastcall hook_TLaserTick(void* self, void* /*edx*/) {
-    int id = laser_dbg_id_for(self);
-    int b8_before = *(int*)((char*)self + 0xB8);
-    unsigned char dead_before = *((unsigned char*)self + 0x2E);
-    unsigned char enable = *((unsigned char*)self + 0xC8);
+    // FF probe: snapshot our hp, run the tick (which does the beam's damage),
+    // and if our hp dropped this laser hit us → record (victim=us, attacker=laser).
+    float ff_hp_before = g_ff_local_player ? *(float*)((char*)g_ff_local_player + 0xBC) : 0.0f;
     orig_TLaserTick(self);
-    int b8_after = *(int*)((char*)self + 0xB8);
-    unsigned char dead_after = *((unsigned char*)self + 0x2E);
-    float sx = *(float*)((char*)self + 0x88);
-    float sy = *(float*)((char*)self + 0x8C);
-    float ex = *(float*)((char*)self + 0x74);
-    float ey = *(float*)((char*)self + 0x78);
-    host_log("TLaser TICK id=%d obj=%p b8 %d->%d dead %d->%d en=%d start=(%.2f,%.2f) end=(%.2f,%.2f)",
-             id, self, b8_before, b8_after, (int)dead_before, (int)dead_after,
-             (int)enable, sx, sy, ex, ey);
+    if (g_ff_local_player) ff_record_laser_hit(self, ff_hp_before);
+    // Per-tick diag, throttled (this fires every frame per laser → log spam).
+    static int s_tick = 0;
+    if ((s_tick++ % 60) == 0) {
+        int b8_after = *(int*)((char*)self + 0xB8);
+        unsigned char dead_after = *((unsigned char*)self + 0x2E);
+        host_log("TLaser TICK id=%d obj=%p b8=%d dead=%d",
+                 laser_dbg_id_for(self), self, b8_after, (int)dead_after);
+    }
 }
 
 // Hook on FUN_0040e750 — the "mark dead" call. Logs which laser the
@@ -1467,6 +1488,8 @@ static int g_central_hit_count = 0;
 // Forward decls for ring buffer (defined later, shared with hook_common)
 #define HIT_RING_SIZE 256
 extern DWORD g_hit_targets[HIT_RING_SIZE];
+extern DWORD g_hit_attackers[HIT_RING_SIZE];   // parallel: attacker (bullet owner) per hit
+extern int   g_hit_damage[HIT_RING_SIZE];      // parallel: HP delta (real damage) per hit
 extern volatile int g_hit_write_idx;
 
 // Latest captured ApplyHit args from a real engine-side hit. apply_damage
@@ -1483,7 +1506,14 @@ static int           g_apply_hit_last_a5 = 0;
 static void __fastcall hook_CentralHit(void* self, void* /*edx*/,
                                        void* a1, int a2, int a3, int a4, int a5) {
     g_central_hit_count++;
-    g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
+    int ridx = g_hit_write_idx % HIT_RING_SIZE;
+    g_hit_targets[ridx]   = (DWORD)self;
+    // a1 is the BULLET (ApplyBulletDamage's projectile arg), NOT the shooter.
+    // The shooter is the bullet's owner at TBullet+0x70 (TPlayer/TActor ptr). For
+    // a replicated peer bullet that owner IS the shooter's puppet, so storing it
+    // lets the Lua side match a teammate puppet for friendly-fire attribution.
+    g_hit_attackers[ridx] = (a1 && (DWORD)a1 > 0x10000)
+                            ? *(DWORD*)((char*)a1 + 0x70) : 0;
     g_hit_write_idx++;
     // Capture the freshest engine-side ApplyHit args so apply_damage can
     // replay the exact call shape.
@@ -1500,6 +1530,7 @@ static void __fastcall hook_CentralHit(void* self, void* /*edx*/,
     f2.i = a2; f3.i = a3; f4.i = a4; f5.i = a5;
     orig_CentralHit(self, a1, a2, a3, a4, a5);
     float hp_after  = *(float*)((char*)self + 0xBC);
+    g_hit_damage[ridx] = (int)(hp_before - hp_after);   // real damage from this hit
     if (g_central_hit_count <= 64 || (g_central_hit_count % 25) == 0) {
         host_log("hook_CentralHit #%d: target=%p a1=%p a2=0x%08x(int=%d,f=%.3f) "
                  "a3=0x%08x(int=%d,f=%.3f) a4=0x%08x(int=%d,f=%.3f) a5=0x%08x(int=%d,f=%.3f) "
@@ -1698,20 +1729,46 @@ static TakeDamageFn g_origs[HOOK_POOL_SIZE] = {0};
 // which returns one address per call, or 0 when empty.
 // (HIT_RING_SIZE defined above near hook_CentralHit forward decl.)
 DWORD g_hit_targets[HIT_RING_SIZE] = {0};
+DWORD g_hit_attackers[HIT_RING_SIZE] = {0};   // parallel: attacker (bullet owner) per hit
+int   g_hit_damage[HIT_RING_SIZE] = {0};      // parallel: HP delta (real damage) per hit
 volatile int g_hit_write_idx = 0;
 static int g_hit_read_idx = 0;
 
 static void hook_common(int slot, void* self, float damage, float kind) {
     g_takedmg_count++;
-    g_hit_targets[g_hit_write_idx % HIT_RING_SIZE] = (DWORD)self;
+    int ridx = g_hit_write_idx % HIT_RING_SIZE;
+    g_hit_targets[ridx]   = (DWORD)self;
+    g_hit_attackers[ridx] = 0;   // vtable path: no attacker info available
     g_hit_write_idx++;
     float hp_before = *(float*)((char*)self + 0xBC);
     g_origs[slot](self, damage, kind);
     float hp_after  = *(float*)((char*)self + 0xBC);
+    g_hit_damage[ridx] = (int)(hp_before - hp_after);
     if (g_takedmg_count <= 96 || (g_takedmg_count % 50) == 0) {
         host_log("vtable_takedmg[slot %d] #%d: target=%p damage=%.3f kind=%.3f hp %.1f->%.1f",
                  slot, g_takedmg_count, self, damage, kind, hp_before, hp_after);
     }
+}
+
+// Record a laser-FF hit into the same ring consume_hit() drains. attacker is the
+// LASER object; the Lua side maps it to the shooter via mp.peer_lasers (it can't
+// be matched to a puppet directly the way a bullet's owner can).
+static void ff_record_laser_hit(void* laser, float hp_before) {
+    if (!g_ff_local_player) return;
+    float hp_after = *(float*)((char*)g_ff_local_player + 0xBC);
+    if (hp_after >= hp_before) return;   // no damage to us this tick
+    int ridx = g_hit_write_idx % HIT_RING_SIZE;
+    g_hit_targets[ridx]   = (DWORD)g_ff_local_player;
+    g_hit_attackers[ridx] = (DWORD)laser;
+    g_hit_damage[ridx]    = (int)(hp_before - hp_after);
+    g_hit_write_idx++;
+}
+
+// set_ff_watch_player(playerPtr) — tell the native which entity is OUR player,
+// so the laser-tick FF probe knows whose hp to watch.
+static int l_set_ff_watch_player(lua_State* L) {
+    g_ff_local_player = resolve_entity(L, 1);
+    return 0;
 }
 
 // Lua-callable: returns the integer address backing a userdata. Lua side
@@ -1730,15 +1787,25 @@ static int l_addr_of(lua_State* L) {
 
 // Lua-callable: returns one target address per call, or 0 if no more hits.
 // Lua side maps the address to its known mob puppets to detect a real hit.
+// Returns (victim, attacker, damage) for one hit, or (0,0,0) when empty.
+// attacker is the bullet's owner (a teammate puppet for friendly fire); damage
+// is the HP delta. Old callers that read a single return value still work.
 static int l_consume_hit(lua_State* L) {
     if (g_hit_read_idx >= g_hit_write_idx) {
         api.pushinteger(L, 0);
-        return 1;
+        api.pushinteger(L, 0);
+        api.pushinteger(L, 0);
+        return 3;
     }
-    DWORD t = g_hit_targets[g_hit_read_idx % HIT_RING_SIZE];
+    int ridx = g_hit_read_idx % HIT_RING_SIZE;
+    DWORD t   = g_hit_targets[ridx];
+    DWORD atk = g_hit_attackers[ridx];
+    int   dmg = g_hit_damage[ridx];
     g_hit_read_idx++;
     api.pushinteger(L, (int)t);
-    return 1;
+    api.pushinteger(L, (int)atk);
+    api.pushinteger(L, dmg);
+    return 3;
 }
 
 #define HOOK_SLOT(N) \
@@ -2808,6 +2875,50 @@ static int l_set_body_dynamic(lua_State* L) {
     return 1;
 }
 
+// set_body_sensor(ptr) — make all of an entity's Box2D fixtures sensors so it
+// no longer collides (walk-through), keeping its sprite. Used for death-loot
+// chests. We FIND m_fixtureList by scanning the body for a member pointer whose
+// target's m_body (b2Fixture+0x08) points back to the body — a certain match —
+// then set m_isSensor (b2Fixture+0x28, best-guess; the dump confirms it). The
+// m_body validation means a wrong fixture-list offset just aborts (no write).
+#define B2FIX_MBODY_OFF    0x08
+#define B2FIX_NEXT_OFF     0x04
+// m_isSensor lives right after b2Filter (category@0x20, mask@0x22, group@0x24);
+// confirmed from a live fixture dump (the byte at +0x26). +0x28 is m_userData.
+#define B2FIX_SENSOR_OFF   0x26
+static int l_set_body_sensor(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadReadPtr(e, ACTOR_BODY_OFF + 4)) { api.pushboolean(L, 0); return 1; }
+    void* body = *(void**)((char*)e + ACTOR_BODY_OFF);
+    if (!body || IsBadReadPtr(body, 0x88)) { host_log("set_body_sensor: bad body=%p", body); api.pushboolean(L, 0); return 1; }
+    void* fix = nullptr; int found_off = -1;
+    for (int off = 0x40; off <= 0x84; off += 4) {
+        void* cand = *(void**)((char*)body + off);
+        if (cand && !IsBadReadPtr(cand, 0x40)
+            && *(void**)((char*)cand + B2FIX_MBODY_OFF) == body) {
+            fix = cand; found_off = off; break;
+        }
+    }
+    if (!fix) { host_log("set_body_sensor: fixtureList not found (body=%p)", body); api.pushboolean(L, 0); return 1; }
+    const unsigned char* fb = (const unsigned char*)fix;
+    host_log("set_body_sensor: m_fixtureList@body+0x%x=%p  fixdump: "
+             "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+             found_off, fix,
+             *(int*)(fb+0),*(int*)(fb+4),*(int*)(fb+8),*(int*)(fb+12),
+             *(int*)(fb+16),*(int*)(fb+20),*(int*)(fb+24),*(int*)(fb+28),
+             *(int*)(fb+32),*(int*)(fb+36),*(int*)(fb+40),*(int*)(fb+44));
+    int count = 0;
+    while (fix && !IsBadReadPtr(fix, 0x40)
+           && *(void**)((char*)fix + B2FIX_MBODY_OFF) == body && count < 16) {
+        *((unsigned char*)fix + B2FIX_SENSOR_OFF) = 1;   // m_isSensor = true
+        count++;
+        fix = *(void**)((char*)fix + B2FIX_NEXT_OFF);
+    }
+    host_log("set_body_sensor: set sensor on %d fixture(s)", count);
+    api.pushboolean(L, count > 0 ? 1 : 0);
+    return 1;
+}
+
 // set_render_gate(ptr, val) — write byte to +0xFD (think2's render/draw
 // gate). !=0 → draw block in think2 short-circuits, the actor becomes
 // invisible. Used to hide the local player's body during spectate so the
@@ -3128,7 +3239,11 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
         && api.pcall && api.getglobal
         && g_lua_nest_depth == 0) {
         DWORD now = GetTickCount();
-        if ((now - g_last_tick_ms) >= 250) {
+        // Try-acquire the cross-thread Lua mutex: if the main-thread swap hook
+        // is mid-MP_RENDER (or another pump is mid-tick), skip this iteration
+        // rather than racing g_L. Prevents the worker-thread vs main-thread
+        // heap corruption that crashes while the game-over overlay is up.
+        if ((now - g_last_tick_ms) >= 250 && lua_entry_try_acquire()) {
             g_last_tick_ms = now;
             g_in_frame_tick = true;
             api.getglobal(g_L, "MP_FRAME_TICK");
@@ -3144,6 +3259,7 @@ static BOOL WINAPI hook_PeekMessageA(LPMSG lpMsg, HWND hWnd,
                 api.settop(g_L, -2);
             }
             g_in_frame_tick = false;
+            lua_entry_release();
         }
     }
     return r;
@@ -3216,6 +3332,10 @@ static int chat_vk_to_ascii(DWORD vk, bool shift, bool caps) {
 
 // Test hotkey (KP*) press flag — set by kbd_ll_proc, drained by consume_testkey.
 static volatile bool g_testkey_pressed = false;
+// Game-over screen state: g_gameover_bg = screen up (swap hook clears to black);
+// g_gameover_dismiss = ESC pressed while it's up (drained by Lua to hide it).
+static volatile bool g_gameover_bg      = false;
+static volatile bool g_gameover_dismiss = false;
 
 // Low-level keyboard hook. Per MSDN this must return quickly (within
 // the LowLevelHooksTimeout) or Windows silently unhooks us. The
@@ -3250,6 +3370,10 @@ static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
             HWND fg  = GetForegroundWindow();
             HWND own = g_our_hwnd;  // already cached; avoid EnumWindows here
             if (own && fg == own) {
+                if (g_gameover_bg) {           // ESC dismisses the game-over screen
+                    g_gameover_dismiss = true;
+                    return 1;
+                }
                 if (g_esc_quits) {
                     PostMessageA(own, WM_CLOSE, 0, 0);
                     return 1;
@@ -3379,7 +3503,6 @@ static void mp_load_gl() {
 // the HUD + deferred scoreboard text render on a black background.
 typedef void (__cdecl *Begin2DFn)(float, float);
 static Begin2DFn orig_begin2d = nullptr;
-static volatile bool g_gameover_bg   = false;   // set from Lua when the screen is up
 static volatile bool g_begin2d_cleared = false; // per-frame guard, reset at swap
 
 static void __cdecl hook_begin2d(float w, float h) {
@@ -3387,10 +3510,18 @@ static void __cdecl hook_begin2d(float w, float h) {
 }
 
 static BOOL WINAPI hook_wglSwapBuffers(HDC hdc) {
+    // NOTE: no g_lua_nest_depth==0 gate here. In-game the engine drives its
+    // render from inside Lua, so wglSwapBuffers fires at nest depth > 0 (seen:
+    // nest=3); requiring 0 meant the overlay only ever drew at the menu. The
+    // swap point is a fixed end-of-frame location, safe to draw from at any
+    // nesting. We call orig_lua_pcallk (balanced getglobal+pcall) on the main
+    // thread only, holding the cross-thread mutex — the worker-thread frame
+    // tick can't collide (it still requires nest==0), and g_in_render blocks
+    // our own reentrancy.
     if (g_render_armed && !g_in_render
         && g_L && api.getglobal && (orig_lua_pcallk || api.pcall)
         && g_main_tid != 0 && GetCurrentThreadId() == g_main_tid
-        && g_lua_nest_depth == 0) {
+        && lua_entry_try_acquire()) {   // serialize vs worker-thread frame tick
         g_in_render = true;
         // Set a fixed 320x240 ortho on a 4:3 letterboxed viewport so the
         // overlay is the same size/position at any window size. DrawText's
@@ -3438,6 +3569,7 @@ static BOOL WINAPI hook_wglSwapBuffers(HDC hdc) {
             p_glMatrixMode(MP_GL_MODELVIEW);  p_glPopMatrix();
         }
         g_in_render = false;
+        lua_entry_release();
     }
     g_begin2d_cleared = false;   // re-arm the per-frame black clear for next frame
     return orig_wglSwapBuffers(hdc);
@@ -3485,8 +3617,18 @@ static int l_set_gameover_bg(lua_State* L) {
         lua_toboolean_p = (LuaToBoolFn)GetProcAddress(lm, "lua_toboolean");
     }
     g_gameover_bg = lua_toboolean_p ? (lua_toboolean_p(L, 1) != 0) : false;
+    if (!g_gameover_bg) g_gameover_dismiss = false;   // clear stale dismiss on hide
     host_log("set_gameover_bg(%d)", g_gameover_bg ? 1 : 0);
     api.pushboolean(L, 1);
+    return 1;
+}
+
+// consume_gameover_dismiss() — atomic read+clear of the "ESC while game-over
+// screen up" flag. Lua polls this to hide the screen.
+static int l_consume_gameover_dismiss(lua_State* L) {
+    bool was = g_gameover_dismiss;
+    g_gameover_dismiss = false;
+    api.pushboolean(L, was ? 1 : 0);
     return 1;
 }
 
@@ -3791,6 +3933,10 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "consume_hit");
     api.pushcclosure(L, l_addr_of, 0);
     api.setfield(L, -2, "addr_of");
+    api.pushcclosure(L, l_set_ff_watch_player, 0);
+    api.setfield(L, -2, "set_ff_watch_player");
+    api.pushcclosure(L, l_set_body_sensor, 0);
+    api.setfield(L, -2, "set_body_sensor");
     api.pushcclosure(L, l_install_central_hit_hook, 0);
     api.setfield(L, -2, "install_central_hit_hook");
     api.pushcclosure(L, l_install_takedmg2_hook, 0);
@@ -3897,6 +4043,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "arm_render");
     api.pushcclosure(L, l_set_gameover_bg, 0);
     api.setfield(L, -2, "set_gameover_bg");
+    api.pushcclosure(L, l_consume_gameover_dismiss, 0);
+    api.setfield(L, -2, "consume_gameover_dismiss");
     api.pushcclosure(L, l_set_chat_capture, 0);
     api.setfield(L, -2, "set_chat_capture");
     api.pushcclosure(L, l_consume_chat_key, 0);

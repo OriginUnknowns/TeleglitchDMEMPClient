@@ -31,16 +31,26 @@ do
                 local ok = mp_native.install_passive_player_hooks()
                 if mp_native.log then mp_native.log("install_passive_player_hooks returned " .. tostring(ok)) end
             end
-            -- central_hit + takedamage hooks DISABLED (2026-05-29). They fed
-            -- the old consume_hit -> mob_damage path, which bullet replication
-            -- has fully superseded — so they're redundant (and risk double-
-            -- counting). Removing them also shrinks the native code-patch
-            -- surface while we chase the remaining heap corruptor. Only the
-            -- bullet ctor hook (needed for the joiner bullet drain) stays.
-            -- central_hit + takedmg2 (0x4ee80, 0x4e3e0) hooks DISABLED —
-            -- signature was wrong (last call crashed host on bullet hit).
-            -- Direct damage on host parked for future RE session.
+            -- central_hit (TNewLiving::ApplyHit @0x4ee80) RE-ENABLED: it is the
+            -- only hook that exposes the ATTACKER (bullet owner) of each hit,
+            -- which we need to attribute friendly fire to the shooter. It was
+            -- disabled 2026-05-29 after a crash-on-bullet-hit; that crash was
+            -- almost certainly the heap corruptor (bullet hits make Lua busy),
+            -- now fixed via the cross-thread Lua mutex — so re-testing. The
+            -- takedmg2 (0x4e3e0) hook stays off. consume_hit now returns
+            -- (victim, attacker, damage). If this regresses to a crash, just
+            -- delete this call (Lua-only) to fall back.
+            if mp_native.install_central_hit_hook then
+                local okc = mp_native.install_central_hit_hook()
+                if mp_native.log then mp_native.log("install_central_hit_hook returned " .. tostring(okc)) end
+            end
             _G.MP_NATIVE = mp_native
+            -- Arm the wglSwapBuffers render hook so _G.MP_RENDER is called
+            -- inside the render pass (the only place DrawText draws).
+            if mp_native.arm_render then
+                local rok = mp_native.arm_render()
+                if mp_native.log then mp_native.log("arm_render returned " .. tostring(rok)) end
+            end
             local f = io.open("mp_client_native.txt", "w")
             if f then
                 f:write("native bridge active. hello() returned: " ..
@@ -457,7 +467,8 @@ local stats = { data = nil, recently_damaged = {}, _last_hp = nil }
 
 function stats.reset()
     stats.data = { kills = 0, score = 0, shots = 0, hits = 0, items = 0,
-                   hp_lost = 0, hp_gained = 0, ff = 0, crafted = 0 }
+                   hp_lost = 0, hp_gained = 0, ff = 0, crafted = 0,
+                   damage_dealt = 0, items_shared = 0 }
     stats.recently_damaged = {}
     stats._last_hp = nil
 end
@@ -509,6 +520,12 @@ function stats.snapshot()
         items = d.items or 0, crafted = d.crafted or 0,
         hp_lost = math.floor(d.hp_lost or 0), hp_gained = math.floor(d.hp_gained or 0),
         ff = d.ff or 0,
+        -- new stats: healing == hp_gained; damage_dealt accumulated per hit;
+        -- this snapshot only ships on death, so deaths is 1; items_shared Phase 2.
+        damage_dealt  = math.floor(d.damage_dealt or 0),
+        health_healed = math.floor(d.hp_gained or 0),
+        items_shared  = d.items_shared or 0,
+        deaths        = 1,
     }
 end
 
@@ -1292,6 +1309,8 @@ do
                 }
                 mp.containers[id] = entry
                 mp.container_obj_to_id[ptr_str] = id
+                -- Remember a real container sprite so death-drop chests can reuse it.
+                if data.sprite and not mp.container_sprite then mp.container_sprite = data.sprite end
                 logf("CONTAINER tracked id=%d ptr=%s pos=(%.2f,%.2f) sprite=%s",
                     id, ptr_str, entry.x or 0, entry.y or 0, tostring(entry.sprite))
                 if type(obj.AddItem) == "function" and not rawget(obj, "_mp_add_wrapped") then
@@ -1445,6 +1464,68 @@ end
 -- our lua_resume/lua_pcallk hooks, so MP_FRAME_TICK never fires once
 -- begin_game runs. net_tick_loop's coroutine IS resumed every tick
 -- (Wait yields go through lua_resume), so the helper runs reliably.
+-- Seconds to hold on the death scene (body still visible, camera still on you)
+-- before cutting to spectate / showing the scoreboard, so you can see how you
+-- died. Used by both the spectate entry and the game-over screen. (1–4 is sane.)
+local DEATH_VIEW_DELAY = 2.5
+
+-- ===================== DEATH LOOT CHEST =====================
+-- When a player dies, drop a container at their corpse holding their inventory
+-- so teammates can recover the gear. Spawned locally + replicated to peers with
+-- a deterministic shared id (owner-keyed) so loot stays in sync.
+local DEATH_CHEST_SPRITE = "spr_hiteckast"   -- hi-tech box: distinct from level chests, same on every client
+local function spawn_death_chest(x, y, items, owner_id)
+    if not (Create and x and y) then return end
+    local shared_id = 100000 + (tonumber(owner_id) or 0)
+    mp.containers = mp.containers or {}
+    if mp.containers[shared_id] then return end   -- already spawned (idempotent)
+    local sprite = DEATH_CHEST_SPRITE
+    local cont
+    local ok = pcall(function()
+        cont = Create({ type = "container", x = x, y = y, angle = 0, sprite = sprite })
+    end)
+    if not ok or not cont then logf("death chest: Create failed (sprite=%s)", tostring(sprite)); return end
+    -- The Create wrap auto-tracked it under a local id; re-key to the shared id
+    -- so container_item_taken loot-sync lines up across clients.
+    local pstr = tostring(cont.pointer)
+    local auto_id = mp.container_obj_to_id and mp.container_obj_to_id[pstr]
+    if auto_id and auto_id ~= shared_id and mp.containers[auto_id] then
+        mp.containers[shared_id] = mp.containers[auto_id]
+        mp.containers[shared_id].id = shared_id
+        mp.containers[auto_id] = nil
+        mp.container_obj_to_id[pstr] = shared_id
+    end
+    for _, it in ipairs(items or {}) do pcall(function() cont:AddItem(it) end) end
+    -- Make the death chest walk-through (sensor fixtures) so teammates don't get
+    -- stuck on it while looting at the corpse.
+    if _G.MP_NATIVE and _G.MP_NATIVE.set_body_sensor and cont.pointer then
+        pcall(function() _G.MP_NATIVE.set_body_sensor(cont.pointer) end)
+    end
+    logf("DEATH CHEST id=%d owner=%s items=%d at (%.1f,%.1f) sprite=%s",
+        shared_id, tostring(owner_id), #(items or {}), x, y, tostring(sprite))
+end
+
+-- Snapshot OUR inventory + position and drop the chest (once). Called on death.
+local function drop_death_chest()
+    if mp.death_chest_dropped then return end
+    mp.death_chest_dropped = true
+    local pl = player.GetPlayer()
+    if not pl then return end
+    local px, py
+    pcall(function() px, py = pl:GetPosition() end)
+    if not (px and py) then return end
+    local counts = snapshot_inventory() or {}
+    local items = {}
+    for tn, cn in pairs(counts) do
+        for _ = 1, (tonumber(cn) or 0) do items[#items + 1] = tn end
+    end
+    if #items == 0 then logf("death chest: empty inventory — no drop"); return end
+    spawn_death_chest(px, py, items, mp.my_id)
+    if mp.sock then
+        pcall(function() send_msg({ type = "death_chest", x = px, y = py, items = items, owner = mp.my_id }) end)
+    end
+end
+
 local function tick_death_intercept()
     if not mp.in_game then return end
     if not (_G.MP_NATIVE and _G.MP_NATIVE.pin_hp) then return end
@@ -1478,21 +1559,16 @@ local function tick_death_intercept()
         end)
         pcall(refresh_objective_string)
         if mp.sock then pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end) end
+        pcall(drop_death_chest)   -- drop our gear as a chest for teammates
     end
     if mp.is_dead then
         -- Keep pinning so any incoming damage can't tip HP <= 0.
         pcall(function() _G.MP_NATIVE.pin_hp(target_ptr, true) end)
-        -- One-time on death-entry: park local body far off-map so the
-        -- engine's item pickup scan finds nothing near us.
-        if not mp.local_parked_off_map then
-            mp.local_parked_off_map = true
-            if pl.SetPosition then
-                pcall(function() pl:SetPosition(-99999, -99999) end)
-            end
-            if _G.MP_NATIVE.set_body_velocity then
-                pcall(function() _G.MP_NATIVE.set_body_velocity(target_ptr, 0, 0) end)
-            end
-        end
+        -- Hold on the death scene (body still visible, camera still on us) for a
+        -- beat so the player can see how they died before we cut away.
+        local held = (mp.death_announced_at and socket and socket.gettime)
+            and (socket.gettime() - mp.death_announced_at) or 999
+        if held < DEATH_VIEW_DELAY then return end
         -- Pick the nearest LIVING teammate to spectate.
         local target, target_d2 = nil, math.huge
         for _, entry in pairs(mp.puppets or {}) do
@@ -1504,7 +1580,23 @@ local function tick_death_intercept()
                 if d2 < target_d2 then target, target_d2 = entry, d2 end
             end
         end
+        -- Only cut away if there's a living teammate to follow. Solo (or when
+        -- everyone is dead) we stay parked on the death scene — the game-over
+        -- scoreboard covers it shortly after, so there's no empty-void shot.
         if target and target.obj and target.obj.pointer then
+            -- One-time on spectate-entry: hide + park local body far off-map so
+            -- the engine's item pickup scan finds nothing near us. Deferred from
+            -- the intercept so the body stayed visible during the death-view hold.
+            if not mp.local_parked_off_map then
+                mp.local_parked_off_map = true
+                pcall(function() if _G.MP_NATIVE.set_render_gate then _G.MP_NATIVE.set_render_gate(target_ptr, 1) end end)
+                if pl.SetPosition then
+                    pcall(function() pl:SetPosition(-99999, -99999) end)
+                end
+                if _G.MP_NATIVE.set_body_velocity then
+                    pcall(function() _G.MP_NATIVE.set_body_velocity(target_ptr, 0, 0) end)
+                end
+            end
             -- Redirect camera + HUD to the spectated puppet. set_main_player
             -- writes DAT_005747a4 → engine camera follows that ptr.
             -- set_hud_allowed_puppet lets vt[14] render for this puppet
@@ -1517,6 +1609,17 @@ local function tick_death_intercept()
                 end)
                 logf("SPECTATE target switched to puppet ptr=%s",
                     tostring(_G.MP_NATIVE.addr_of and _G.MP_NATIVE.addr_of(target.obj.pointer)))
+            end
+        elseif mp.spectate_target_ptr then
+            -- The teammate we were spectating just died and no one else is
+            -- alive. Point the engine's main-player back at our OWN (valid,
+            -- pinned) body — leaving it on the now-defunct puppet makes the
+            -- engine run player logic on a non-player entity → AV @ .text+0x37a6d.
+            mp.spectate_target_ptr = nil
+            local back = mp.local_player_ptr or (pl and pl.pointer)
+            if back then
+                pcall(function() if _G.MP_NATIVE.set_main_player then _G.MP_NATIVE.set_main_player(back) end end)
+                logf("SPECTATE: target died, camera restored to local body")
             end
         end
         return
@@ -1550,17 +1653,17 @@ local function tick_death_intercept()
                 _G.MP_NATIVE.set_invulnerable(pl.pointer, true)
             end
         end)
-        -- Spectate ergonomics: kinematic body (no jitter against teammate
-        -- we follow) + fire-gate set (engine's own no-fire/no-reload gate)
-        -- + render-gate set (think2 draw skip, local body invisible so the
-        -- camera shows only the teammate puppet).
+        -- Spectate ergonomics: kinematic body (no jitter against teammate we
+        -- follow) + fire-gate (engine's own no-fire/no-reload gate). The
+        -- render-gate (hide local body) is deferred to spectate-entry in the
+        -- is_dead block, so the body stays visible during the death-view hold.
         pcall(function()
             if _G.MP_NATIVE.set_body_kinematic then _G.MP_NATIVE.set_body_kinematic(target_ptr) end
             if _G.MP_NATIVE.set_fire_gate then _G.MP_NATIVE.set_fire_gate(target_ptr, 1) end
-            if _G.MP_NATIVE.set_render_gate then _G.MP_NATIVE.set_render_gate(target_ptr, 1) end
         end)
         pcall(refresh_objective_string)
         if mp.sock then pcall(function() send_msg({ type = "player_died", stats = stats.snapshot() }) end) end
+        pcall(drop_death_chest)   -- drop our gear as a chest for teammates
     end
 end
 
@@ -2802,63 +2905,470 @@ local chat = {
     TOP_OFFSET = -1.5,  -- world-units from the player to the newest (bottom) row
 }
 
--- ============ GAME OVER ============
--- Relay broadcasts `game_over { players:[{name,kills,score,...}] }` once all
--- players die. We show the custom mp_gameover menu page (a real menu page, not
--- a world overlay, so it's screen-space and unaffected by the dead-spectator
--- camera). Transition mirrors the proven kick flow: set pending → net_tick_loop
--- flips engine game→menu via inject_esc + SetPage, and MP_FRAME_TICK re-forces
--- the page (the engine resets the active page on pause). Button labels are
--- capped at 15 chars by set_button_label's SSO write, so stats are packed into
--- short codes across two columns. mp.gameover_btns is filled at page creation.
-local gameover_players = {}
+-- ============ GAME OVER OVERLAY (CreateTextObj, in-game) ============
+-- Rendered with CreateTextObj (world-space, same primitive as chat / the dev
+-- menu) for precise positioning and arbitrary-length text — no menu buttons,
+-- no 15-char SSO cap, no column-overlap. In-game ONLY (needs a world/camera).
+-- Toggled by KP* in dev_menu_tick for layout iteration; later it'll render on
+-- the real game_over while spectating. Each line is one text object stacked
+-- top→down from the player, like the dev menu.
+local go_overlay = {
+    active = false, players = {}, text_objs = {}, text_cache = {},
+    LINE_DY = 0.45,   -- world-units between rows
+    TOP_OFFSET = 4.5, -- world-units above the player for the first (top) row
+}
 
-local function fmt_go_a(s)   -- kills / score / accuracy  e.g. "K5 S120 45%"
-    return string.format("K%d S%d %d%%", s.kills or 0, s.score or 0, s.accuracy or 0)
-end
-local function fmt_go_b(s)   -- items / hp lost / friendly fire  e.g. "I8 HP-340 FF0"
-    return string.format("I%d HP-%d FF%d", s.items or 0, s.hp_lost or 0, s.ff or 0)
+local GO_TEST_PLAYERS = {
+    { name = "Player1", kills = 28, score = 560, accuracy = 62, items = 12, hp_lost = 360, ff = 0,   crafted = 3,
+      damage_dealt = 3400, health_healed = 30,  items_shared = 2, deaths = 1 },
+    { name = "Player2", kills = 16, score = 300, accuracy = 37, items = 7,  hp_lost = 520, ff = 280, crafted = 1,
+      damage_dealt = 2400, health_healed = 0,   items_shared = 0, deaths = 4 },
+    { name = "Player3", kills = 7,  score = 140, accuracy = 28, items = 5,  hp_lost = 720, ff = 10,  crafted = 0,
+      damage_dealt = 1200, health_healed = 460, items_shared = 7, deaths = 8 },
+    { name = "Player4", kills = 21, score = 420, accuracy = 51, items = 9,  hp_lost = 440, ff = 40,  crafted = 6,
+      damage_dealt = 2900, health_healed = 160, items_shared = 3, deaths = 2 },
+}
+
+function go_overlay.build_lines()
+    local L = { "======  GAME OVER  ======", "" }
+    for _, p in ipairs(go_overlay.players or {}) do
+        L[#L + 1] = tostring(p.name or "?")
+        L[#L + 1] = string.format("   %d kills    %d score    %d%% acc",
+            p.kills or 0, p.score or 0, p.accuracy or 0)
+        L[#L + 1] = string.format("   %d items    %d dmg taken    %d FF    %d crafted",
+            p.items or 0, p.hp_lost or 0, p.ff or 0, p.crafted or 0)
+        L[#L + 1] = ""
+    end
+    return L
 end
 
-local function populate_gameover()
-    if not (mp.gameover_btns and _G.MP_NATIVE and _G.MP_NATIVE.set_button_label) then return end
-    for i = 1, 4 do
-        local row = mp.gameover_btns[i]
-        local p = gameover_players[i]
-        if row then
-            local function setl(btn, txt)
-                if btn and btn.pointer then
-                    pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, txt) end)
-                end
-            end
-            setl(row.name, p and tostring(p.name or "?") or "")
-            setl(row.a,    p and fmt_go_a(p) or "")
-            setl(row.b,    p and fmt_go_b(p) or "")
+function go_overlay.clear()
+    for _, t in ipairs(go_overlay.text_objs) do
+        if t then pcall(function() t:Delete() end) end
+    end
+    go_overlay.text_objs = {}
+    go_overlay.text_cache = {}
+end
+
+function go_overlay.render()
+    if not go_overlay.active then
+        if #go_overlay.text_objs > 0 then go_overlay.clear() end
+        return
+    end
+    if not (level and level.IsLoaded and level.IsLoaded()) then return end
+    local pl = player.GetPlayer()
+    if not pl then return end
+    local px, py = pl:GetPosition()
+    local lines = go_overlay.build_lines()
+    local function row_y(i) return py + go_overlay.TOP_OFFSET - (i - 1) * go_overlay.LINE_DY end
+    while #go_overlay.text_objs < #lines do
+        local idx = #go_overlay.text_objs + 1
+        local obj
+        pcall(function() obj = CreateTextObj(px, row_y(idx), lines[idx]) end)
+        table.insert(go_overlay.text_objs, obj)
+        table.insert(go_overlay.text_cache, lines[idx])
+    end
+    while #go_overlay.text_objs > #lines do
+        local last = table.remove(go_overlay.text_objs)
+        table.remove(go_overlay.text_cache)
+        if last then pcall(function() last:Delete() end) end
+    end
+    for i, txt in ipairs(lines) do
+        local ty = row_y(i)
+        local obj = go_overlay.text_objs[i]
+        if go_overlay.text_cache[i] ~= txt then
+            if obj then pcall(function() obj:Delete() end) end
+            local newobj
+            pcall(function() newobj = CreateTextObj(px, ty, txt) end)
+            go_overlay.text_objs[i] = newobj
+            go_overlay.text_cache[i] = txt
+        elseif obj then
+            pcall(function() obj:SetPosition(px, ty) end)
         end
     end
 end
 
-local function handle_game_over(m)
-    if mp.gameover_shown then return end
-    mp.gameover_shown = true
-    gameover_players = (type(m.players) == "table") and m.players or {}
-    mp.pending_gameover = true   -- net_tick_loop performs the screen transition
-    logf("GAME OVER received: %d players", #gameover_players)
+function go_overlay.toggle()
+    go_overlay.active = not go_overlay.active
+    if go_overlay.active and #go_overlay.players == 0 then
+        go_overlay.players = GO_TEST_PLAYERS   -- dummy data for layout testing
+    end
+    if not go_overlay.active then go_overlay.clear() end
+    logf("go_overlay toggle → active=%s", tostring(go_overlay.active))
 end
 
--- Flip from the (spectating) game into the mp_gameover menu page. Runs from
--- net_tick_loop, which fires reliably in-game; the re-force loop in
--- MP_FRAME_TICK then keeps the page up at menu state.
-local function mp_show_gameover()
-    populate_gameover()
-    mp.in_game = false              -- stops the mp_pause re-force + death intercept
-    mp.force_gameover_page = true
-    mp._pause_bypass = true
-    pcall(function() menu.SetPage("mp_gameover") end)
-    mp._pause_bypass = false
-    if _G.MP_NATIVE and _G.MP_NATIVE.inject_esc then
-        pcall(function() _G.MP_NATIVE.inject_esc() end)   -- engine game→menu state
+-- ============ SCREEN-SPACE RENDER (DrawText via wglSwapBuffers hook) ============
+-- _G.MP_RENDER is invoked by the native render hook every frame, INSIDE the
+-- render pass — the only context where the engine's immediate-mode DrawText
+-- actually draws (screen pixel coords). Keep it cheap and pcall-guarded.
+-- Screen-space scoreboard drawn via DrawText. Coords are the game's virtual UI
+-- space (~320x240, same as the menu buttons). Lines are precomputed on show()
+-- so the per-frame MP_RENDER is just a draw loop (no string building / GC).
+local go_screen = { active = false, lines = {} }
+
+-- Transposed layout: stat NAMES down the left (full words, room to breathe),
+-- players as narrow number columns across the top. No abbreviations, no wrapping.
+local GO_PCOL = { 124, 174, 224, 274 }   -- up to 4 player value columns
+-- get = numeric value (for finding the best); suffix = display suffix;
+-- bad = true means a HIGH value is bad (highlight the worst in red, not green).
+local GO_ROWS = {
+    { label = "Kills",         get = function(p) return p.kills or 0 end },
+    { label = "Deaths",        get = function(p) return p.deaths or 0 end, bad = true },
+    { label = "Score",         get = function(p) return p.score or 0 end },
+    { label = "Accuracy",      get = function(p) return p.accuracy or 0 end, suffix = "%" },
+    { label = "Damage dealt",  get = function(p) return p.damage_dealt or 0 end },
+    { label = "Damage taken",  get = function(p) return p.hp_lost or 0 end, bad = true },
+    { label = "Health healed", get = function(p) return p.health_healed or 0 end },
+    { label = "Items",         get = function(p) return p.items or 0 end },
+    { label = "Items shared",  get = function(p) return p.items_shared or 0 end },
+    { label = "Friendly fire", get = function(p) return p.ff or 0 end, bad = true },
+    { label = "Crafted",       get = function(p) return p.crafted or 0 end },
+}
+
+-- ====================================================================
+-- NICKNAMES — one per player. Two tiers, both RANK/RATIO based so they stay
+-- meaningful regardless of run length or party size (no magic absolutes):
+--   Tier 1 = signature COMBOS (Carry, Team Killer, Guardian Angel, ...).
+--   Tier 2 = "standout" engine: your single most disproportionate stat picks
+--            the name. Everyone gets something characterful — never "Rookie".
+-- Context helpers: c.top(p,s) (group leader), c.avg(s), c.share(p,s) (fraction
+-- of team total), c.ratio(p,a,b) (a/b, huge if b==0 and a>0).
+-- ====================================================================
+local function S(p, k) return p[k] or 0 end
+-- Tier 1: signature COMBOS, rank/ratio based. FF is judged as a SHARE of your
+-- own damage output (menace-to-team), not a raw count — so a couple of stray
+-- shots never reads as "Team Killer". First match wins; uncaught players fall
+-- through to the standout engine, so nobody is left "Rookie".
+local GO_NICKNAMES = {
+    { "Carry",          function(p,c) return c.top(p,"kills") and c.top(p,"damage_dealt") and c.share(p,"kills") >= 0.33 end },
+    { "Team Killer",    function(p,c) return c.top(p,"ff") and c.ratio(p,"ff","damage_dealt") >= 0.10 end },
+    { "Bastard",        function(p,c) return S(p,"ff") > 0 and c.ratio(p,"ff","damage_dealt") >= 0.05 end },
+    { "Glass Cannon",   function(p,c) return c.top(p,"damage_dealt") and c.top(p,"deaths") and S(p,"deaths") > 0 end },
+    { "Juggernaut",     function(p,c) return c.top(p,"hp_lost") and S(p,"damage_dealt") >= c.avg("damage_dealt") and c.ratio(p,"kills","deaths") >= 6 end },
+    { "Guardian Angel", function(p,c) return c.top(p,"health_healed") and S(p,"health_healed") > 0 and S(p,"kills") < c.avg("kills") end },
+    { "Saint",          function(p,c) return c.top(p,"items_shared") and c.top(p,"health_healed") and S(p,"items_shared") > 0 end },
+    { "MacGyver",       function(p,c) return c.top(p,"crafted") and S(p,"crafted") > 0 and S(p,"kills") >= c.avg("kills") end },
+    { "Phoenix",        function(p,c) return c.top(p,"deaths") and S(p,"deaths") > 0 and S(p,"kills") >= c.avg("kills") end },
+    { "Lone Wolf",      function(p,c) return c.top(p,"kills") and S(p,"items_shared") == 0 and S(p,"health_healed") == 0 end },
+    { "Berserker",      function(p,c) return c.top(p,"kills") and c.top(p,"hp_lost") end },
+    { "Glass Hammer",   function(p,c) return c.top(p,"damage_dealt") and S(p,"hp_lost") > 0 and S(p,"hp_lost") >= c.avg("hp_lost") end },
+    { "Deadeye",        function(p,c) return c.top(p,"accuracy") and S(p,"accuracy") >= 50 and S(p,"kills") >= c.avg("kills") end },
+    { "Spray 'n' Pray", function(p,c) return S(p,"accuracy") > 0 and S(p,"accuracy") <= 30 and S(p,"kills") >= c.avg("kills") end },
+    { "Liability",      function(p,c) return c.top(p,"deaths") and c.top(p,"ff") and S(p,"ff") > 0 end },
+    { "Pacifist",       function(p,c) return S(p,"kills") == 0 and (c.max.kills or 0) > 0 end },
+}
+
+-- Tier 2: standout engine. For each additive stat, "dominance" = share-of-team
+-- × party size (1.0 == fair share; >1 == disproportionately theirs; scale-free).
+-- A player's single most dominant stat picks their name; HOW dominant picks the
+-- tier within that stat. Tiers are { minDominance, name }, high → low.
+local GO_SIGNATURE = {
+    kills         = { {1.7, "Terminator"},    {1.25, "Slayer"},     {0, "Fighter"} },
+    score         = { {1.6, "MVP"},           {0, "Top Dog"} },
+    damage_dealt  = { {1.6, "Wrecking Ball"}, {0, "Bruiser"} },
+    accuracy      = { {1.25, "Deadeye"},      {0, "Marksman"} },
+    hp_lost       = { {1.6, "Meat Shield"},   {0, "Punching Bag"} },
+    health_healed = { {1.7, "Lifesaver"},     {0, "Medic"} },
+    items         = { {1.6, "Loot Goblin"},   {0, "Scavenger"} },
+    items_shared  = { {1.7, "Saint"},         {0, "Provider"} },
+    ff            = { {1.7, "Team Killer"},   {0, "Menace"} },
+    crafted       = { {1.7, "Engineer"},      {0, "Tinkerer"} },
+    deaths        = { {1.6, "Cannon Fodder"}, {0, "Liability"} },
+}
+
+local GO_NICK_STATS = { "kills","score","accuracy","items","hp_lost","ff","crafted",
+                        "damage_dealt","health_healed","items_shared","deaths" }
+
+local function go_assign_nicks(players)
+    local n = #players
+    local max, sum = {}, {}
+    for _, s in ipairs(GO_NICK_STATS) do
+        local m, t = 0, 0
+        for _, p in ipairs(players) do local v = p[s] or 0; m = math.max(m, v); t = t + v end
+        max[s], sum[s] = m, t
     end
+    local c = { max = max, sum = sum, n = n }
+    function c.top(p, s)   return (p[s] or 0) == max[s] and (max[s] or 0) > 0 end
+    function c.avg(s)      return n > 0 and (sum[s] / n) or 0 end
+    function c.share(p, s) return (sum[s] or 0) > 0 and ((p[s] or 0) / sum[s]) or 0 end
+    function c.ratio(p, a, b)
+        local db = p[b] or 0
+        if db == 0 then return (p[a] or 0) > 0 and math.huge or 0 end
+        return (p[a] or 0) / db
+    end
+    -- Tier 2 fallback: most dominant additive stat → tiered signature name.
+    local function standout(p)
+        local any, best_stat, best_dom = false, nil, 1.15   -- must beat fair share
+        for _, s in ipairs(GO_NICK_STATS) do
+            local v = p[s] or 0
+            if v > 0 then any = true end
+            if v > 0 and (sum[s] or 0) > 0 and GO_SIGNATURE[s] then
+                local dom = c.share(p, s) * n
+                if dom > best_dom then best_dom, best_stat = dom, s end
+            end
+        end
+        if not any then return "Bystander" end
+        if not best_stat then return "All-Rounder" end
+        for _, tier in ipairs(GO_SIGNATURE[best_stat]) do
+            if best_dom >= tier[1] then return tier[2] end
+        end
+        return "All-Rounder"
+    end
+    for _, p in ipairs(players) do
+        local nick
+        for _, rule in ipairs(GO_NICKNAMES) do
+            local okr, matched = pcall(rule[2], p, c)
+            if okr and matched then nick = rule[1]; break end
+        end
+        p._nick = nick or standout(p)
+    end
+end
+
+function go_screen.show(players)
+    players = players or {}
+    -- colors (r,g,b 0..1); values stay default white
+    local C_TITLE  = { 1.0, 0.82, 0.2 }   -- gold
+    local C_HEADER = { 0.45, 0.85, 1.0 }  -- cyan player names
+    local C_LABEL  = { 0.6, 0.6, 0.6 }    -- grey stat labels
+    local C_GREEN = { 0.35, 1.0, 0.35 }   -- best in a good stat
+    local C_RED   = { 1.0, 0.4, 0.4 }     -- worst in a bad stat (e.g. friendly fire)
+    local C_NICK  = { 1.0, 0.72, 0.25 }   -- nickname (orange-gold)
+    go_assign_nicks(players)
+    local L = { { x = 120, y = 8, text = "-- GAME OVER --", c = C_TITLE } }
+    -- header row: player names across the top
+    for i, p in ipairs(players) do
+        if GO_PCOL[i] then L[#L+1] = { x = GO_PCOL[i], y = 22, text = tostring(p.name or "?"), c = C_HEADER } end
+    end
+    -- one row per stat: label on the left, each player's value in its column.
+    -- Highlight the leader: green for good stats, red for bad ones (ties share it).
+    local y = 36
+    for _, row in ipairs(GO_ROWS) do
+        L[#L+1] = { x = 16, y = y, text = row.label, c = C_LABEL }
+        local maxv
+        for _, p in ipairs(players) do
+            local v = row.get(p)
+            if maxv == nil or v > maxv then maxv = v end
+        end
+        for i, p in ipairs(players) do
+            if GO_PCOL[i] then
+                local v = row.get(p)
+                local col
+                if maxv and maxv > 0 and v == maxv then col = row.bad and C_RED or C_GREEN end
+                L[#L+1] = { x = GO_PCOL[i], y = y, text = tostring(v) .. (row.suffix or ""), c = col }
+            end
+        end
+        y = y + 12
+    end
+    -- separator between the stat grid and the nickname block
+    y = y + 3
+    L[#L+1] = { x = 16, y = y, text = string.rep("-", 50), c = C_LABEL }
+    y = y + 8
+    -- nickname block: "Name   Nickname", one line per player
+    for i, p in ipairs(players) do
+        L[#L+1] = { x = 16, y = y, text = tostring(p.name or "?"), c = C_HEADER }
+        L[#L+1] = { x = 84, y = y, text = tostring(p._nick or "All-Rounder"), c = C_NICK }
+        y = y + 11
+    end
+    -- back button: a bracketed label at the very bottom (ESC also triggers it)
+    local C_BACK = { 0.4, 0.95, 0.55 }   -- green, distinct from the gold title
+    L[#L+1] = { x = 110, y = 222, text = "[ Return to Lobby  (ESC) ]", c = C_BACK }
+    go_screen.lines = L
+    go_screen.active = true
+    if _G.MP_NATIVE and _G.MP_NATIVE.set_gameover_bg then
+        pcall(function() _G.MP_NATIVE.set_gameover_bg(true) end)   -- black backdrop
+    end
+end
+
+function go_screen.hide()
+    go_screen.active = false
+    go_screen.pending_at = nil       -- cancel any scheduled (delayed) show
+    go_screen.pending_players = nil
+    if _G.MP_NATIVE and _G.MP_NATIVE.set_gameover_bg then
+        pcall(function() _G.MP_NATIVE.set_gameover_bg(false) end)
+    end
+end
+
+-- The back button's action. Defaults to just closing the overlay; the lobby
+-- code overrides it with lobby_leave_room() once that's in scope, so the
+-- on-screen "[ Return to Lobby (ESC) ]" button (and ESC) actually navigates.
+go_screen.on_back = nil
+function go_screen.back()
+    if go_screen.on_back then pcall(go_screen.on_back) else go_screen.hide() end
+end
+
+-- Poll the native ESC-dismiss flag (set by the keyboard hook while the screen is
+-- up) and trigger the back action on ESC. Called from in-game and menu ticks.
+function go_screen.poll_dismiss()
+    -- Delayed show: handle_game_over schedules pending_at; reveal when it's due
+    -- (lets the player watch the final death before the scoreboard appears).
+    if go_screen.pending_at and socket and socket.gettime
+       and socket.gettime() >= go_screen.pending_at then
+        local players = go_screen.pending_players or {}
+        go_screen.pending_at = nil
+        go_screen.pending_players = nil
+        pcall(function() go_screen.show(players) end)
+    end
+    if not go_screen.active then return end
+    if _G.MP_NATIVE and _G.MP_NATIVE.consume_gameover_dismiss then
+        local ok, d = pcall(function() return _G.MP_NATIVE.consume_gameover_dismiss() end)
+        if ok and d then go_screen.back() end
+    end
+end
+
+function go_screen.toggle()
+    if go_screen.active then go_screen.hide() else go_screen.show(GO_TEST_PLAYERS) end
+    logf("go_screen toggle → active=%s", tostring(go_screen.active))
+end
+
+-- Called by the native wglSwapBuffers hook every frame, inside the render pass.
+-- Coord space is the fixed 320x240 ortho set by the hook.
+function _G.MP_RENDER()
+    if not (DrawText and go_screen.active) then return end
+    for _, ln in ipairs(go_screen.lines) do
+        if SetColor then
+            local c = ln.c
+            if c then SetColor(c[1], c[2], c[3], 1) else SetColor(1, 1, 1, 1) end
+        end
+        DrawText(ln.x, ln.y, ln.text)
+    end
+    if SetColor then SetColor(1, 1, 1, 1) end   -- restore default white
+end
+
+-- ============ GAME OVER ============
+-- Relay broadcasts `game_over { players:[{name,kills,score,...}] }` once all
+-- players die. `gameover_players` holds the latest payload for the UI to render.
+local gameover_players = {}
+
+-- ====================================================================
+-- GAME OVER UI — standalone mainmenu injector (NOT WIRED IN by default)
+-- --------------------------------------------------------------------
+-- WHY this shape: the engine's pause overlay renders the `mainmenu` page
+-- DIRECTLY (native), bypassing menu.SetPage — so a separate page can't be shown
+-- in-game. The only way to show an in-game screen is to INJECT into mainmenu,
+-- exactly like the MP pause UI. This module is self-contained so it can be
+-- wired into the mainmenu state logic without entangling it:
+--
+--   1) once, where mainmenu is set up:   gameover_ui.inject(menu.GetPage("mainmenu"))
+--   2) when game_over fires:             gameover_ui.show(gameover_players)
+--   3) in the per-state relabel, when NOT in game-over:  gameover_ui.hide()
+--   4) the Return button callback below should call your leave-to-lobby action.
+--
+-- Labels are SSO-capped at 15 chars (set_button_label), so stats are packed
+-- into short codes across two columns.
+local gameover_ui = { btns = nil, active = false }
+
+local function go_setlabel(btn, txt)
+    if btn and btn.pointer and _G.MP_NATIVE and _G.MP_NATIVE.set_button_label then
+        pcall(function() _G.MP_NATIVE.set_button_label(btn.pointer, txt or "") end)
+    end
+end
+
+-- Create the (blank/invisible) game-over slots on the given page. Call once.
+function gameover_ui.inject(page)
+    if not (page and page.AddButton) then logf("gameover_ui.inject: bad page"); return false end
+    local b = { rows = {} }
+    b.title  = page:AddButton(21, 36, "", "", function() end)
+    b.header = page:AddButton(20, 56, "", "", function() end)
+    for i = 1, 4 do
+        local y = 76 + (i - 1) * 16
+        b.rows[i] = {
+            name = page:AddButton(20,  y, "", "", function() end),
+            a    = page:AddButton(120, y, "", "", function() end),
+            b    = page:AddButton(215, y, "", "", function() end),
+        }
+    end
+    b.ret = page:AddButton(21, 168, "", "", function()
+        gameover_ui.hide()
+        -- TODO(wire-in): call your return-to-lobby action here, e.g. lobby_leave_room()
+    end)
+    gameover_ui.btns = b
+    logf("gameover_ui: injected into mainmenu")
+    return true
+end
+
+-- Fill the slots from a players array (each entry has the flattened stats).
+function gameover_ui.show(players)
+    if not gameover_ui.btns then return end   -- no-op until inject() is wired
+    gameover_ui.active = true
+    local b = gameover_ui.btns
+    go_setlabel(b.title,  "-- GAME OVER --")
+    go_setlabel(b.header, "K=kill S=score")
+    for i = 1, 4 do
+        local r, p = b.rows[i], players and players[i]
+        go_setlabel(r.name, p and tostring(p.name or "?") or "")
+        go_setlabel(r.a, p and string.format("K%d S%d %d%%",
+            p.kills or 0, p.score or 0, p.accuracy or 0) or "")
+        go_setlabel(r.b, p and string.format("I%d HP-%d FF%d",
+            p.items or 0, p.hp_lost or 0, p.ff or 0) or "")
+    end
+    go_setlabel(b.ret, "Return to Lobby")
+end
+
+-- Blank every slot so mainmenu is clean outside game-over.
+function gameover_ui.hide()
+    if not gameover_ui.btns then return end
+    gameover_ui.active = false
+    local b = gameover_ui.btns
+    go_setlabel(b.title, ""); go_setlabel(b.header, "")
+    for i = 1, 4 do
+        local r = b.rows[i]
+        go_setlabel(r.name, ""); go_setlabel(r.a, ""); go_setlabel(r.b, "")
+    end
+    go_setlabel(b.ret, "")
+end
+
+-- NEUTRALIZED transition: just store the payload + hand it to the (unwired)
+-- UI. No inject_esc / SetPage — dying no longer dumps players to the engine
+-- menu. Once gameover_ui is wired into the mainmenu, show() will render it.
+-- A peer died and dropped a loot chest — spawn the same container locally.
+local function handle_death_chest(m)
+    if not m or not m.x or not m.y then return end
+    pcall(function() spawn_death_chest(m.x, m.y, m.items or {}, m.owner) end)
+end
+
+-- A victim reported that WE friendly-fired them. Credit our own stats: it
+-- counts as friendly fire AND toward total damage dealt. (Broadcast to the
+-- room; we only act on entries addressed to us.)
+local function handle_ff_hit(m)
+    if not m or m.to ~= mp.my_id then return end
+    local d = tonumber(m.dmg) or 10
+    stats.add("ff", d)
+    stats.add("damage_dealt", d)
+    logf("FF credited: +%d ff / +%d damage (we shot a teammate)", d, d)
+end
+
+local function handle_game_over(m)
+    gameover_players = (type(m.players) == "table") and m.players or {}
+    -- Stop spectating now: once everyone is dead the spectated puppet stops
+    -- updating, and the engine crashes (AV @ .text+0x37a6d) if it keeps running
+    -- main-player logic on it. Point the camera back at our own valid body.
+    if mp.spectate_target_ptr and _G.MP_NATIVE and _G.MP_NATIVE.set_main_player then
+        local back = mp.local_player_ptr or (mp.local_player_obj and mp.local_player_obj.pointer)
+        if back then pcall(function() _G.MP_NATIVE.set_main_player(back) end) end
+        mp.spectate_target_ptr = nil
+    end
+    -- Defer the scoreboard so the final death plays out first (see how you died).
+    -- go_screen.poll_dismiss (in-game + menu ticks) fires the show when due.
+    go_screen.pending_players = gameover_players
+    go_screen.pending_at = (socket and socket.gettime and socket.gettime() or 0) + DEATH_VIEW_DELAY
+    logf("GAME OVER received: %d players → scoreboard in %.1fs", #gameover_players, DEATH_VIEW_DELAY)
+end
+
+-- TEST: dummy stats + a toggle, driven by a hotkey (KP*) polled in the menu
+-- tick. Lets us preview the game-over UI on the title menu without dying. The
+-- first toggle lazily injects gameover_ui into mainmenu.
+local GAMEOVER_TEST_PLAYERS = {
+    { name = "Toni", kills = 12, score = 340, accuracy = 58, items = 9,  hp_lost = 420, ff = 0  },
+    { name = "Kito", kills = 7,  score = 180, accuracy = 41, items = 5,  hp_lost = 510, ff = 15 },
+    { name = "Grim", kills = 3,  score = 70,  accuracy = 22, items = 2,  hp_lost = 600, ff = 0  },
+}
+local function gameover_test_toggle()
+    if not gameover_ui.btns then
+        gameover_ui.inject(menu and menu.GetPage and menu.GetPage("mainmenu"))
+    end
+    if gameover_ui.active then gameover_ui.hide()
+    else gameover_ui.show(GAMEOVER_TEST_PLAYERS) end
+    logf("gameover test toggle → active=%s", tostring(gameover_ui.active))
 end
 
 local handlers = {
@@ -2893,6 +3403,8 @@ local handlers = {
     game_started = handle_game_started,
     kicked       = handle_kicked,
     game_over    = handle_game_over,
+    ff_hit       = handle_ff_hit,
+    death_chest  = handle_death_chest,
 }
 
 -- Build a mob snapshot from the host's tracked mobs. Filters out dead/invalid entries.
@@ -3216,11 +3728,6 @@ local function net_tick_loop()
             -- MP_FRAME_TICK doesn't fire after begin_game. This coroutine
             -- IS resumed on every tick (Wait yields go through lua_resume).
             pcall(tick_death_intercept)
-            -- Game over: relay said all players are dead → show the results page.
-            if mp.pending_gameover then
-                mp.pending_gameover = false
-                pcall(mp_show_gameover)
-            end
             local now = socket.gettime()
             if mp.sock and now - mp.last_send >= send_interval then
                 local pl = player.GetPlayer()
@@ -3511,6 +4018,9 @@ local function build_dev_categories()
 
     -- Test triggers — available on both host and joiner.
     local test_actions = {
+        { label = "Toggle GAME OVER screen", run = function()
+            pcall(go_screen.toggle)
+        end },
         { label = "Kill self (enter spectate)", run = function()
             if mp.is_dead then logf("dev: already dead"); return end
             mp.is_dead = true
@@ -3874,6 +4384,7 @@ local function dev_menu_tick()
     -- Networked chat: poll T/Y to open, drain typed keys, render. Wrapped in
     -- pcall so a chat error never blocks the bullet/hit draining below.
     pcall(chat.tick)
+    pcall(go_screen.poll_dismiss)   -- ESC closes the game-over screen
     -- Drain native hit events and forward to host as mob_damage. Each event
     -- is a c-side entity address; we match against our local puppet pointers
     -- to find the mp mob id. Deduplicate via a short cooldown per id.
@@ -3974,35 +4485,72 @@ local function dev_menu_tick()
             end
         end
     end
-    if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and (not mp.is_host) and mp.sock then
-        if not _G.MP_HIT_COOLDOWN then _G.MP_HIT_COOLDOWN = {} end
-        if not _G.MP_HIT_PUPPET_ADDRS then _G.MP_HIT_PUPPET_ADDRS = {} end
-        -- Refresh addr→id map periodically (puppet creation rate is low).
-        if (not _G.MP_HIT_ADDR_REFRESH) or (socket.gettime() - _G.MP_HIT_ADDR_REFRESH > 1.0) then
-            _G.MP_HIT_ADDR_REFRESH = socket.gettime()
-            local map = {}
-            for id, entry in pairs(mp.mob_puppets) do
+    -- Friendly-fire tracking. FF damage is applied on the VICTIM's machine: a
+    -- peer's replicated bullet (owner = the shooter's puppet) hits our real
+    -- player. The CentralHit hook gives us (victim, attacker, damage); when WE
+    -- are the victim and the attacker is a teammate's puppet, we credit the
+    -- shooter over the relay (their client adds it to ff + damage_dealt).
+    if _G.MP_NATIVE and _G.MP_NATIVE.consume_hit and _G.MP_NATIVE.addr_of and mp.sock then
+        if not _G.MP_FF_PUPPET_ADDRS then _G.MP_FF_PUPPET_ADDRS = {} end
+        -- Refresh teammate-puppet addr→id map + our own player address (~1 Hz).
+        if (not _G.MP_FF_ADDR_REFRESH) or (socket.gettime() - _G.MP_FF_ADDR_REFRESH > 1.0) then
+            _G.MP_FF_ADDR_REFRESH = socket.gettime()
+            local ff_map = {}
+            for id, entry in pairs(mp.puppets or {}) do
                 if type(entry) == "table" and entry.obj and entry.obj.pointer then
                     local ok, addr = pcall(function() return _G.MP_NATIVE.addr_of(entry.obj.pointer) end)
-                    if ok and addr and addr ~= 0 then map[addr] = id end
+                    if ok and addr and addr ~= 0 then ff_map[addr] = id end
                 end
             end
-            _G.MP_HIT_PUPPET_ADDRS = map
+            _G.MP_FF_PUPPET_ADDRS = ff_map
+            -- Laser FF: the native laser-tick probe records the LASER object as
+            -- the attacker (a laser doesn't carry an owner we can match like a
+            -- bullet). Map each active peer laser's address → its shooter id.
+            local laser_map = {}
+            for id, entry in pairs(mp.peer_lasers or {}) do
+                if type(entry) == "table" and entry.obj and entry.obj.pointer then
+                    local ok, addr = pcall(function() return _G.MP_NATIVE.addr_of(entry.obj.pointer) end)
+                    if ok and addr and addr ~= 0 then laser_map[addr] = id end
+                end
+            end
+            _G.MP_FF_LASER_ADDRS = laser_map
+            _G.MP_LOCAL_PLAYER_ADDR = nil
+            local lp = mp.local_player_ptr or (mp.local_player_obj and mp.local_player_obj.pointer)
+            if not lp then local p = player.GetPlayer(); lp = p and p.pointer end
+            if lp then
+                local ok, a = pcall(function() return _G.MP_NATIVE.addr_of(lp) end)
+                if ok and a and a ~= 0 then _G.MP_LOCAL_PLAYER_ADDR = a end
+                -- tell the native whose hp to watch for laser-beam friendly fire
+                if _G.MP_NATIVE.set_ff_watch_player then
+                    pcall(function() _G.MP_NATIVE.set_ff_watch_player(lp) end)
+                end
+            end
         end
-        -- Drain up to 32 hits per tick
-        local now = socket.gettime()
-        for _ = 1, 32 do
-            local addr = _G.MP_NATIVE.consume_hit()
-            if not addr or addr == 0 then break end
-            local mob_id = _G.MP_HIT_PUPPET_ADDRS[addr]
-            if mob_id then
-                stats.add("hits")            -- shot landed on a mob
-                stats.note_damage(mob_id)    -- kill credit if it dies soon
-                local last = _G.MP_HIT_COOLDOWN[mob_id] or 0
-                if (now - last) > 0.1 then
-                    _G.MP_HIT_COOLDOWN[mob_id] = now
-                    send_msg({ type = "mob_damage", id = mob_id, dmg = 10 })
-                    logf("native hit -> mob_damage id=%d", mob_id)
+        -- Drain the whole ring each tick (FF events are rare but must not be
+        -- starved out by mob-hit churn). Only hits on OUR player matter here.
+        local la = _G.MP_LOCAL_PLAYER_ADDR
+        for _ = 1, 200 do
+            local victim, attacker, dmg = _G.MP_NATIVE.consume_hit()
+            if not victim or victim == 0 then break end
+            if la and victim == la and attacker and attacker ~= 0 then
+                -- attacker is either a bullet's owner (→ teammate puppet) or a
+                -- laser object (→ peer laser). Match against both maps.
+                local shooter_id = _G.MP_FF_PUPPET_ADDRS[attacker]
+                    or (_G.MP_FF_LASER_ADDRS and _G.MP_FF_LASER_ADDRS[attacker])
+                -- Credit ONLY when the source is a DIFFERENT player. A
+                -- self-inflicted hit (own grenade/explosion) has owner == our
+                -- own player, so it must never count as FF.
+                if attacker == la then
+                    logf("FF self-hit ignored (owner==local %X)", la)
+                elseif shooter_id and shooter_id ~= mp.my_id then
+                    local d = (type(dmg) == "number" and dmg > 0) and dmg or 10
+                    send_msg({ type = "ff_hit", to = shooter_id, dmg = d })
+                    logf("FRIENDLY FIRE taken: owner=%X shooter_id=%s dmg=%d → crediting",
+                        attacker, tostring(shooter_id), d)
+                else
+                    -- not a teammate puppet (mob/unknown owner) — log to learn what it is
+                    logf("FF skip: hit on us, owner=%X local=%X matched_id=%s",
+                        attacker, la, tostring(shooter_id))
                 end
             end
         end
@@ -4137,6 +4685,9 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.gameover_shown = false
         mp.pending_gameover = false
         mp.force_gameover_page = false
+        mp.death_chest_dropped = false   -- allow a fresh death-loot drop this run
+        mp.local_parked_off_map = false
+        go_screen.hide()   -- clear any prior run's scoreboard
         local seed = mp.session_seed or 1779843477
         logf("begin_game: seed=%s is_host=%s room='%s'",
             tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
@@ -4590,7 +5141,14 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         if _G.MP_NATIVE and _G.MP_NATIVE.set_esc_opens_mp_pause then
             pcall(function() _G.MP_NATIVE.set_esc_opens_mp_pause(false) end)
         end
+        go_screen.hide()   -- clear the scoreboard when leaving the room
         menu.SetPage("mp_lobby")
+    end
+
+    -- Wire the game-over back button / ESC to return to the lobby. When merely
+    -- previewing the screen from the title menu (no socket/game), just close it.
+    go_screen.on_back = function()
+        if mp.in_game or mp.sock then lobby_leave_room() else go_screen.hide() end
     end
 
     -- ------------------------------------------------------------------
@@ -4628,15 +5186,52 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 pcall(lobby_refresh_rooms)   -- pre-populate before page render
                 menu.SetPage("mp_browse")
             end)
+        local gotest_btn = mp_lobby_page:AddButton(60, 154, "TEST: Game Over",
+            "Toggle the DrawText scoreboard overlay",
+            function() pcall(go_screen.toggle) end)
         pcall(function()
             local back = mp_lobby_page:GetButton("BACK")
             create_btn:SetNext("down", browse_btn); browse_btn:SetNext("up", create_btn)
+            browse_btn:SetNext("down", gotest_btn); gotest_btn:SetNext("up", browse_btn)
             if back then
-                browse_btn:SetNext("down", back); back:SetNext("up", browse_btn)
+                gotest_btn:SetNext("down", back); back:SetNext("up", gotest_btn)
             end
         end)
     end)
     logf("MP page mp_lobby: ok=%s err=%s", tostring(pok1), tostring(perr1))
+
+    -- ------------------------------------------------------------------
+    -- mp_gostest = standalone PREVIEW of the end-of-run scoreboard layout.
+    -- Reachable from mp_lobby's "TEST: Game Over" button. Uses full-length
+    -- AddButton labels baked at creation (NOT set_button_label), so we can see
+    -- a roomy layout without the 15-char SSO cap. This is a layout sandbox only
+    -- — the real in-game screen still has to inject into mainmenu.
+    -- ------------------------------------------------------------------
+    local pokGO, perrGO = pcall(function()
+        local page = menu.AddPage("mp_gostest", "mp_lobby")
+        if not page then error("AddPage('mp_gostest') returned nil") end
+        pcall(function() page:AddBackground("gfx/menubg.bmp") end)
+        -- Fixed-column grid of buttons (each cell its own button at a fixed x →
+        -- columns line up). Content starts below the menubg's title band.
+        local COLX = { name = 16, kills = 88, score = 120, acc = 160,
+                       items = 200, dmg = 232, ff = 270, craft = 298 }
+        local function cell(x, y, txt) page:AddButton(x, y, tostring(txt), "", function() end) end
+        local function row(y, c)
+            cell(COLX.name, y, c.name);  cell(COLX.kills, y, c.kills); cell(COLX.score, y, c.score)
+            cell(COLX.acc, y, c.acc);    cell(COLX.items, y, c.items); cell(COLX.dmg, y, c.dmg)
+            cell(COLX.ff, y, c.ff);      cell(COLX.craft, y, c.craft)
+        end
+        row(92, { name = "NAME", kills = "K", score = "SCR", acc = "ACC",
+                  items = "ITM", dmg = "DMG", ff = "FF", craft = "CRF" })
+        for i, p in ipairs(GAMEOVER_TEST_PLAYERS) do
+            row(110 + (i - 1) * 16, {
+                name = p.name, kills = p.kills, score = p.score,
+                acc = (p.accuracy or 0) .. "%", items = p.items,
+                dmg = p.hp_lost, ff = p.ff, craft = p.crafted or 0,
+            })
+        end
+    end)
+    logf("MP page mp_gostest: ok=%s err=%s", tostring(pokGO), tostring(perrGO))
 
     -- ------------------------------------------------------------------
     -- mp_browse = room slot picker. 4 slot buttons + page prev/next + Back.
@@ -4762,37 +5357,9 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end)
     logf("MP page mp_waiting: ok=%s err=%s", tostring(pok2), tostring(perr2))
 
-    -- ----- mp_gameover: end-of-run scoreboard -----
-    -- One row per player (up to 4): name + two packed stat columns (button
-    -- labels are SSO-capped at 15 chars). Filled by populate_gameover() from
-    -- the relay's game_over payload. Return to Lobby tears down and goes back.
-    local pok3, perr3 = pcall(function()
-        local page = menu.AddPage("mp_gameover", "mp_lobby")
-        if not page then error("AddPage('mp_gameover') returned nil") end
-        pcall(function() page:AddBackground("gfx/menubg.bmp") end)
-        page:AddButton(21, 36, "-- GAME OVER --", "All players have died", function() end)
-        page:AddButton(20,  58, "PLAYER",  "", function() end)
-        page:AddButton(120, 58, "K=kills S=score", "", function() end)
-        page:AddButton(215, 58, "I=items HP-=lost", "", function() end)
-        mp.gameover_btns = {}
-        for i = 1, 4 do
-            local y = 78 + (i - 1) * 16
-            mp.gameover_btns[i] = {
-                name = page:AddButton(20,  y, "",  "", function() end),
-                a    = page:AddButton(120, y, "",  "", function() end),
-                b    = page:AddButton(215, y, "",  "", function() end),
-            }
-        end
-        local ret = page:AddButton(21, 168, "Return to Lobby",
-            "Leave the room and return to the lobby",
-            function()
-                mp.force_gameover_page = false
-                mp.gameover_shown = false
-                pcall(lobby_leave_room)
-            end)
-        mp.gameover_return_btn = ret
-    end)
-    logf("MP page mp_gameover: ok=%s err=%s", tostring(pok3), tostring(perr3))
+    -- (Game-over UI is the standalone gameover_ui mainmenu injector defined
+    -- earlier — NOT a separate page, since the engine renders mainmenu directly
+    -- on pause. Wire gameover_ui.inject/show/hide into the mainmenu state logic.)
 
     -- Background auto-refresh: hook user32!PeekMessageA per frame and
     -- call _G.MP_FRAME_TICK at ~10Hz. Engine-tracked coroutines (Wait)
@@ -4887,6 +5454,14 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end
 
     _G.MP_FRAME_TICK = function()
+        -- TEST hotkey: KP* toggles the game-over UI preview on the title menu.
+        -- Detected by the native LL keyboard hook (input.KeyDown doesn't reach
+        -- Lua at the menu); consume_testkey is an atomic read+clear.
+        if _G.MP_NATIVE and _G.MP_NATIVE.consume_testkey then
+            local ok, pressed = pcall(function() return _G.MP_NATIVE.consume_testkey() end)
+            if ok and pressed then pcall(gameover_test_toggle) end
+        end
+        pcall(go_screen.poll_dismiss)   -- ESC closes the game-over screen (menu state)
         mp._frame_tick_dbg_count = (mp._frame_tick_dbg_count or 0) + 1
         if (mp._frame_tick_dbg_count % 30) == 1 then
             local hp_val = "?"
@@ -5104,18 +5679,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 pcall(function() _G.MP_NATIVE.inject_esc() end)
             end
             return
-        end
-
-        -- Same engine page-reset issue as the kick path: keep re-forcing
-        -- mp_gameover until the user clicks Return to Lobby (clears the flag).
-        if mp.force_gameover_page then
-            local now = (socket and socket.gettime) and socket.gettime() or os.time()
-            if (now - (mp._last_go_force or 0)) >= 0.5 then
-                mp._pause_bypass = true
-                pcall(function() menu.SetPage("mp_gameover") end)
-                mp._pause_bypass = false
-                mp._last_go_force = now
-            end
         end
 
         -- The engine's native ESC handler resets the active page to
