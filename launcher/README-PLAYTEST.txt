@@ -5,10 +5,11 @@ Quick start
 -----------
 1. Extract the entire ZIP. Keep GlitchMod.exe beside the payload folder.
 2. Run GlitchMod.exe.
-3. Confirm that your Steam Teleglitch: Die More Edition folder is detected.
-4. Select MULTIPLAYER ALPHA.
-5. Click INSTALL / REPAIR, then LAUNCH MULTIPLAYER.
-6. In Teleglitch, use the multiplayer lobby to create or join a room.
+3. GlitchMod normally finds Teleglitch automatically. If it does not, click
+   CHANGE and choose the game folder containing Teleglitch.exe.
+4. Select MULTIPLAYER ALPHA and click INSTALL / REPAIR.
+5. Click LAUNCH MULTIPLAYER.
+6. In Teleglitch, create or join a room from the multiplayer menu.
 
 There is no separate installer and no files are downloaded at runtime. The
 manager backs up files it must replace and REMOVE LOADER restores them. Imported

@@ -5,11 +5,23 @@ More Edition**. The bundled Multiplayer Alpha profile installs the native bridge
 and Lua client, keeps per-profile mod selections, writes the public relay config,
 and launches the game. A Vanilla profile starts the game with all mods disabled.
 
-## Player install
+## Play the multiplayer alpha
 
-Download the latest `GlitchMod-*-win-x86.zip` release, extract it, and run
-`GlitchMod.exe`. The ZIP is self-contained; no PowerShell command or separate
-runtime install is required.
+1. Open the [GlitchMod Alpha 1 release](https://github.com/OriginUnknowns/TeleglitchDMEMPClient/releases/tag/v0.1.0-alpha.1).
+2. Under **Assets**, download `GlitchMod-0.1.0-alpha.1-win-x86.zip`. Do not
+   download GitHub's automatic "Source code" ZIP.
+3. Extract the entire ZIP, then run `GlitchMod.exe`.
+4. GlitchMod normally finds the Steam game automatically. If it does not, click
+   **CHANGE** and choose the Teleglitch DME folder containing `Teleglitch.exe`.
+5. Select **MULTIPLAYER ALPHA** and click **INSTALL / REPAIR**.
+6. Click **LAUNCH MULTIPLAYER**, then create or join a room in the game's
+   multiplayer menu.
+
+That is the complete setup. There is no account, command line, port forwarding,
+server address, separate installer, or runtime download. Everyone joining the
+same room should use the same GlitchMod release.
+
+The `.sha256` asset is optional verification data; most players do not need it.
 
 ## Current multiplayer scope
 
@@ -19,7 +31,8 @@ runtime install is required.
   deaths, level exits, campaign transitions, chat, and game over
 - One always-on Railway relay replica, exposed over raw TCP
 
-This is an alpha. Everyone in a room should use the same GlitchMod release.
+This is an alpha and currently supports the Windows/Steam release of
+Teleglitch: Die More Edition.
 
 ## Build a release
 
