@@ -129,7 +129,7 @@ namespace GlitchMod
                 {
                     BorderBrush = active ? Acid : Line,
                     BorderThickness = new Thickness(active ? 1.5 : 1),
-                    Background = active ? new SolidColorBrush(Color.FromRgb(28, 34, 28)) : Panel,
+                    Background = active ? new SolidColorBrush(Color.FromRgb(31, 38, 30)) : Panel,
                     CornerRadius = new CornerRadius(4),
                     Margin = new Thickness(0, 0, 0, 9)
                 };
@@ -170,7 +170,7 @@ namespace GlitchMod
                     Text = profile.Multiplayer ? "NETWORK PROFILE" : "CLEAN PROFILE",
                     Foreground = active ? Acid : Muted,
                     FontFamily = new FontFamily("Consolas"),
-                    FontSize = 9,
+                    FontSize = 10,
                     Margin = new Thickness(0, 3, 0, 0)
                 });
                 Grid.SetColumn(text, 1);
@@ -238,7 +238,7 @@ namespace GlitchMod
                     Text = mod.Folder + "  ·  " + mod.Version,
                     Foreground = Muted,
                     FontFamily = new FontFamily("Consolas"),
-                    FontSize = 9,
+                    FontSize = 10,
                     Margin = new Thickness(0, 3, 0, 0)
                 });
                 var toggle = new CheckBox

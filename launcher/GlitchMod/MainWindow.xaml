@@ -88,7 +88,7 @@
                                    FontWeight="Bold" FontSize="33" Margin="0,5,0,0"/>
                         <TextBlock x:Name="ProfileSubtitle"
                                    Text="Co-op campaign through the OriginUnknowns relay."
-                                   Foreground="{StaticResource Muted}" FontSize="13" Margin="1,4,0,24"/>
+                                   Foreground="{StaticResource Muted}" FontSize="14" Margin="1,4,0,24"/>
 
                         <Border Background="{StaticResource Panel}" BorderBrush="{StaticResource Line}"
                                 BorderThickness="1" CornerRadius="4" Padding="18">
@@ -125,7 +125,7 @@
                                     <TextBlock x:Name="LoaderStateText" Text="Not installed" FontSize="17"
                                                FontFamily="Segoe UI Semibold" Margin="0,5,0,2"/>
                                     <TextBlock x:Name="LoaderVersionText" Text="Payload unavailable"
-                                               Foreground="{StaticResource Muted}" FontSize="11"/>
+                                               Foreground="{StaticResource Muted}" FontSize="12"/>
                                 </StackPanel>
                             </Border>
                             <Border Grid.Column="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Line}"
@@ -138,7 +138,7 @@
                                                    FontFamily="Segoe UI Semibold"/>
                                     </StackPanel>
                                     <TextBlock x:Name="RelayAddressText" Text="No endpoint configured"
-                                               Foreground="{StaticResource Muted}" FontFamily="Consolas" FontSize="11"/>
+                                               Foreground="{StaticResource Muted}" FontFamily="Consolas" FontSize="12"/>
                                 </StackPanel>
                             </Border>
                         </Grid>
@@ -147,7 +147,7 @@
                                 BorderThickness="1" CornerRadius="4" Padding="18" Margin="0,14,0,0">
                             <StackPanel>
                                 <TextBlock Text="QUICK NOTES" Style="{StaticResource LabelCaps}" Margin="0,0,0,9"/>
-                                <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="12.5"
+                                <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="13"
                                            LineHeight="20">
                                     This is an early multiplayer build. Rooms support up to four players.
                                     Everyone must use the same GlitchMod release. The host leaving closes the room.
@@ -175,7 +175,7 @@
                         </Grid.RowDefinitions>
                         <TextBlock Text="MODS IN THIS INSTANCE" Style="{StaticResource LabelCaps}" Margin="0,4,0,7"/>
                         <TextBlock Grid.Row="1" x:Name="ModsSummaryText" Text="0 enabled"
-                                   Foreground="{StaticResource Muted}" FontSize="12" Margin="0,0,0,13"/>
+                                   Foreground="{StaticResource Muted}" FontSize="13" Margin="0,0,0,13"/>
                         <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
                             <StackPanel x:Name="ModsPanel"/>
                         </ScrollViewer>

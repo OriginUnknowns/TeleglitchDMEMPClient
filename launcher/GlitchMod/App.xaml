@@ -3,24 +3,26 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
-        <SolidColorBrush x:Key="Ink" Color="#0A0D0E"/>
-        <SolidColorBrush x:Key="Panel" Color="#111617"/>
-        <SolidColorBrush x:Key="PanelRaised" Color="#171D1E"/>
-        <SolidColorBrush x:Key="Line" Color="#263032"/>
-        <SolidColorBrush x:Key="Paper" Color="#E8ECE7"/>
-        <SolidColorBrush x:Key="Muted" Color="#899493"/>
+        <SolidColorBrush x:Key="Ink" Color="#080B0C"/>
+        <SolidColorBrush x:Key="Panel" Color="#141A1C"/>
+        <SolidColorBrush x:Key="PanelRaised" Color="#1C2426"/>
+        <SolidColorBrush x:Key="Line" Color="#3A474A"/>
+        <SolidColorBrush x:Key="Paper" Color="#F4F7F2"/>
+        <SolidColorBrush x:Key="Muted" Color="#B6C0BE"/>
         <SolidColorBrush x:Key="Acid" Color="#DDFD51"/>
-        <SolidColorBrush x:Key="Danger" Color="#FF6B55"/>
+        <SolidColorBrush x:Key="Danger" Color="#FF806D"/>
 
         <Style TargetType="TextBlock">
             <Setter Property="FontFamily" Value="Segoe UI"/>
             <Setter Property="Foreground" Value="{StaticResource Paper}"/>
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display"/>
+            <Setter Property="TextOptions.TextRenderingMode" Value="ClearType"/>
         </Style>
 
         <Style x:Key="LabelCaps" TargetType="TextBlock">
             <Setter Property="FontFamily" Value="Consolas"/>
             <Setter Property="Foreground" Value="{StaticResource Muted}"/>
-            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="FontSize" Value="11"/>
             <Setter Property="FontWeight" Value="Bold"/>
         </Style>
 
@@ -50,7 +52,7 @@
                                 <Setter TargetName="Border" Property="Opacity" Value="0.72"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="Border" Property="Opacity" Value="0.35"/>
+                                <Setter TargetName="Border" Property="Opacity" Value="0.58"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
