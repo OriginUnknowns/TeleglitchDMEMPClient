@@ -54,6 +54,7 @@
     <Compile Include="MainWindow.xaml.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="LauncherDialogs.cs" />
     <Compile Include="LauncherCore.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

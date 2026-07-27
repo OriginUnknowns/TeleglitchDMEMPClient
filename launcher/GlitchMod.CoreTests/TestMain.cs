@@ -1,6 +1,7 @@
 using GlitchMod;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -20,7 +21,9 @@ namespace GlitchMod.CoreTests
                 string payload = Path.GetFullPath(args[0]);
                 string game = Path.GetFullPath(args[1]);
                 Environment.SetEnvironmentVariable("GLITCHMOD_PAYLOAD", payload);
-                var core = new LauncherCore();
+                Environment.SetEnvironmentVariable("GLITCHMOD_APPDATA", Path.Combine(game, "_test-appdata"));
+                var processStarts = new List<ProcessStartInfo>();
+                var core = new LauncherCore(info => processStarts.Add(info));
                 GameValidation validation = core.ValidateGame(game);
                 Check(validation.Found, "Disposable game copy was not detected.");
                 Check(validation.Supported, "Disposable game executable hash was not accepted.");
@@ -49,6 +52,25 @@ namespace GlitchMod.CoreTests
                     Multiplayer = true,
                     EnabledMods = new List<string> { "mp_client" }
                 };
+                var vanilla = new LaunchProfile
+                {
+                    Id = "vanilla",
+                    Name = "Vanilla",
+                    Description = "test",
+                    Multiplayer = false,
+                    EnabledMods = new List<string>()
+                };
+                var settings = new LauncherSettings
+                {
+                    GamePath = game,
+                    SelectedProfile = vanilla.Id,
+                    Profiles = new List<LaunchProfile> { multiplayer, vanilla }
+                };
+                core.SaveSettings(settings);
+                LauncherSettings reloaded = core.LoadSettings();
+                Check(reloaded.GamePath == game, "Saved game path did not reload.");
+                Check(reloaded.SelectedProfile == vanilla.Id, "Selected profile did not reload.");
+
                 core.InstallOrRepair(game, multiplayer, false);
 
                 string patchedInit = File.ReadAllText(initPath);
@@ -61,6 +83,28 @@ namespace GlitchMod.CoreTests
                 Check(File.ReadAllText(Path.Combine(game, "modloader", "enabled.txt")).Contains("mp_client"),
                     "Multiplayer profile did not enable mp_client.");
                 Check(core.CheckRelayAsync(10000).GetAwaiter().GetResult(), "Manager relay health check failed.");
+
+                core.ApplyProfile(game, vanilla);
+                Check(!File.ReadAllText(Path.Combine(game, "modloader", "enabled.txt")).Contains("mp_client"),
+                    "Vanilla profile did not disable mp_client.");
+                core.ApplyProfile(game, multiplayer);
+                Check(File.ReadAllText(Path.Combine(game, "modloader", "enabled.txt")).Contains("mp_client"),
+                    "Multiplayer profile did not restore mp_client.");
+
+                core.Launch(game, vanilla);
+                Check(processStarts.Count == 1, "Launch did not invoke the process starter exactly once.");
+                Check(processStarts[0].FileName == Path.Combine(game, "Teleglitch.exe"),
+                    "Launch targeted the wrong executable.");
+                Check(processStarts[0].WorkingDirectory == game, "Launch used the wrong working directory.");
+                Check(processStarts[0].UseShellExecute, "Launch did not request shell execution.");
+                Check(!File.ReadAllText(Path.Combine(game, "modloader", "enabled.txt")).Contains("mp_client"),
+                    "Vanilla launch did not apply the vanilla profile.");
+
+                core.OpenGameFolder(game);
+                Check(processStarts.Count == 2, "Open game folder did not invoke the process starter.");
+                Check(string.Equals(processStarts[1].FileName, "explorer.exe", StringComparison.OrdinalIgnoreCase),
+                    "Open game folder did not target Explorer.");
+                Check(processStarts[1].Arguments.Contains(game), "Open game folder used the wrong path.");
 
                 string importedZip = Path.Combine(game, "glitchmod-test-mod.zip");
                 using (ZipArchive archive = ZipFile.Open(importedZip, ZipArchiveMode.Create))

@@ -1,7 +1,5 @@
-using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Windows;
@@ -15,6 +13,7 @@ namespace GlitchMod
     public partial class MainWindow : Window
     {
         private readonly LauncherCore core;
+        private readonly ILauncherDialogs dialogs;
         private LauncherSettings settings;
         private LaunchProfile selectedProfile;
         private List<ModInfo> installedMods = new List<ModInfo>();
@@ -26,17 +25,29 @@ namespace GlitchMod
         private Brush Panel { get { return (Brush)FindResource("Panel"); } }
         private Brush Danger { get { return (Brush)FindResource("Danger"); } }
 
-        public MainWindow()
+        public MainWindow() : this(new LauncherCore(), new SystemLauncherDialogs())
+        {
+        }
+
+        public MainWindow(LauncherCore launcherCore) : this(launcherCore, new SystemLauncherDialogs())
+        {
+        }
+
+        public MainWindow(LauncherCore launcherCore, ILauncherDialogs launcherDialogs)
         {
             InitializeComponent();
             try
             {
-                core = new LauncherCore();
+                if (launcherCore == null) throw new ArgumentNullException("launcherCore");
+                if (launcherDialogs == null) throw new ArgumentNullException("launcherDialogs");
+                core = launcherCore;
+                dialogs = launcherDialogs;
                 settings = core.LoadSettings();
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "GlitchMod could not start", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (launcherDialogs != null)
+                    launcherDialogs.ShowError(ex.Message, "GlitchMod could not start");
                 Close();
                 return;
             }
@@ -293,23 +304,18 @@ namespace GlitchMod
 
         private void BrowseGame_Click(object sender, RoutedEventArgs e)
         {
-            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
+            string selectedPath = dialogs.ChooseGameFolder(settings.GamePath);
+            if (string.IsNullOrWhiteSpace(selectedPath)) return;
+            if (!core.LooksLikeGame(selectedPath))
             {
-                dialog.Description = "Choose the Teleglitch: Die More Edition folder";
-                dialog.ShowNewFolderButton = false;
-                if (!string.IsNullOrWhiteSpace(settings.GamePath)) dialog.SelectedPath = settings.GamePath;
-                if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
-                if (!core.LooksLikeGame(dialog.SelectedPath))
-                {
-                    MessageBox.Show("That folder does not contain a complete Teleglitch DME installation.",
-                        "Not a Teleglitch folder", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                settings.GamePath = dialog.SelectedPath;
-                core.SaveSettings(settings);
-                RefreshAll();
-                SetStatus("GAME PATH UPDATED");
+                dialogs.ShowWarning("That folder does not contain a complete Teleglitch DME installation.",
+                    "Not a Teleglitch folder");
+                return;
             }
+            settings.GamePath = selectedPath;
+            core.SaveSettings(settings);
+            RefreshAll();
+            SetStatus("GAME PATH UPDATED");
         }
 
         private void InstallRepair_Click(object sender, RoutedEventArgs e)
@@ -320,10 +326,7 @@ namespace GlitchMod
                 bool allowUnsupported = false;
                 if (!validation.Supported)
                 {
-                    MessageBoxResult result = MessageBox.Show(
-                        validation.Message + "\n\nThe native bridge is address-specific. Continue only if this is the Steam DME build you expect.",
-                        "Unrecognized game build", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-                    if (result != MessageBoxResult.Yes) return;
+                    if (!dialogs.ConfirmUnsupportedBuild(validation.Message)) return;
                     allowUnsupported = true;
                 }
                 core.InstallOrRepair(settings.GamePath, selectedProfile, allowUnsupported);
@@ -354,9 +357,7 @@ namespace GlitchMod
 
         private void RemoveLoader_Click(object sender, RoutedEventArgs e)
         {
-            if (MessageBox.Show(
-                "Remove the GlitchMod loader and restore any files it backed up?\n\nImported mod folders will be kept.",
-                "Remove loader", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+            if (!dialogs.ConfirmRemoveLoader()) return;
             RunUiAction("REMOVING LOADER", () =>
             {
                 core.RemoveLoader(settings.GamePath);
@@ -367,16 +368,11 @@ namespace GlitchMod
 
         private void ImportMod_Click(object sender, RoutedEventArgs e)
         {
-            var dialog = new OpenFileDialog
-            {
-                Title = "Import a Teleglitch mod ZIP",
-                Filter = "ZIP archives (*.zip)|*.zip",
-                CheckFileExists = true
-            };
-            if (dialog.ShowDialog(this) != true) return;
+            string zipPath = dialogs.ChooseModZip(this);
+            if (string.IsNullOrWhiteSpace(zipPath)) return;
             RunUiAction("IMPORTING MOD", () =>
             {
-                ModInfo imported = core.ImportModZip(settings.GamePath, dialog.FileName);
+                ModInfo imported = core.ImportModZip(settings.GamePath, zipPath);
                 RefreshAll();
                 if (imported != null)
                 {
@@ -392,12 +388,7 @@ namespace GlitchMod
         private void OpenGameFolder_Click(object sender, RoutedEventArgs e)
         {
             if (string.IsNullOrWhiteSpace(settings.GamePath) || !Directory.Exists(settings.GamePath)) return;
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "explorer.exe",
-                Arguments = "\"" + settings.GamePath + "\"",
-                UseShellExecute = true
-            });
+            RunUiAction("OPENING GAME FOLDER", () => core.OpenGameFolder(settings.GamePath));
         }
 
         private void RunUiAction(string runningStatus, Action action)
@@ -410,7 +401,7 @@ namespace GlitchMod
             catch (Exception ex)
             {
                 SetStatus("ERROR");
-                MessageBox.Show(ex.Message, "GlitchMod", MessageBoxButton.OK, MessageBoxImage.Error);
+                dialogs.ShowError(ex.Message, "GlitchMod");
             }
         }
 

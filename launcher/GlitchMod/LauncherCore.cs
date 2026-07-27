@@ -77,17 +77,26 @@ namespace GlitchMod
         private readonly JavaScriptSerializer json = new JavaScriptSerializer();
         private readonly string appDataDir;
         private readonly string settingsPath;
+        private readonly Action<ProcessStartInfo> processStarter;
 
         public string BaseDirectory { get; private set; }
         public string PayloadDirectory { get; private set; }
         public PayloadInfo Payload { get; private set; }
 
-        public LauncherCore()
+        public LauncherCore() : this(null)
         {
+        }
+
+        public LauncherCore(Action<ProcessStartInfo> processStarter)
+        {
+            this.processStarter = processStarter ?? (info => { Process.Start(info); });
             BaseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-            appDataDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "GlitchMod");
+            string appDataOverride = Environment.GetEnvironmentVariable("GLITCHMOD_APPDATA");
+            appDataDir = !string.IsNullOrWhiteSpace(appDataOverride)
+                ? Path.GetFullPath(appDataOverride)
+                : Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "GlitchMod");
             settingsPath = Path.Combine(appDataDir, "settings.json");
             Directory.CreateDirectory(appDataDir);
 
@@ -371,13 +380,35 @@ namespace GlitchMod
 
         public void Launch(string gamePath, LaunchProfile profile)
         {
+            processStarter(PrepareLaunch(gamePath, profile));
+        }
+
+        public ProcessStartInfo PrepareLaunch(string gamePath, LaunchProfile profile)
+        {
             ApplyProfile(gamePath, profile);
-            Process.Start(new ProcessStartInfo
+            return new ProcessStartInfo
             {
                 FileName = Path.Combine(gamePath, "Teleglitch.exe"),
                 WorkingDirectory = gamePath,
                 UseShellExecute = true
-            });
+            };
+        }
+
+        public void OpenGameFolder(string gamePath)
+        {
+            processStarter(PrepareOpenGameFolder(gamePath));
+        }
+
+        public ProcessStartInfo PrepareOpenGameFolder(string gamePath)
+        {
+            if (string.IsNullOrWhiteSpace(gamePath) || !Directory.Exists(gamePath))
+                throw new InvalidOperationException("Select a valid Teleglitch installation first.");
+            return new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = "\"" + Path.GetFullPath(gamePath) + "\"",
+                UseShellExecute = true
+            };
         }
 
         public ModInfo ImportModZip(string gamePath, string zipPath)
