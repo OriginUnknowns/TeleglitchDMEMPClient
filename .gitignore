@@ -9,3 +9,8 @@ cdb_*.err
 # build outputs
 modloader/dllhost/version.dll
 modloader/dllhost/libversion.a
+launcher/GlitchMod/bin/
+launcher/GlitchMod/obj/
+launcher/GlitchMod.CoreTests/bin/
+launcher/GlitchMod.CoreTests/obj/
+dist/

@@ -9,8 +9,17 @@
 
 $ErrorActionPreference = "Stop"
 
-$cxx = "C:\Users\Toni\AppData\Local\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\llvm-mingw-20260519-ucrt-x86_64\bin\i686-w64-mingw32-g++.exe"
-if (-not (Test-Path $cxx)) {
+$compiler = Get-Command "i686-w64-mingw32-g++.exe" -ErrorAction SilentlyContinue
+if ($compiler) {
+    $cxx = $compiler.Source
+} else {
+    $wingetRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+    $cxx = Get-ChildItem -Path $wingetRoot -Filter "i686-w64-mingw32-g++.exe" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -like "*MartinStorsjo.LLVM-MinGW.UCRT*" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $cxx -or -not (Test-Path $cxx)) {
     Write-Error "i686 g++ not found. Install with: winget install --id MartinStorsjo.LLVM-MinGW.UCRT"
 }
 
