@@ -13,4 +13,6 @@ launcher/GlitchMod/bin/
 launcher/GlitchMod/obj/
 launcher/GlitchMod.CoreTests/bin/
 launcher/GlitchMod.CoreTests/obj/
+launcher/GlitchMod.UiTests/bin/
+launcher/GlitchMod.UiTests/obj/
 dist/
