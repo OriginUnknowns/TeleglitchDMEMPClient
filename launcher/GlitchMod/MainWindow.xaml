@@ -4,7 +4,8 @@
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="GlitchMod" Width="1160" Height="720" MinWidth="980" MinHeight="620"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
-        Background="{StaticResource Ink}" ResizeMode="CanResize">
+        Background="{StaticResource Ink}" Foreground="{StaticResource Paper}"
+        ResizeMode="CanResize">
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="6" CornerRadius="0"/>
     </shell:WindowChrome.WindowChrome>
