@@ -2797,6 +2797,19 @@ static int l_pin_hp(lua_State* L) {
     return 1;
 }
 
+// revive_player(ptr) — restore a previously death-pinned player: full HP and
+// clear the death-timer sentinel (+0xCC) that pin_hp parked. The Lua side also
+// drops invuln / fire / render gates and restores a dynamic body + camera.
+static int l_revive_player(lua_State* L) {
+    void* e = resolve_entity(L, 1);
+    if (!e || IsBadWritePtr(e, DEATH_TIMER_OFF + 4)) { api.pushboolean(L, 0); return 1; }
+    *(float*)((char*)e + HP_OFF) = 100.0f;          // full HP
+    *(int*)((char*)e + DEATH_TIMER_OFF) = 0;        // clear the pinned death countdown
+    host_log("revive_player: e=%p hp=100 deathtimer=0", e);
+    api.pushboolean(L, 1);
+    return 1;
+}
+
 // read_hp(ptr) — return *(float*)(ptr+0xBC) as a Lua number. Used by the
 // death intercept to poll the LOCAL player's HP from a cached pointer
 // without going through any engine state (DAT_005747a4 / GetPlayer) that
@@ -3981,6 +3994,8 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "pin_hp");
     api.pushcclosure(L, l_read_hp, 0);
     api.setfield(L, -2, "read_hp");
+    api.pushcclosure(L, l_revive_player, 0);
+    api.setfield(L, -2, "revive_player");
     api.pushcclosure(L, l_set_local_player, 0);
     api.setfield(L, -2, "set_local_player");
     api.pushcclosure(L, l_get_local_player, 0);

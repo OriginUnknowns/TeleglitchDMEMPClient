@@ -377,6 +377,7 @@ end
 if type(GenerateLevel) == "function" then
     local orig_GenerateLevel = GenerateLevel
     GenerateLevel = function(ldata)
+        mp.in_levelgen = true   -- gates loot-pop detection: no Wait() coroutines mid-gen
         if mp.session_seed then
             math.randomseed(mp.session_seed)
             logf("GenerateLevel: re-seeded to %s", tostring(mp.session_seed))
@@ -395,6 +396,35 @@ if type(GenerateLevel) == "function" then
         math.random = orig_random
         logf("GenerateLevel: math.random called %d times; first5=[%s]",
             count, table.concat(first_vals, ","))
+        -- WORLD CHECKSUM: hash every object's position so host/joiner can be
+        -- compared line-for-line in the log. Identical seeds + identical RNG
+        -- consumption must yield an identical checksum; any mismatch means the
+        -- worlds diverged even though the counts matched. Also probe the
+        -- post-gen RNG state (consumed identically on both sides, so it stays
+        -- in sync and directly compares the generator state).
+        -- The probe MUST be unconditional (not inside a fallible path): it
+        -- consumes one stream value, so it has to run on both clients or the
+        -- streams desync right here.
+        local rngprobe = math.random(1000000)
+        local n, hash = 0, 0
+        pcall(function()
+            local objs = GetObjectsInCircle(0, 0, 100000)
+            if type(objs) == "table" then
+                for _, o in ipairs(objs) do
+                    if type(o) == "table" then
+                        local ox, oy
+                        pcall(function() ox, oy = o:GetPosition() end)
+                        if ox and oy then
+                            n = n + 1
+                            hash = (hash + math.floor(ox * 10 + 0.5) * 31
+                                         + math.floor(oy * 10 + 0.5) * 7) % 1000000007
+                        end
+                    end
+                end
+            end
+        end)
+        logf("WORLD CHECKSUM: objects=%d poshash=%d rngprobe=%d", n, hash, rngprobe)
+        mp.in_levelgen = false
         return result
     end
     logf("wrapped GenerateLevel for deterministic level gen")
@@ -639,31 +669,73 @@ local function track_item_host(obj, type_name, x, y)
     -- If this spawn happened after the initial snapshot was sent, broadcast it so
     -- joiners can spawn the same item locally.
     if mp.item_snapshot_sent and mp.sock then
-        send_msg({ type = "item_spawned",
-                   item = { id = id, type = type_name,
-                            x = mp.items[id].x, y = mp.items[id].y } })
-        logf("broadcast item_spawned id=%d type=%s", id, type_name)
-        -- Loot ejection: if this new item appeared right next to a tracked
-        -- container that holds this type, treat it as a loot pop. Decrement
-        -- the container's shadow + broadcast so joiners stay in sync.
+        -- Is this a container loot pop? (spawned next to a tracked container
+        -- that holds this type)
+        local near_cid = nil
         local CONTAINER_LOOT_R2 = 4.0   -- ~2u radius; containers are 5-7u wide
         for cid, c in pairs(mp.containers or {}) do
             if c.items and #c.items > 0 then
                 local dx, dy = (c.x or 0) - mp.items[id].x, (c.y or 0) - mp.items[id].y
                 if dx*dx + dy*dy <= CONTAINER_LOOT_R2 then
-                    for i, it in ipairs(c.items) do
-                        if it == type_name then
-                            table.remove(c.items, i)
-                            logf("CONTAINER LOOT id=%d ejected %s (n=%d remain)",
-                                cid, type_name, #c.items)
-                            send_msg({ type = "container_item_taken",
-                                       container_id = cid, item_type = type_name })
-                            break
-                        end
+                    for _, it in ipairs(c.items) do
+                        if it == type_name then near_cid = cid; break end
                     end
                     break
                 end
             end
+        end
+        if not near_cid or mp.in_levelgen or mp.reloading then
+            send_msg({ type = "item_spawned",
+                       item = { id = id, type = type_name,
+                                x = mp.items[id].x, y = mp.items[id].y } })
+            logf("broadcast item_spawned id=%d type=%s", id, type_name)
+        else
+            -- DEFERRED VERIFY: a full-inventory take gets REVERTED by the
+            -- engine (item back in the box, transient entity deleted).
+            -- Broadcasting at spawn time desynced peers (they saw a ground
+            -- item + box decrement that never happened locally). Wait a beat
+            -- and check what actually happened before telling anyone.
+            -- NOTE: snapshot_inventory/entity_alive are defined LATER in this
+            -- file — reach them via mp.* (set right after their definitions).
+            local sx, sy = mp.items[id].x, mp.items[id].y
+            local inv0 = (mp.snapshot_inventory and mp.snapshot_inventory() or {})[type_name] or 0
+            local co = coroutine.create(function()
+                pcall(function()
+                    Wait(0.3)
+                    if mp.force_alive_rescan then mp.force_alive_rescan() end
+                    local c = mp.containers and mp.containers[near_cid]
+                    local function shadow_remove()
+                        if not c then return end
+                        for i, it in ipairs(c.items or {}) do
+                            if it == type_name then table.remove(c.items, i); break end
+                        end
+                    end
+                    if mp.entity_alive and mp.entity_alive(obj) then
+                        -- Real pop: item is sitting on the ground.
+                        shadow_remove()
+                        send_msg({ type = "item_spawned",
+                                   item = { id = id, type = type_name, x = sx, y = sy } })
+                        send_msg({ type = "container_item_taken",
+                                   container_id = near_cid, item_type = type_name })
+                        logf("CONTAINER LOOT id=%d ejected %s (verified on ground)", near_cid, type_name)
+                    elseif ((mp.snapshot_inventory and mp.snapshot_inventory() or {})[type_name] or 0) > inv0 then
+                        -- Instant pickup: item went straight into our inventory.
+                        shadow_remove()
+                        send_msg({ type = "container_item_taken",
+                                   container_id = near_cid, item_type = type_name })
+                        mp.items[id] = nil
+                        mp.item_obj_to_id[obj] = nil
+                        logf("CONTAINER LOOT id=%d took %s (verified into inventory)", near_cid, type_name)
+                    else
+                        -- Take failed (inventory full): the engine reverted the
+                        -- item into the box. No broadcast; drop our tracking.
+                        mp.items[id] = nil
+                        mp.item_obj_to_id[obj] = nil
+                        logf("CONTAINER LOOT id=%d %s REVERTED (take failed — inventory full?)", near_cid, type_name)
+                    end
+                end)
+            end)
+            coroutine.resume(co)
         end
     end
 end
@@ -914,7 +986,8 @@ local giveitem_hook_installed = false
 local PICKUP_MATCH_RADIUS_SQ = 25  -- 5u — generous; multi-pickup can be sloppy
 local last_inv_counts = nil
 
-local function snapshot_inventory()
+local snapshot_inventory   -- forward name for the mp.* export below
+function snapshot_inventory()
     local pl = player.GetPlayer()
     if not pl or type(pl.GetInventory) ~= "function" then return nil end
     local inv
@@ -936,6 +1009,9 @@ local function snapshot_inventory()
     end
     return counts
 end
+-- Exposed via mp for code defined EARLIER in the file (track_item_host's
+-- deferred container-loot verify).
+mp.snapshot_inventory = snapshot_inventory
 
 local function broadcast_pickup_of_type(type_name, px, py)
     local best_id, best_d2 = nil, math.huge
@@ -1376,36 +1452,64 @@ do
                         pcall(function()
                             if obj.GetPosition then wx, wy = obj:GetPosition() end
                         end)
+                        local near_cid = nil
                         for cid, c in pairs(mp.containers or {}) do
                             if c.items and #c.items > 0 then
                                 local dx, dy = (c.x or 0) - (wx or 0), (c.y or 0) - (wy or 0)
                                 if dx*dx + dy*dy <= CONTAINER_LOOT_R2 then
-                                    for i, it in ipairs(c.items) do
-                                        if it == nimi then
-                                            table.remove(c.items, i)
-                                            logf("CONTAINER LOOT (joiner) id=%d ejected %s (n=%d remain)",
-                                                cid, nimi, #c.items)
-                                            -- Session-monotonic counter so each ejection gets a
-                                            -- globally-unique id. Using container index (i)
-                                            -- collided after table.remove shifts everything down.
-                                            mp.peer_loot_seq = (mp.peer_loot_seq or 0) + 1
-                                            local peer_iid = "p" .. tostring(mp.my_id or "?") .. "_c" .. tostring(cid) .. "_" .. tostring(mp.peer_loot_seq)
-                                            -- Add to local mp.items so the joiner's own pickup
-                                            -- detector (ammo diff / inventory diff) can find the
-                                            -- item by id and broadcast item_picked when grabbed.
-                                            mp.items[peer_iid] = { obj = obj, type = nimi, x = wx or 0, y = wy or 0 }
-                                            mp.item_obj_to_id[obj] = peer_iid
-                                            send_msg({ type = "item_spawned",
-                                                       item = { id = peer_iid, type = nimi,
-                                                                x = wx or 0, y = wy or 0 } })
-                                            send_msg({ type = "container_item_taken",
-                                                       container_id = cid, item_type = nimi })
-                                            break
-                                        end
+                                    for _, it in ipairs(c.items) do
+                                        if it == nimi then near_cid = cid; break end
                                     end
                                     break
                                 end
                             end
+                        end
+                        if near_cid and not mp.in_levelgen and not mp.reloading then
+                            -- DEFERRED VERIFY (same as host path): a
+                            -- full-inventory take gets REVERTED by the engine;
+                            -- broadcasting at spawn time desynced peers.
+                            -- (Gated out of level generation/reload — starting
+                            -- Wait() coroutines mid-gen registers nodes on a
+                            -- level object that gen retries free.)
+                            local inv0 = (mp.snapshot_inventory and mp.snapshot_inventory() or {})[nimi] or 0
+                            local co = coroutine.create(function()
+                                pcall(function()
+                                    Wait(0.3)
+                                    if mp.force_alive_rescan then mp.force_alive_rescan() end
+                                    local c = mp.containers and mp.containers[near_cid]
+                                    local function shadow_remove()
+                                        if not c then return end
+                                        for i, it in ipairs(c.items or {}) do
+                                            if it == nimi then table.remove(c.items, i); break end
+                                        end
+                                    end
+                                    if mp.entity_alive and mp.entity_alive(obj) then
+                                        shadow_remove()
+                                        -- Session-monotonic counter so each ejection
+                                        -- gets a globally-unique id.
+                                        mp.peer_loot_seq = (mp.peer_loot_seq or 0) + 1
+                                        local peer_iid = "p" .. tostring(mp.my_id or "?") .. "_c" .. tostring(near_cid) .. "_" .. tostring(mp.peer_loot_seq)
+                                        -- Track locally so our own pickup detector can
+                                        -- broadcast item_picked when grabbed later.
+                                        mp.items[peer_iid] = { obj = obj, type = nimi, x = wx or 0, y = wy or 0 }
+                                        mp.item_obj_to_id[obj] = peer_iid
+                                        send_msg({ type = "item_spawned",
+                                                   item = { id = peer_iid, type = nimi,
+                                                            x = wx or 0, y = wy or 0 } })
+                                        send_msg({ type = "container_item_taken",
+                                                   container_id = near_cid, item_type = nimi })
+                                        logf("CONTAINER LOOT (joiner) id=%d ejected %s (verified on ground)", near_cid, nimi)
+                                    elseif ((mp.snapshot_inventory and mp.snapshot_inventory() or {})[nimi] or 0) > inv0 then
+                                        shadow_remove()
+                                        send_msg({ type = "container_item_taken",
+                                                   container_id = near_cid, item_type = nimi })
+                                        logf("CONTAINER LOOT (joiner) id=%d took %s (verified into inventory)", near_cid, nimi)
+                                    else
+                                        logf("CONTAINER LOOT (joiner) id=%d %s REVERTED (take failed — inventory full?)", near_cid, nimi)
+                                    end
+                                end)
+                            end)
+                            coroutine.resume(co)
                         end
                     end
                 end
@@ -1442,6 +1546,9 @@ local function refresh_objective_string()
     local line
     if mp.is_dead then
         line = string.format("*** YOU ARE DEAD ***  spectating — revive at next level exit")
+    elseif mp.at_exit_dir then
+        line = string.format(">> AT EXIT <<  waiting for team  (%s/%s ready)",
+            tostring(mp.exit_waiting or "?"), tostring(mp.exit_living or "?"))
     elseif nearest and nearest_dist <= PROXIMITY_RANGE then
         line = string.format(">> %s <<  %s   HP:%d   dist:%.1f",
             role, nearest.name, nearest.hp or 0, nearest_dist)
@@ -1528,6 +1635,7 @@ end
 
 local function tick_death_intercept()
     if not mp.in_game then return end
+    if mp.reloading then return end   -- level reload in progress; stale entity refs
     if not (_G.MP_NATIVE and _G.MP_NATIVE.pin_hp) then return end
     -- Local player ptr was captured in begin_game; this is just a fallback.
     if not mp.local_player_obj then
@@ -1830,6 +1938,10 @@ local function entity_alive(obj)
     refresh_alive_cache()
     return alive_ptr_cache[tostring(obj.pointer)] == true
 end
+-- Exposed via mp for code defined EARLIER in the file (track_item_host's
+-- deferred container-loot verify) — locals aren't in scope upward.
+mp.entity_alive = entity_alive
+mp.force_alive_rescan = function() alive_ptr_cache_at = 0 end
 
 -- Liveness-gated Delete. The engine recycles freed C++ pointers and, when a
 -- binding (Delete/SetPosition/GetHealth/…) is called on freed memory, aborts
@@ -2382,23 +2494,23 @@ local function handle_mob_snapshot(msg)
             end
         else
             if entry.obj then
-                -- Verify puppet still exists in world before SetPosition.
-                -- SetPosition on a freed C entity calls abort() in native
-                -- code which pcall cannot catch — process-killing crash.
-                -- Grace period: trust newly-created puppets for first 1s
-                -- (engine scan may not include freshly Created objects).
-                local alive = true
+                -- Three states based on age + a fresh world scan:
+                --   grace (<1s): freshly Created; the engine scan may not list
+                --     it yet, so we can't tell alive from freed. DON'T touch it
+                --     (SetPosition on a freed entity abort()s natively, and Lua
+                --     calling a method on a destroyed C++ object hits a purecall
+                --     stub — verified lua52.dll+0xda1f in luaD_precall; this was
+                --     the delayed joiner crash during the mob create/drop churn,
+                --     when every puppet was perpetually <1s old). Leave it frozen
+                --     at spawn — invisible for a fraction of a second.
+                --   alive: reposition normally.
+                --   confirmed gone (>1s AND not in scan): drop it.
                 local age = socket.gettime() - (entry.created_at or 0)
-                if age > 1.0 then
-                    refresh_alive_cache()
-                    alive = entry.obj.pointer and alive_ptr_cache[tostring(entry.obj.pointer)] == true
-                end
-                if alive then
-                    -- BISECT (2026-05-29): puppet repositioning temporarily
-                    -- disabled to test whether SetPosition/SetAngle on a
-                    -- stale/freed entity is the joiner heap corruptor. Puppets
-                    -- freeze where spawned. If the joiner stops crashing, this
-                    -- path is the culprit. Re-enable after confirming.
+                if age <= 1.0 then
+                    -- grace: no method calls on the puppet at all.
+                elseif entry.obj.pointer
+                       and (refresh_alive_cache() or true)
+                       and alive_ptr_cache[tostring(entry.obj.pointer)] == true then
                     if _G.MP_BISECT_PUPPET_MOVE ~= false then
                         pcall(function() entry.obj:SetPosition(m.x, m.y) end)
                         if m.a then pcall(function() entry.obj:SetAngle(m.a) end) end
@@ -2409,7 +2521,17 @@ local function handle_mob_snapshot(msg)
                     if m.h and not entry.h_baseline then entry.h_baseline = 999999 end
                     entry.mh = m.mh or entry.mh
                 else
-                    logf("MOB PUPPET id=%d type=%s gone from world — dropping", m.id, tostring(entry.type))
+                    -- Diagnostic detail: puppet's host-side pos vs our player
+                    -- pos — distinguishes "outside scan radius" from "engine
+                    -- really deleted it" for the residual id 1-5 churn.
+                    local px, py = 0, 0
+                    pcall(function()
+                        local pl = player.GetPlayer()
+                        if pl then px, py = pl:GetPosition() end
+                    end)
+                    logf("MOB PUPPET id=%d type=%s gone from world — dropping (mob=%.1f,%.1f me=%.1f,%.1f d=%.0f age=%.1f)",
+                        m.id, tostring(entry.type), m.x or 0, m.y or 0, px, py,
+                        math.sqrt((m.x - px)^2 + (m.y - py)^2), age)
                     mp.mob_puppets[m.id] = nil
                 end
             end
@@ -3223,14 +3345,46 @@ end
 -- Called by the native wglSwapBuffers hook every frame, inside the render pass.
 -- Coord space is the fixed 320x240 ortho set by the hook.
 function _G.MP_RENDER()
-    if not (DrawText and go_screen.active) then return end
-    for _, ln in ipairs(go_screen.lines) do
-        if SetColor then
-            local c = ln.c
-            if c then SetColor(c[1], c[2], c[3], 1) else SetColor(1, 1, 1, 1) end
+    -- ============ LEVEL RELOAD DISPATCH (swap slot) ============
+    -- This is the one reliable per-frame slot that runs in-game on the main
+    -- thread OUTSIDE the coroutinemanager wait-walk. Gate: our net coroutine
+    -- must be "suspended" (sitting in a Wait), which proves its resume — and
+    -- therefore the wait-walk — is NOT on the C stack beneath this swap. If
+    -- the swap ever fires from inside a coroutine's own render call, status
+    -- reads "normal" and we simply wait for the next clean frame.
+    if mp.pending_reload and mp.do_level_reload and not mp._reload_running then
+        local st = "no-coro"
+        if mp.net_co then st = coroutine.status(mp.net_co) end
+        mp._reload_wait_frames = (mp._reload_wait_frames or 0) + 1
+        if st == "suspended" or st == "dead" or st == "no-coro" then
+            logf("RELOAD DISPATCH: swap slot clean (net_co=%s) after %d frame(s)",
+                st, mp._reload_wait_frames)
+            mp._reload_wait_frames = nil
+            mp._reload_running = true
+            local pr = mp.pending_reload
+            mp.pending_reload = nil
+            local ok, err = pcall(mp.do_level_reload, pr)
+            if not ok then logf("RELOAD DISPATCH: do_level_reload error: %s", tostring(err)) end
+            mp._reload_running = false
+        elseif mp._reload_wait_frames <= 5 or (mp._reload_wait_frames % 60) == 0 then
+            logf("RELOAD DISPATCH: swap slot busy (net_co=%s), frame %d — waiting",
+                st, mp._reload_wait_frames)
         end
-        DrawText(ln.x, ln.y, ln.text)
     end
+    if not DrawText then return end
+    local function draw(lines)
+        for _, ln in ipairs(lines) do
+            if SetColor then
+                local c = ln.c
+                if c then SetColor(c[1], c[2], c[3], 1) else SetColor(1, 1, 1, 1) end
+            end
+            DrawText(ln.x, ln.y, ln.text)
+        end
+    end
+    if go_screen.active and go_screen.lines then draw(go_screen.lines) end
+    -- Dev menu shares this clean screen-space path (no black backdrop — it
+    -- overlays live gameplay; only the game-over screen sets the backdrop).
+    if dev_menu and dev_menu.visible and dev_menu.render_lines then draw(dev_menu.render_lines) end
     if SetColor then SetColor(1, 1, 1, 1) end   -- restore default white
 end
 
@@ -3326,6 +3480,150 @@ local function handle_death_chest(m)
     pcall(function() spawn_death_chest(m.x, m.y, m.items or {}, m.owner) end)
 end
 
+-- ===================== LEVEL FLOW + REVIVES =====================
+-- Bring a death-pinned local player back to life: full HP, empty-handed (their
+-- gear already dropped as a death chest). Called when the team advances a level.
+local function revive_local_player()
+    local pl = player.GetPlayer()
+    local ptr = mp.local_player_ptr or (pl and pl.pointer)
+    mp.is_dead = false
+    mp.death_announced_at = nil
+    mp.local_parked_off_map = false
+    mp.spectate_target_ptr = nil
+    if ptr and _G.MP_NATIVE then
+        local N = _G.MP_NATIVE
+        if N.revive_player    then pcall(function() N.revive_player(ptr) end) end       -- full HP + clear death timer
+        if N.set_invulnerable then pcall(function() N.set_invulnerable(ptr, false) end) end
+        if N.set_fire_gate    then pcall(function() N.set_fire_gate(ptr, 0) end) end
+        if N.set_render_gate  then pcall(function() N.set_render_gate(ptr, 0) end) end
+        if N.set_body_dynamic then pcall(function() N.set_body_dynamic(ptr) end) end
+        if N.set_main_player  then pcall(function() N.set_main_player(ptr) end) end      -- camera back to us
+    end
+    logf("REVIVE: local player back (full HP, empty-handed)")
+end
+
+-- Wrap level.Change to gate co-op level advance. When OUR player reaches an exit
+-- the engine calls level.Change(dir); we signal the relay (at_exit) and BLOCK the
+-- immediate change. The relay waits until every living player is at an exit, then
+-- broadcasts level_change → handle_level_change runs the real change for everyone.
+if type(level) == "table" and type(level.Change) == "function" and not mp._orig_level_change then
+    mp._orig_level_change = level.Change
+    level.Change = function(dir, ...)
+        if mp.in_game and mp.sock then
+            -- DEAD players do NOT gate and must NOT trigger a transition. The
+            -- old code fell through to _orig_level_change here (the REAL
+            -- single-player level change) — a spectating corpse that walked
+            -- its parked body onto a teleporter tile yanked itself (and its
+            -- save) to the next level out from under the team. Dead players
+            -- advance ONLY via the team's level_change broadcast. Swallow it.
+            if mp.is_dead then
+                logf("level.Change(%s) from DEAD player — ignored (advance via team gate)", tostring(dir))
+                return
+            end
+            if mp.at_exit_dir ~= dir then
+                mp.at_exit_dir = dir
+                pcall(function() send_msg({ type = "at_exit", dir = dir }) end)
+                logf("AT EXIT -> %s — waiting for team", tostring(dir))
+            end
+            return   -- block; the real change arrives via level_change
+        end
+        return mp._orig_level_change(dir, ...)
+    end
+    logf("wrapped level.Change for co-op level-advance gating")
+end
+
+-- Relay confirms every living player is at the exit — advance everyone.
+-- We do NOT use the engine's level.Change: that runs the single-player
+-- save/continue checkpoint and tears down the MP session. Instead we re-run
+-- begin_game's flow (a "rehost → rejoin"): StartFrom the fresh level (host owns
+-- the authoritative gen, joiners follow the same seed), recreate peers, re-send
+-- the host's item/container snapshots, and restore each survivor's inventory.
+-- Dead players revive (full HP, empty-handed — their gear is a chest behind us).
+--
+-- CRITICAL — the reload is TWO-PHASE (Ghidra-verified + crash-reproduced
+-- 2026-07-16, AV @ .text+0x1524a in the wait-list walk):
+--
+-- Every Wait-based coroutine (this net loop included) is resumed from INSIDE
+-- the level object's wait-list iteration (coroutinemanager.cpp: FUN_004151c0,
+-- called per-frame by TGameState::update -> FUN_00417720). level.StartFrom
+-- frees the level object INCLUDING that wait list mid-iteration, so calling it
+-- from ANY Wait-resumed coroutine is a guaranteed use-after-free — no amount
+-- of Wait(0) deferral changes the resume context.
+--
+-- Phase 1 (here, net_tick_loop, game state): snapshot inventory, stash the
+-- reload request, and switch the engine to the "newmenu" state via
+-- menu.SetState("newmenu", false) — byte-identical to the engine's own native
+-- ESC pause (TGameState::update calls FUN_0043dfe0("newmenu", 0)). The switch
+-- frees nothing; the current frame's walk completes on the still-live level,
+-- and from the next frame the walk simply doesn't run (TNewMenuState::update
+-- never touches the level).
+--
+-- Phase 2 (mp.do_level_reload, called from MP_FRAME_TICK): fires in menu
+-- states via the dllhost PeekMessageA fallback — outside any lua_resume, no
+-- coroutinemanager frames on the stack. Same proven-safe context begin_game's
+-- StartFrom has always used.
+local function do_level_change(m)
+    if not m or type(m.dir) ~= "string" then return end
+    if mp.reloading or mp.pending_reload then return end
+    mp.reloading = true   -- pause the other per-frame ticks while we tear down/rebuild
+    logf("LEVEL CHANGE -> %s seed=%s (pausing for menu-state reload; was_dead=%s)",
+        m.dir, tostring(m.seed), tostring(mp.is_dead))
+
+    -- Survivors keep their gear: snapshot it now, re-give after the new level
+    -- loads. The dead come back empty-handed (gear dropped as a chest behind us).
+    local keep_items = nil
+    if not mp.is_dead then
+        local counts = snapshot_inventory() or {}
+        keep_items = {}
+        for tn, cn in pairs(counts) do
+            for _ = 1, (tonumber(cn) or 0) do keep_items[#keep_items + 1] = tn end
+        end
+    end
+    if mp.is_dead then pcall(revive_local_player) end
+
+    mp.at_exit_dir = nil
+    mp.exit_waiting, mp.exit_living = nil, nil
+    pcall(function() go_screen.hide() end)
+    -- Close the dev menu across the transition — its overlay lines reference
+    -- pre-reload state, and leaving it open rendered it stuck/unusable.
+    if dev_menu then
+        dev_menu.visible = false
+        dev_menu.render_lines = nil
+    end
+
+    mp.pending_reload = { m = m, keep_items = keep_items }
+    logf("LEVEL CHANGE stashed — reload will run from the swap-hook slot (MP_RENDER)")
+    -- NOTE: no state switch. Menu states do NOT stop the game world (verified
+    -- 2026-07-16: wait-walk kept ticking behind the "newmenu" screen), so
+    -- "pausing" buys nothing. The reload instead dispatches from MP_RENDER —
+    -- the wglSwapBuffers hook slot: main thread, end-of-frame — gated on this
+    -- coroutine being suspended (i.e. the wait-walk provably NOT on the stack).
+end
+mp.do_level_change = do_level_change   -- MP_FRAME_TICK needs it for paused-arrival dispatch
+
+-- Handler: only QUEUE the advance — net_tick_loop (in game) or MP_FRAME_TICK
+-- (paused) performs it from a safe context. seq guards against a duplicated
+-- broadcast triggering a double reload.
+local function handle_level_change(m)
+    if not m or type(m.dir) ~= "string" then return end
+    if type(m.seq) == "number" then
+        if mp.last_level_change_seq and m.seq <= mp.last_level_change_seq then
+            logf("LEVEL CHANGE ignored (stale seq=%s <= %s)", tostring(m.seq), tostring(mp.last_level_change_seq))
+            return
+        end
+        mp.last_level_change_seq = m.seq
+    end
+    mp.pending_level_change = m
+    logf("LEVEL CHANGE queued -> %s seed=%s seq=%s", m.dir, tostring(m.seed), tostring(m.seq))
+end
+
+-- Relay progress while gating: how many living players are waiting at the exit.
+local function handle_exit_wait(m)
+    if not m then return end
+    mp.exit_waiting = tonumber(m.waiting)
+    mp.exit_living  = tonumber(m.living)
+end
+
 -- A victim reported that WE friendly-fired them. Credit our own stats: it
 -- counts as friendly fire AND toward total damage dealt. (Broadcast to the
 -- room; we only act on entries addressed to us.)
@@ -3405,6 +3703,8 @@ local handlers = {
     game_over    = handle_game_over,
     ff_hit       = handle_ff_hit,
     death_chest  = handle_death_chest,
+    level_change = handle_level_change,
+    exit_wait    = handle_exit_wait,
 }
 
 -- Build a mob snapshot from the host's tracked mobs. Filters out dead/invalid entries.
@@ -3694,6 +3994,13 @@ local function net_tick_loop()
         mp.handshake_queued = nil
     end
     while true do
+        -- Deferred co-op level advance: phase 1 (stash) runs HERE —
+        -- never from inside a message handler. See do_level_change.
+        if mp.pending_level_change then
+            local m = mp.pending_level_change
+            mp.pending_level_change = nil
+            pcall(do_level_change, m)
+        end
         -- Mob-class vtable takedmg hook DISABLED — signature mismatch on
         -- non-Soldat classes crashed the host on first bullet hit. Direct
         -- damage on host is parked (Task: joiner melee). The accumulator
@@ -3861,8 +4168,11 @@ local function start_net_coro()
         if not ok then logf("net coroutine crashed: %s", tostring(err)) end
         mp.coro_running = false
     end)
+    mp.net_co = co   -- MP_RENDER's reload gate checks this handle's status
     coroutine.resume(co)
 end
+
+-- (mp.do_level_reload is defined below, after start_joiner_cleanup_coro.)
 
 -- ============ JOINER: clear local mobs after level load ============
 local function clear_local_mobs()
@@ -3909,6 +4219,141 @@ local function start_joiner_cleanup_coro()
         if not ok then logf("joiner cleanup crashed: %s", tostring(err)) end
     end)
     coroutine.resume(co)
+end
+
+-- ============ LEVEL RELOAD, PHASE 2 ============
+-- Runs from MP_RENDER (the wglSwapBuffers hook slot): main thread,
+-- end-of-frame, gated on the net coroutine being suspended — so the
+-- coroutinemanager wait-walk is provably not on the stack. See
+-- do_level_change for why this must NOT run from a Wait-resumed coroutine.
+mp.do_level_reload = function(pr)
+    local m = (pr and pr.m) or nil
+    if not m or type(m.dir) ~= "string" then mp.reloading = false; return end
+    logf("LEVEL RELOAD -> %s seed=%s (swap-slot reload)", m.dir, tostring(m.seed))
+    if type(m.seed) == "number" then mp.session_seed = m.seed end
+
+    -- CRITICAL: unregister the OLD puppets from the native tick BEFORE the
+    -- engine frees them. The dllhost pokes registered puppet pointers every
+    -- frame (PT1); poking a freed TPlayer corrupts the debug heap → delayed
+    -- lua52 purecall crash (killed the joiner, 2026-07-16 15:36 run).
+    if _G.MP_NATIVE and _G.MP_NATIVE.unregister_puppet then
+        for _, entry in pairs(mp.puppets or {}) do
+            if type(entry) == "table" and entry.obj and entry.obj.pointer then
+                pcall(function() _G.MP_NATIVE.unregister_puppet(entry.obj.pointer) end)
+            end
+        end
+    end
+
+    -- Reset per-level state. level.Clear (invoked during StartFrom's level
+    -- generation) wipes the puppet/mob/item/container maps; the host re-sends
+    -- authoritative lists.
+    mp.item_snapshot_sent = false
+    mp.item_snapshot_received = false
+    mp.container_snapshot_sent = false
+    mp.local_player_obj, mp.local_player_ptr = nil, nil
+    mp.death_chest_dropped = false
+    mp.local_parked_off_map = false
+    mp.is_dead = false
+    mp.death_announced_at = nil
+
+    -- CRITICAL — must be false BEFORE StartFrom: the Create wrap stubs joiner
+    -- enemy spawns while cleanup_done is true. Stubbed Creates skip the
+    -- math.random calls the host's real Creates consume, so generation RNG
+    -- diverges (seen: 741 vs 1280 calls) → different mob/item placement →
+    -- every mob puppet fails the alive scan each second (create/drop churn =
+    -- the joiner hitch) and half the host's items fail position-adoption.
+    -- With false, the joiner spawns real local mobs identically (RNG parity);
+    -- start_joiner_cleanup_coro deletes them 1.5s later, same as begin_game.
+    mp.cleanup_done = false
+
+    math.randomseed(mp.session_seed)
+    if not pcall(function() level.StartFrom(m.dir, 0) end) then
+        logf("level_reload: StartFrom(%s) failed", m.dir)
+    end
+    -- No state switch needed — we never left game state (menu states don't
+    -- stop the world anyway). Keep mp_pause preselected for the ESC menu.
+    pcall(function() menu.SetPage("mp_pause") end)
+
+    -- Re-lock our local player pointer after the reload.
+    if _G.MP_NATIVE and _G.MP_NATIVE.set_local_player then
+        local pl = player.GetPlayer()
+        if pl and pl.pointer then
+            pcall(function() _G.MP_NATIVE.set_local_player(pl.pointer) end)
+            mp.local_player_obj, mp.local_player_ptr = pl, pl.pointer
+        end
+    end
+
+    -- Recreate puppets for the other players; state sync repositions them.
+    for _, p in ipairs(mp.room_players or {}) do
+        if p.id ~= mp.my_id then pcall(function() handle_join(p) end) end
+    end
+
+    -- Reset the inventory-diff baseline: the first pass of the new net loop
+    -- otherwise diffs the fresh spawn inventory against the PRE-reload counts
+    -- and broadcasts spurious drops/pickups (ghost weapons at (0,0)).
+    last_inv_counts = nil
+
+    -- Joiner: wipe the locally-generated mobs (host's are authoritative),
+    -- same as begin_game. Also re-arm the pickup scan delay.
+    start_joiner_cleanup_coro()
+    mp.pickup_scan_start_after = socket.gettime() + 2.5
+
+    -- Restart the dev-menu/chat/bullet-drain coroutine — its Wait(1/30) node
+    -- died with the old level's wait list, killing the dev menu, chat, AND
+    -- joiner bullet forwarding after a transition. Guaranteed dead at this
+    -- point (it can only be mid-execution during the game-update phase, never
+    -- at swap time), so an unconditional restart can't double it up.
+    if mp.start_dev_menu_coro then mp.start_dev_menu_coro() end
+
+    -- Host re-sends authoritative item/container snapshots for the new level.
+    -- These Wait()s register in the NEW level's wait list and tick normally.
+    if mp.is_host then
+        local co = coroutine.create(function()
+            pcall(function() Wait(1.5); host_send_item_list(); host_send_container_list() end)
+        end)
+        coroutine.resume(co)
+    end
+
+    -- Restore survivor inventory once the level settles. DEFICIT-ONLY:
+    -- StartFrom(dir, 0) runs generation with preservestatus_=false, so the
+    -- engine already granted the fresh starting loadout (pump/pystol/agl/…).
+    -- Re-giving the full keep_items list on top DOUBLED those items every
+    -- level (seen: aglx2, pystolx2, pumpx2). Only top up each type to the
+    -- pre-transition count.
+    local keep_items = pr.keep_items
+    if keep_items and #keep_items > 0 then
+        local co = coroutine.create(function()
+            pcall(function()
+                Wait(1.0)
+                local pl = player.GetPlayer()
+                if pl and pl.GiveItem then
+                    local have = snapshot_inventory() or {}
+                    local want = {}
+                    for _, t in ipairs(keep_items) do want[t] = (want[t] or 0) + 1 end
+                    local given = 0
+                    for t, n in pairs(want) do
+                        for _ = 1, math.max(0, n - (have[t] or 0)) do
+                            pcall(function() pl:GiveItem(t) end)
+                            given = given + 1
+                        end
+                    end
+                    logf("level_reload: restored %d items to survivor (deficit-only vs spawn loadout)", given)
+                end
+            end)
+        end)
+        coroutine.resume(co)
+    end
+
+    pcall(refresh_objective_string)
+    mp.reloading = false
+    -- The OLD net coroutine died with the old level (its pending wait node was
+    -- freed with the wait list, and the wrapper that clears coro_running never
+    -- ran) — force the flag so start_net_coro actually starts a fresh loop.
+    -- The new loop also drains mp.handshake_queued (messages that arrived via
+    -- drain_sock_sync while paused in a menu).
+    mp.coro_running = false
+    start_net_coro()
+    logf("LEVEL RELOAD done -> %s (net coroutine restarted)", m.dir)
 end
 
 -- ============ TEST ROOM ============
@@ -4027,6 +4472,71 @@ local function build_dev_categories()
             mp.death_announced_at = nil  -- frame_tick will pin + announce
             logf("dev: kill_self → mp.is_dead = true")
         end },
+        { label = "Teleport to level exit (teleporter)", run = function()
+            local pl = player.GetPlayer()
+            if not pl then logf("dev: no player"); return end
+            local px, py = pl:GetPosition()
+            local objs = GetObjectsInCircle(px, py, 1000000)   -- whole level
+            if type(objs) ~= "table" then logf("dev: no objects"); return end
+            local best_d2, bx, by, bname = math.huge, nil, nil, nil
+            local sx, sy, sn = 0, 0, 0   -- centroid of all geometry = level interior
+            for _, obj in ipairs(objs) do
+                if type(obj) == "table" and obj.GetName and obj.GetPosition then
+                    local ox, oy
+                    pcall(function() ox, oy = obj:GetPosition() end)
+                    if ox and oy then
+                        sx, sy, sn = sx + ox, sy + oy, sn + 1
+                        local nm = ""
+                        pcall(function() nm = obj:GetName() or "" end)
+                        local lnm = string.lower(nm)
+                        -- "EndMarker" is the engine's level-exit marker (next to
+                        -- the teleporter pad); levels can have several (branches).
+                        if string.find(lnm, "endmarker", 1, true) or string.find(lnm, "teleport", 1, true) then
+                            local dx, dy = ox - px, oy - py
+                            local d2 = dx * dx + dy * dy
+                            if d2 < best_d2 then best_d2, bx, by, bname = d2, ox, oy, nm end
+                        end
+                    end
+                end
+            end
+            if not bx then logf("dev: no teleporter found in level"); return end
+            -- Step ~2.5u OFF the pad toward the level interior (geometry centroid)
+            -- — that's the open corridor/room, not the wall behind the teleporter.
+            local nx, ny = bx, by
+            if sn > 0 then
+                local dx, dy = (sx / sn) - bx, (sy / sn) - by
+                local d = math.sqrt(dx * dx + dy * dy)
+                if d > 0.01 then nx, ny = bx + dx / d * 2.5, by + dy / d * 2.5 end
+            end
+            pcall(function() pl:SetPosition(nx, ny) end)
+            logf("dev: teleport near '%s' exit @(%.1f,%.1f) -> placed @(%.1f,%.1f)", bname, bx, by, nx, ny)
+        end },
+        { label = "Dump object names (find exit)", run = function()
+            local pl = player.GetPlayer()
+            if not pl then logf("dev: no player"); return end
+            local px, py = pl:GetPosition()
+            local objs = GetObjectsInCircle(px, py, 1000000)
+            if type(objs) ~= "table" then logf("dev: no objects"); return end
+            local counts, sample = {}, {}
+            for _, obj in ipairs(objs) do
+                if type(obj) == "table" then
+                    local nm, ot = "", tostring(rawget(obj, "objtype") or obj.objtype or "?")
+                    pcall(function() nm = obj:GetName() or "" end)
+                    local key = ot .. " / '" .. nm .. "'"
+                    counts[key] = (counts[key] or 0) + 1
+                    if not sample[key] then
+                        local ox, oy
+                        pcall(function() ox, oy = obj:GetPosition() end)
+                        sample[key] = string.format("(%.0f,%.0f)", ox or 0, oy or 0)
+                    end
+                end
+            end
+            logf("dev: ==== OBJECT DUMP: %d objects ====", #objs)
+            for key, n in pairs(counts) do
+                logf("dev:   %dx  %s  e.g.%s", n, key, sample[key])
+            end
+            logf("dev: ==== END DUMP ====")
+        end },
         { label = "Revive (clear dead state)", run = function()
             mp.is_dead = false
             mp.death_announced_at = nil
@@ -4107,82 +4617,38 @@ end
 -- Text objects are CACHED — only recreated when content changes, to
 -- avoid per-frame allocation churn that hammered the engine.
 dev_menu = {
-    visible    = false,
-    cat        = 1,
-    idx        = 1,
-    text_objs  = {},   -- array of CreateTextObj handles
-    text_cache = {},   -- last-set text per line — skip recreate if unchanged
+    visible      = false,
+    cat          = 1,
+    idx          = 1,
+    render_lines = nil,   -- {x,y,text,c} list drawn by _G.MP_RENDER (swap-hook DrawText)
 }
 
-local DEV_LINE_DY    = 0.35   -- world-units between menu rows (top to bottom)
-local DEV_TOP_OFFSET = 3.5    -- world-units above player for the first line
-local DEV_HIDE_POS   = -9999
-
-local function dev_menu_clear_lines()
-    for _, t in ipairs(dev_menu.text_objs) do
-        if t then pcall(function() t:Delete() end) end
-    end
-    dev_menu.text_objs  = {}
-    dev_menu.text_cache = {}
-end
-
-local function dev_menu_build_lines()
+-- Build the dev menu as screen-space lines for the game-over render path (clean,
+-- window-scaled DrawText) instead of the old world-space CreateTextObj overlay.
+local function dev_menu_build_screen_lines()
     local cats = build_dev_categories()
     local cat  = cats[dev_menu.cat]
-    if not cat then return {} end
-    local lines = {}
-    -- Header (with simple ASCII frame to fake a "panel" without a sprite).
-    table.insert(lines, "================================")
-    table.insert(lines, string.format("  DEV  [%s]  (KP4/6=cat)", cat.name))
-    table.insert(lines, "--------------------------------")
+    if not cat then return nil end
+    local C_HDR = { 0.45, 0.85, 1.0 }   -- cyan header
+    local C_SEL = { 0.35, 1.0, 0.35 }   -- green selected row
+    local C_DIM = { 0.6, 0.6, 0.6 }     -- grey footer
+    local L = {}
+    local x, y = 8, 14
+    L[#L+1] = { x = x, y = y, text = string.format("== DEV [%s]   KP4/6 = category ==", cat.name), c = C_HDR }
+    y = y + 12
     for i, act in ipairs(cat.actions) do
-        local marker = (i == dev_menu.idx) and ">> " or "   "
-        table.insert(lines, marker .. act.label)
+        local sel = (i == dev_menu.idx)
+        L[#L+1] = { x = x, y = y, text = (sel and "> " or "  ") .. act.label, c = sel and C_SEL or nil }
+        y = y + 10
     end
-    table.insert(lines, "--------------------------------")
-    table.insert(lines, "Up/Dn=move  Enter=run  KP+=close")
-    table.insert(lines, "================================")
-    return lines
+    y = y + 3
+    L[#L+1] = { x = x, y = y, text = "Up/Dn = move   Enter = run   KP+ = close", c = C_DIM }
+    return L
 end
 
+-- Refresh the line list MP_RENDER draws (or clear it when hidden).
 local function dev_menu_render()
-    if not (level and level.IsLoaded and level.IsLoaded()) then return end
-    if not dev_menu.visible then
-        if #dev_menu.text_objs > 0 then dev_menu_clear_lines() end
-        return
-    end
-    local pl = player.GetPlayer()
-    if not pl then return end
-    local px, py = pl:GetPosition()
-    local lines = dev_menu_build_lines()
-    -- Grow/shrink text_objs to match lines.
-    while #dev_menu.text_objs < #lines do
-        local idx = #dev_menu.text_objs + 1
-        local ty = py + DEV_TOP_OFFSET - (idx - 1) * DEV_LINE_DY
-        local obj
-        pcall(function() obj = CreateTextObj(px, ty, lines[idx]) end)
-        table.insert(dev_menu.text_objs,  obj)
-        table.insert(dev_menu.text_cache, lines[idx])
-    end
-    while #dev_menu.text_objs > #lines do
-        local last = table.remove(dev_menu.text_objs)
-        table.remove(dev_menu.text_cache)
-        if last then pcall(function() last:Delete() end) end
-    end
-    -- Update each line: reposition every frame, only recreate when text changes.
-    for i, txt in ipairs(lines) do
-        local ty  = py + DEV_TOP_OFFSET - (i - 1) * DEV_LINE_DY
-        local obj = dev_menu.text_objs[i]
-        if dev_menu.text_cache[i] ~= txt then
-            if obj then pcall(function() obj:Delete() end) end
-            local newobj
-            pcall(function() newobj = CreateTextObj(px, ty, txt) end)
-            dev_menu.text_objs[i]  = newobj
-            dev_menu.text_cache[i] = txt
-        elseif obj then
-            pcall(function() obj:SetPosition(px, ty) end)
-        end
-    end
+    dev_menu.render_lines = dev_menu.visible and dev_menu_build_screen_lines() or nil
 end
 
 local function dev_menu_run_current()
@@ -4381,6 +4847,7 @@ end
 
 -- Key names from lua/keys.lua — keypad +, arrow up/down, return/kp_enter.
 local function dev_menu_tick()
+    if mp.reloading then return end   -- level reload in progress; entity refs stale
     -- Networked chat: poll T/Y to open, drain typed keys, render. Wrapped in
     -- pcall so a chat error never blocks the bullet/hit draining below.
     pcall(chat.tick)
@@ -4581,7 +5048,7 @@ local function dev_menu_tick()
         dev_menu.visible = not dev_menu.visible
         logf("dev_menu: toggle visible=%s", tostring(dev_menu.visible))
         if not dev_menu.visible then
-            dev_menu_clear_lines()
+            dev_menu.render_lines = nil
             pcall(refresh_objective_string)
         else
             dev_menu_render()
@@ -4627,6 +5094,7 @@ local function start_dev_menu_coro()
     end)
     coroutine.resume(co)
 end
+mp.start_dev_menu_coro = start_dev_menu_coro   -- do_level_reload restarts it after a transition
 
 -- ============ MENU INTEGRATION (Phase 2 lobby) ============
 local _mp_integration_ok, _mp_integration_err = pcall(function()
@@ -4687,6 +5155,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.force_gameover_page = false
         mp.death_chest_dropped = false   -- allow a fresh death-loot drop this run
         mp.local_parked_off_map = false
+        mp.at_exit_dir = nil             -- not waiting at any exit on a fresh run
+        mp.exit_waiting, mp.exit_living = nil, nil
         go_screen.hide()   -- clear any prior run's scoreboard
         local seed = mp.session_seed or 1779843477
         logf("begin_game: seed=%s is_host=%s room='%s'",
@@ -4850,6 +5320,25 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
             if apply_waiting_labels then pcall(apply_waiting_labels) end
         end,
         kicked = function(m) handle_kicked(m) end,
+        -- Level-advance messages can arrive while the engine is PAUSED (this
+        -- drain path runs from MP_FRAME_TICK in menu states). Without these
+        -- entries they'd strand in handshake_queued until the next net
+        -- coroutine start. Queue-only — MP_FRAME_TICK dispatches the reload.
+        level_change = function(m)
+            if not (m and type(m.dir) == "string") then return end
+            if type(m.seq) == "number" then
+                if mp.last_level_change_seq and m.seq <= mp.last_level_change_seq then return end
+                mp.last_level_change_seq = m.seq
+            end
+            mp.pending_level_change = m
+            logf("LEVEL CHANGE queued (paused) -> %s seed=%s seq=%s",
+                m.dir, tostring(m.seed), tostring(m.seq))
+        end,
+        exit_wait = function(m)
+            if not m then return end
+            mp.exit_waiting = tonumber(m.waiting)
+            mp.exit_living  = tonumber(m.living)
+        end,
     }
 
     -- Pull frames from mp.sock at title-menu state. Lobby-known messages
@@ -5719,6 +6208,26 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         if mp.sock then pcall(drain_sock_sync) end
         if apply_waiting_labels then pcall(apply_waiting_labels) end
         if apply_pause_labels   then pcall(apply_pause_labels)   end
+        -- ============ LEVEL RELOAD DISPATCH ============
+        -- A level_change that arrived while PAUSED (via drain_sock_sync above)
+        -- sits in mp.pending_level_change with the net coroutine frozen. Run
+        -- phase 1 here — we're already in a menu state, so its
+        -- SetState("newmenu") is a no-op and it just snapshots + stashes.
+        if mp.pending_level_change and mp.in_game and not mp.reloading
+           and mp.do_level_change then
+            local lc = mp.pending_level_change
+            mp.pending_level_change = nil
+            pcall(mp.do_level_change, lc)
+        end
+        -- Phase 2: the actual StartFrom reload. MP_FRAME_TICK only runs in
+        -- menu states — outside any lua_resume / coroutinemanager walk — which
+        -- is the one context where freeing the level object is safe (same as
+        -- begin_game). See do_level_change / mp.do_level_reload.
+        if mp.pending_reload and mp.do_level_reload then
+            local pr = mp.pending_reload
+            mp.pending_reload = nil
+            pcall(mp.do_level_reload, pr)
+        end
         -- Only re-fire begin_game if we actually have a live socket and
         -- haven't already entered the game. Without these guards a
         -- stale game_started_pending flag (e.g. from a previous run
