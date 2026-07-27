@@ -7,8 +7,8 @@ and launches the game. A Vanilla profile starts the game with all mods disabled.
 
 ## Play the multiplayer alpha
 
-1. Open the [GlitchMod Alpha 1 release](https://github.com/OriginUnknowns/TeleglitchDMEMPClient/releases/tag/v0.1.0-alpha.1).
-2. Under **Assets**, download `GlitchMod-0.1.0-alpha.1-win-x86.zip`. Do not
+1. Open the [GlitchMod Alpha 2 release](https://github.com/OriginUnknowns/TeleglitchDMEMPClient/releases/tag/v0.1.0-alpha.2).
+2. Under **Assets**, download `GlitchMod-0.1.0-alpha.2-win-x86.zip`. Do not
    download GitHub's automatic "Source code" ZIP.
 3. Extract the entire ZIP, then run `GlitchMod.exe`.
 4. GlitchMod normally finds the Steam game automatically. If it does not, click
@@ -38,7 +38,7 @@ Teleglitch: Die More Edition.
 
 ```powershell
 .\launcher\build-release.ps1 `
-  -Version 0.1.0-alpha.1 `
+  -Version 0.1.0-alpha.2 `
   -RelayHost yamanote.proxy.rlwy.net `
   -RelayPort 58057
 ```

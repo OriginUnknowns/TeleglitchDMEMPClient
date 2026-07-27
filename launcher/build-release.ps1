@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0-alpha.1",
+    [string]$Version = "0.1.0-alpha.2",
     [Parameter(Mandatory = $true)][string]$RelayHost,
     [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$RelayPort
 )
@@ -20,6 +20,31 @@ if (-not (Test-Path $msbuild)) {
 }
 if ($RelayHost -notmatch "^[A-Za-z0-9.-]+$") {
     throw "RelayHost must be a DNS hostname."
+}
+
+$clientSourcePath = Join-Path $repoRoot "mods\mp_client\init.lua"
+$nativeSourcePath = Join-Path $repoRoot "modloader\dllhost\main.cpp"
+$clientSource = Get-Content -LiteralPath $clientSourcePath -Raw
+$nativeSource = Get-Content -LiteralPath $nativeSourcePath -Raw
+if ($clientSource -notmatch "(?m)^\s*local DEV_TOOLS = false\s*$") {
+    throw "Release hygiene failed: DEV_TOOLS must be explicitly false."
+}
+$forbiddenReleasePatterns = [ordered]@{
+    "fixed multiplayer seed" = "1779843477"
+    "debug starter loadout" = "debug starter loadout granted"
+    "visible game-over test button" = '"TEST: Game Over"'
+    "RNG stream probe" = "rngprobe"
+    "world-checksum probe" = "WORLD CHECKSUM"
+    "title-screen test hotkey" = "consume_testkey"
+    "per-frame debug heartbeat" = "_frame_tick_dbg_count"
+}
+foreach ($entry in $forbiddenReleasePatterns.GetEnumerator()) {
+    if ($clientSource.Contains($entry.Value) -or $nativeSource.Contains($entry.Value)) {
+        throw "Release hygiene failed: found $($entry.Key) marker '$($entry.Value)'."
+    }
+}
+if ($clientSource -match 'type\s*=\s*"create_room"[^\r\n]*seed\s*=') {
+    throw "Release hygiene failed: client room creation must let the relay choose a fresh seed."
 }
 
 & (Join-Path $repoRoot "modloader\dllhost\build.ps1")

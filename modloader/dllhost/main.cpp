@@ -3343,8 +3343,6 @@ static int chat_vk_to_ascii(DWORD vk, bool shift, bool caps) {
     return 0;
 }
 
-// Test hotkey (KP*) press flag — set by kbd_ll_proc, drained by consume_testkey.
-static volatile bool g_testkey_pressed = false;
 // Game-over screen state: g_gameover_bg = screen up (swap hook clears to black);
 // g_gameover_dismiss = ESC pressed while it's up (drained by Lua to hide it).
 static volatile bool g_gameover_bg      = false;
@@ -3398,16 +3396,6 @@ static LRESULT CALLBACK kbd_ll_proc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (g_suppress_esc) {
                     return 1;
                 }
-            }
-        }
-        // Test hotkey (KP*): flag a press for the Lua menu tick to consume.
-        // The engine reads menu input natively, so input.KeyDown never reaches
-        // Lua at the title menu — this LL hook does. Not swallowed; the engine
-        // ignores KP* at the menu anyway.
-        if (p && p->vkCode == VK_MULTIPLY &&
-            (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-            if (g_our_hwnd && GetForegroundWindow() == g_our_hwnd) {
-                g_testkey_pressed = true;
             }
         }
     }
@@ -3723,15 +3711,6 @@ static int l_check_esc_pressed(lua_State* L) {
     g_esc_pressed = false;
     if (was) host_log("check_esc_pressed -> TRUE (leaves_lobby=%d quits=%d suppress=%d)",
                       g_esc_leaves_lobby ? 1 : 0, g_esc_quits ? 1 : 0, g_suppress_esc ? 1 : 0);
-    api.pushboolean(L, was ? 1 : 0);
-    return 1;
-}
-
-// consume_testkey() — atomic read+clear of the KP* test-hotkey flag. Lua polls
-// this from the menu tick (input.KeyDown doesn't reach Lua at the title menu).
-static int l_consume_testkey(lua_State* L) {
-    bool was = g_testkey_pressed;
-    g_testkey_pressed = false;
     api.pushboolean(L, was ? 1 : 0);
     return 1;
 }
@@ -4052,8 +4031,6 @@ extern "C" __declspec(dllexport) int luaopen_mp_native(lua_State* L) {
     api.setfield(L, -2, "set_esc_opens_mp_pause");
     api.pushcclosure(L, l_check_esc_pressed, 0);
     api.setfield(L, -2, "check_esc_pressed");
-    api.pushcclosure(L, l_consume_testkey, 0);
-    api.setfield(L, -2, "consume_testkey");
     api.pushcclosure(L, l_arm_render, 0);
     api.setfield(L, -2, "arm_render");
     api.pushcclosure(L, l_set_gameover_bg, 0);

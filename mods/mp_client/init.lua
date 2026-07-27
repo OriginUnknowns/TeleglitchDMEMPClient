@@ -115,7 +115,6 @@ local mp = {
     last_label_update = 0,
     last_pickup_scan = 0,
     pickup_scan_start_after = 0,
-    test_mode = false,
     coro_running = false,
     log_file = nil,
     session_seed = nil,
@@ -123,6 +122,10 @@ local mp = {
     last_inv_sent_counts = nil,
     peer_inventories = {},  -- player_id -> {type -> count}
 }
+
+-- Developer-only gameplay controls remain in source for local debugging, but
+-- public builds must keep this false. Release packaging verifies the setting.
+local DEV_TOOLS = false
 
 local function logf(fmt, ...)
     local msg = string.format(fmt, ...)
@@ -382,49 +385,9 @@ if type(GenerateLevel) == "function" then
             math.randomseed(mp.session_seed)
             logf("GenerateLevel: re-seeded to %s", tostring(mp.session_seed))
         end
-        -- Instrumentation: count math.random calls + checksum first/last values
-        local orig_random = math.random
-        local count = 0
-        local first_vals, last_vals = {}, {}
-        math.random = function(...)
-            count = count + 1
-            local r = orig_random(...)
-            if count <= 5 then table.insert(first_vals, tostring(r)) end
-            return r
-        end
-        local result = orig_GenerateLevel(ldata)
-        math.random = orig_random
-        logf("GenerateLevel: math.random called %d times; first5=[%s]",
-            count, table.concat(first_vals, ","))
-        -- WORLD CHECKSUM: hash every object's position so host/joiner can be
-        -- compared line-for-line in the log. Identical seeds + identical RNG
-        -- consumption must yield an identical checksum; any mismatch means the
-        -- worlds diverged even though the counts matched. Also probe the
-        -- post-gen RNG state (consumed identically on both sides, so it stays
-        -- in sync and directly compares the generator state).
-        -- The probe MUST be unconditional (not inside a fallible path): it
-        -- consumes one stream value, so it has to run on both clients or the
-        -- streams desync right here.
-        local rngprobe = math.random(1000000)
-        local n, hash = 0, 0
-        pcall(function()
-            local objs = GetObjectsInCircle(0, 0, 100000)
-            if type(objs) == "table" then
-                for _, o in ipairs(objs) do
-                    if type(o) == "table" then
-                        local ox, oy
-                        pcall(function() ox, oy = o:GetPosition() end)
-                        if ox and oy then
-                            n = n + 1
-                            hash = (hash + math.floor(ox * 10 + 0.5) * 31
-                                         + math.floor(oy * 10 + 0.5) * 7) % 1000000007
-                        end
-                    end
-                end
-            end
-        end)
-        logf("WORLD CHECKSUM: objects=%d poshash=%d rngprobe=%d", n, hash, rngprobe)
+        local ok, result = pcall(orig_GenerateLevel, ldata)
         mp.in_levelgen = false
+        if not ok then error(result) end
         return result
     end
     logf("wrapped GenerateLevel for deterministic level gen")
@@ -1339,30 +1302,21 @@ local STUB_MOB = setmetatable({ pointer = "stub", objtype = "stub" }, { __index 
 do
     local orig_create = Create
     Create = function(data)
-        local trace = mp.spawn_test_scene  -- only log loudly during explicit test spawns
         if data and type(data) == "table" and data.type then
             local t = data.type
             local is_enemy = enemylist[t] and string.sub(t, 1, 3) ~= "mp_"
             if is_enemy and (not mp.is_host) and mp.cleanup_done then
                 return STUB_MOB
             end
-            if mp.test_mode and (not mp.spawn_test_scene) and (not mp.item_snapshot_received) then
-                if is_enemy or (itemtable and itemtable[t]) then
-                    return STUB_MOB
-                end
-            end
             -- HOST MP: do NOT block joiner item spawns here. Both sides must
             -- run identical Create calls or math.random state diverges and
             -- module shuffles produce different rooms. Joiner tracks its local
             -- spawns; apply_item_list wipes them when host's snapshot arrives.
-            if trace then logf("CW>before orig_create type=%s pos=(%.2f,%.2f)", t, data.x or -999, data.y or -999) end
         end
         local obj = orig_create(data)
-        if trace then logf("CW>after orig_create type=%s obj_type=%s", data and data.type or "?", type(obj)) end
         if obj and data and type(data) == "table" and data.type then
             local t = data.type
             if mp.is_host and enemylist[t] and string.sub(t, 1, 3) ~= "mp_" then
-                if trace then logf("CW>tracking mob") end
                 local ptr_str = tostring(obj.pointer)
                 mp.host_mobs[ptr_str] = { id = mp.next_mob_id, type = t, obj = obj }
                 mp.next_mob_id = mp.next_mob_id + 1
@@ -1409,7 +1363,6 @@ do
             -- one returned by the low-level call, one returned by Create{} —
             -- so tracking both paths produces duplicate IDs for the same item.
         end
-        if trace then logf("CW>returning obj") end
         return obj
     end
 end
@@ -1423,20 +1376,11 @@ do
         local orig = _G[fn_name]
         if type(orig) == "function" then
             _G[fn_name] = function(x, y, nimi)
-                local trace = mp.spawn_test_scene
-                if mp.test_mode and (not mp.spawn_test_scene) and (not mp.item_snapshot_received)
-                   and itemtable and itemtable[nimi] then
-                    return 0
-                end
                 -- HOST MP: don't block; need RNG parity for module shuffle.
-                if trace then logf("LL>before %s type=%s pos=(%.2f,%.2f)", fn_name, tostring(nimi), x or -999, y or -999) end
                 local obj = orig(x, y, nimi)
-                if trace then logf("LL>after %s obj_type=%s", fn_name, type(obj)) end
                 if obj and itemtable and itemtable[nimi] then
                     if mp.is_host then
-                        if trace then logf("LL>about to track_item_host") end
                         track_item_host(obj, nimi, x, y)
-                        if trace then logf("LL>track_item_host returned") end
                     elseif not mp.item_snapshot_received then
                         track_item_joiner_pre(obj, nimi)
                     elseif mp.sock and not in_giveitem then
@@ -1521,12 +1465,10 @@ end
 
 -- ============ MESSAGE HANDLERS ============
 local handle_join  -- forward decl
-local dev_menu     -- forward decl — actual init in dev menu section below
 
 local PROXIMITY_RANGE = 6.0
 local function refresh_objective_string()
     if not (level and level.IsLoaded and level.IsLoaded()) then return end
-    if dev_menu and dev_menu.visible then return end  -- dev menu owns the line
     local pl = player.GetPlayer()
     local px, py
     if pl then px, py = pl:GetPosition() end
@@ -3382,9 +3324,6 @@ function _G.MP_RENDER()
         end
     end
     if go_screen.active and go_screen.lines then draw(go_screen.lines) end
-    -- Dev menu shares this clean screen-space path (no black backdrop — it
-    -- overlays live gameplay; only the game-over screen sets the backdrop).
-    if dev_menu and dev_menu.visible and dev_menu.render_lines then draw(dev_menu.render_lines) end
     if SetColor then SetColor(1, 1, 1, 1) end   -- restore default white
 end
 
@@ -3584,13 +3523,6 @@ local function do_level_change(m)
     mp.at_exit_dir = nil
     mp.exit_waiting, mp.exit_living = nil, nil
     pcall(function() go_screen.hide() end)
-    -- Close the dev menu across the transition — its overlay lines reference
-    -- pre-reload state, and leaving it open rendered it stuck/unusable.
-    if dev_menu then
-        dev_menu.visible = false
-        dev_menu.render_lines = nil
-    end
-
     mp.pending_reload = { m = m, keep_items = keep_items }
     logf("LEVEL CHANGE stashed — reload will run from the swap-hook slot (MP_RENDER)")
     -- NOTE: no state switch. Menu states do NOT stop the game world (verified
@@ -3908,7 +3840,8 @@ local function connect_and_handshake(proposed_seed)
     if is_host then
         -- Host: create the room. Server auto-joins us and sends welcome.
         local room_name = (config.name or "Player") .. "'s game"
-        _send_frame(sock, { type = "create_room", name = room_name, seed = proposed_seed })
+        -- Omit seed so the relay assigns a fresh one for every room.
+        _send_frame(sock, { type = "create_room", name = room_name })
         local rc, e3 = _recv_until(sock, "room_created", 5, queued)
         if not rc then sock:close(); return false, "no room_created: " .. tostring(e3) end
         logf("room_created: room_id=%d", rc.room_id)
@@ -4151,9 +4084,7 @@ local function net_tick_loop()
             end
             if now - mp.last_label_update >= 0.5 then
                 mp.last_label_update = now
-                if not (dev_menu and dev_menu.visible) then
-                    refresh_objective_string()
-                end
+                refresh_objective_string()
             end
         end
         Wait(1/30)
@@ -4298,12 +4229,12 @@ mp.do_level_reload = function(pr)
     start_joiner_cleanup_coro()
     mp.pickup_scan_start_after = socket.gettime() + 2.5
 
-    -- Restart the dev-menu/chat/bullet-drain coroutine — its Wait(1/30) node
-    -- died with the old level's wait list, killing the dev menu, chat, AND
-    -- joiner bullet forwarding after a transition. Guaranteed dead at this
+    -- Restart the chat/bullet-drain coroutine — its Wait(1/30) node died with
+    -- the old level's wait list, killing chat and joiner bullet forwarding
+    -- after a transition. Guaranteed dead at this
     -- point (it can only be mid-execution during the game-update phase, never
     -- at swap time), so an unconditional restart can't double it up.
-    if mp.start_dev_menu_coro then mp.start_dev_menu_coro() end
+    if mp.start_runtime_coro then mp.start_runtime_coro() end
 
     -- Host re-sends authoritative item/container snapshots for the new level.
     -- These Wait()s register in the NEW level's wait list and tick normally.
@@ -4846,7 +4777,7 @@ local function manual_pickup_nearest()
 end
 
 -- Key names from lua/keys.lua — keypad +, arrow up/down, return/kp_enter.
-local function dev_menu_tick()
+local function runtime_tick()
     if mp.reloading then return end   -- level reload in progress; entity refs stale
     -- Networked chat: poll T/Y to open, drain typed keys, render. Wrapped in
     -- pcall so a chat error never blocks the bullet/hit draining below.
@@ -5024,6 +4955,7 @@ local function dev_menu_tick()
     end
     -- (Per-puppet vtable[+0x60] scan removed — central hit hook covers
     -- everything via the shared TNewLiving::ApplyHit base method.)
+    if not DEV_TOOLS then return end
     -- Manual pickup key works on BOTH sides (host AND joiner).
     -- Numpad 0: disconnect from relay (safe — lets the user recover from
     -- accidentally clicking Host twice or other double-connect bugs).
@@ -5085,16 +5017,16 @@ local function dev_menu_tick()
     end
 end
 
-local function start_dev_menu_coro()
+local function start_runtime_coro()
     local co = coroutine.create(function()
         while true do
-            pcall(dev_menu_tick)
+            pcall(runtime_tick)
             Wait(1/30)
         end
     end)
     coroutine.resume(co)
 end
-mp.start_dev_menu_coro = start_dev_menu_coro   -- do_level_reload restarts it after a transition
+mp.start_runtime_coro = start_runtime_coro   -- do_level_reload restarts it after a transition
 
 -- ============ MENU INTEGRATION (Phase 2 lobby) ============
 local _mp_integration_ok, _mp_integration_err = pcall(function()
@@ -5120,7 +5052,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     begin_game = function()
         if mp.in_game then return end
         mp.in_game = true
-        mp.test_mode = false
         -- Restore normal ESC behavior — a previous Disconnect may have
         -- left it suppressed or in quits-mode.
         if _G.MP_NATIVE and _G.MP_NATIVE.set_suppress_esc then
@@ -5158,7 +5089,13 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         mp.at_exit_dir = nil             -- not waiting at any exit on a fresh run
         mp.exit_waiting, mp.exit_living = nil, nil
         go_screen.hide()   -- clear any prior run's scoreboard
-        local seed = mp.session_seed or 1779843477
+        local seed = tonumber(mp.session_seed)
+        if not seed then
+            mp.in_game = false
+            logf("begin_game: relay did not provide a valid session seed; refusing to start")
+            return
+        end
+        mp.session_seed = seed
         logf("begin_game: seed=%s is_host=%s room='%s'",
             tostring(seed), tostring(mp.is_host), tostring(mp.room_name))
         math.randomseed(seed)
@@ -5192,7 +5129,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         pcall(refresh_objective_string)
         mp.pickup_scan_start_after = socket.gettime() + 2.5
         start_net_coro()      -- safe here — we're now in game state
-        start_dev_menu_coro()
+        start_runtime_coro()
         start_joiner_cleanup_coro()
         if mp.is_host then
             local co = coroutine.create(function()
@@ -5200,37 +5137,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                     Wait(1.5)
                     host_send_item_list()
                     host_send_container_list()
-                end)
-            end)
-            coroutine.resume(co)
-        end
-        -- Debug starter loadout: give every player a representative slice of
-        -- weapons + ammo so we can exercise multi-bullet (pump), explode,
-        -- cannon, nailgun, and energy paths without hunting for them.
-        -- in_giveitem brackets the grant so the item Create wraps skip
-        -- tracking (otherwise each grant queues a phantom item_spawned).
-        do
-            local co = coroutine.create(function()
-                pcall(function()
-                    Wait(0.5)
-                    local pl = player.GetPlayer()
-                    if not pl or not pl.GiveItem then return end
-                    local prev = in_giveitem
-                    in_giveitem = true
-                    -- Ammo types from relvad.lua: pump→ppammo, rifle→riammo,
-                    -- smg→pyammo, lasgun→battery, agl→pexpammo, cannon→cannonammo.
-                    local STARTER = {
-                        weapons = { "pump", "rifle", "smg", "lasgun", "agl", "cannon" },
-                        ammo    = { "ppammo", "riammo", "pyammo", "battery", "pexpammo", "cannonammo" },
-                    }
-                    for _, w in ipairs(STARTER.weapons) do
-                        pcall(function() pl:GiveItem(w) end)
-                    end
-                    for _, a in ipairs(STARTER.ammo) do
-                        for _ = 1, 3 do pcall(function() pl:GiveItem(a) end) end
-                    end
-                    in_giveitem = prev
-                    logf("debug starter loadout granted")
                 end)
             end)
             coroutine.resume(co)
@@ -5406,7 +5312,8 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
         _send_frame(sock, { type = "hello", name = config.name, compress = mp_can_inflate() })
         -- Create the room and wait for welcome.
         local room_name = (config.name or "Player") .. "'s Game"
-        _send_frame(sock, { type = "create_room", name = room_name, seed = 1779843477 })
+        -- Omit seed so the relay assigns a fresh one for every room.
+        _send_frame(sock, { type = "create_room", name = room_name })
         local queued = {}
         local rc = _recv_until(sock, "room_created", 5, queued)
         if not rc then sock:close(); logf("Create: no room_created"); return end
@@ -5675,52 +5582,15 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
                 pcall(lobby_refresh_rooms)   -- pre-populate before page render
                 menu.SetPage("mp_browse")
             end)
-        local gotest_btn = mp_lobby_page:AddButton(60, 154, "TEST: Game Over",
-            "Toggle the DrawText scoreboard overlay",
-            function() pcall(go_screen.toggle) end)
         pcall(function()
             local back = mp_lobby_page:GetButton("BACK")
             create_btn:SetNext("down", browse_btn); browse_btn:SetNext("up", create_btn)
-            browse_btn:SetNext("down", gotest_btn); gotest_btn:SetNext("up", browse_btn)
             if back then
-                gotest_btn:SetNext("down", back); back:SetNext("up", gotest_btn)
+                browse_btn:SetNext("down", back); back:SetNext("up", browse_btn)
             end
         end)
     end)
     logf("MP page mp_lobby: ok=%s err=%s", tostring(pok1), tostring(perr1))
-
-    -- ------------------------------------------------------------------
-    -- mp_gostest = standalone PREVIEW of the end-of-run scoreboard layout.
-    -- Reachable from mp_lobby's "TEST: Game Over" button. Uses full-length
-    -- AddButton labels baked at creation (NOT set_button_label), so we can see
-    -- a roomy layout without the 15-char SSO cap. This is a layout sandbox only
-    -- — the real in-game screen still has to inject into mainmenu.
-    -- ------------------------------------------------------------------
-    local pokGO, perrGO = pcall(function()
-        local page = menu.AddPage("mp_gostest", "mp_lobby")
-        if not page then error("AddPage('mp_gostest') returned nil") end
-        pcall(function() page:AddBackground("gfx/menubg.bmp") end)
-        -- Fixed-column grid of buttons (each cell its own button at a fixed x →
-        -- columns line up). Content starts below the menubg's title band.
-        local COLX = { name = 16, kills = 88, score = 120, acc = 160,
-                       items = 200, dmg = 232, ff = 270, craft = 298 }
-        local function cell(x, y, txt) page:AddButton(x, y, tostring(txt), "", function() end) end
-        local function row(y, c)
-            cell(COLX.name, y, c.name);  cell(COLX.kills, y, c.kills); cell(COLX.score, y, c.score)
-            cell(COLX.acc, y, c.acc);    cell(COLX.items, y, c.items); cell(COLX.dmg, y, c.dmg)
-            cell(COLX.ff, y, c.ff);      cell(COLX.craft, y, c.craft)
-        end
-        row(92, { name = "NAME", kills = "K", score = "SCR", acc = "ACC",
-                  items = "ITM", dmg = "DMG", ff = "FF", craft = "CRF" })
-        for i, p in ipairs(GAMEOVER_TEST_PLAYERS) do
-            row(110 + (i - 1) * 16, {
-                name = p.name, kills = p.kills, score = p.score,
-                acc = (p.accuracy or 0) .. "%", items = p.items,
-                dmg = p.hp_lost, ff = p.ff, craft = p.crafted or 0,
-            })
-        end
-    end)
-    logf("MP page mp_gostest: ok=%s err=%s", tostring(pokGO), tostring(perrGO))
 
     -- ------------------------------------------------------------------
     -- mp_browse = room slot picker. 4 slot buttons + page prev/next + Back.
@@ -5854,10 +5724,6 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     -- call _G.MP_FRAME_TICK at ~10Hz. Engine-tracked coroutines (Wait)
     -- crash at title-menu state, but a Win32-API hook fires every frame
     -- regardless. Tick body just drains the socket + relabels.
-    -- Debug heartbeat: log every 30th tick (~3s at 10Hz) so we can confirm
-    -- frame_tick is firing on each instance. Remove once thread-gate
-    -- regression is sorted.
-    mp._frame_tick_dbg_count = mp._frame_tick_dbg_count or 0
     -- ==========================================================
     -- MP_INTERP_TICK — disabled. The interp architecture (buffer
     -- snapshots, lerp at render time) needs more work; the previous
@@ -5943,30 +5809,7 @@ local _mp_integration_ok, _mp_integration_err = pcall(function()
     end
 
     _G.MP_FRAME_TICK = function()
-        -- TEST hotkey: KP* toggles the game-over UI preview on the title menu.
-        -- Detected by the native LL keyboard hook (input.KeyDown doesn't reach
-        -- Lua at the menu); consume_testkey is an atomic read+clear.
-        if _G.MP_NATIVE and _G.MP_NATIVE.consume_testkey then
-            local ok, pressed = pcall(function() return _G.MP_NATIVE.consume_testkey() end)
-            if ok and pressed then pcall(gameover_test_toggle) end
-        end
         pcall(go_screen.poll_dismiss)   -- ESC closes the game-over screen (menu state)
-        mp._frame_tick_dbg_count = (mp._frame_tick_dbg_count or 0) + 1
-        if (mp._frame_tick_dbg_count % 30) == 1 then
-            local hp_val = "?"
-            -- Only probe HP when in-game; at menu pl exists but has no
-            -- backing TPlayer, so calling :GetHealth nullderefs the engine.
-            if mp.in_game then
-                local pl_for_hp = player.GetPlayer()
-                if pl_for_hp and pl_for_hp.GetHealth then
-                    pcall(function() hp_val = tostring(pl_for_hp:GetHealth()) end)
-                end
-            end
-            logf("frame_tick HB n=%d in_game=%s sock=%s pending=%s is_dead=%s hp=%s",
-                 mp._frame_tick_dbg_count,
-                 tostring(mp.in_game), tostring(mp.sock ~= nil),
-                 tostring(mp.game_started_pending), tostring(mp.is_dead), hp_val)
-        end
         -- ESC dispatch — single g_esc_pressed latch in the native, two
         -- consumer sites here based on current state:
         --   * in_game        → swap to mp_pause + pause engine (game=false)
