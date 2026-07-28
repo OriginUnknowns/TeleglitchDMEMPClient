@@ -7,6 +7,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
@@ -30,6 +31,7 @@ namespace GlitchMod.UiTests
                 string game = Path.GetFullPath(args[1]);
                 Environment.SetEnvironmentVariable("GLITCHMOD_PAYLOAD", payload);
                 Environment.SetEnvironmentVariable("GLITCHMOD_APPDATA", Path.Combine(game, "_ui-test-appdata"));
+                Environment.SetEnvironmentVariable("GLITCHMOD_DISABLE_UPDATES", "1");
 
                 var processStarts = new List<ProcessStartInfo>();
                 var core = new LauncherCore(info => processStarts.Add(info));
@@ -47,6 +49,7 @@ namespace GlitchMod.UiTests
                     ConfirmRemove = true,
                     ConfirmUnsupported = true
                 };
+                var updateService = new FakeUpdateService();
                 LauncherSettings settings = core.LoadSettings();
                 settings.GamePath = game;
                 settings.SelectedProfile = "vanilla";
@@ -54,7 +57,7 @@ namespace GlitchMod.UiTests
 
                 app = new App();
                 app.InitializeComponent();
-                window = new MainWindow(core, dialogs);
+                window = new MainWindow(core, dialogs, updateService);
 
                 LauncherSettings windowSettings = GetField<LauncherSettings>(window, "settings");
                 LaunchProfile vanilla = windowSettings.Profiles.First(profile => profile.Id == "vanilla");
@@ -64,6 +67,13 @@ namespace GlitchMod.UiTests
 
                 AssertHandlerInventory();
                 AssertLaunchButtonColors(app, window);
+
+                Click(Find<Button>(window, "UpdateButton"));
+                Check(updateService.CheckCount == 1, "Update button did not check for a launcher update.");
+                Check(Find<Button>(window, "UpdateButton").Content.ToString().Contains("9.9.9"),
+                    "Update button did not display the available launcher version.");
+                Check(dialogs.UpdateConfirmations == 1,
+                    "Update button did not ask before replacing the launcher.");
 
                 var profiles = Find<StackPanel>(window, "ProfilesPanel");
                 Check(profiles.Children.Count == 2, "Profile buttons did not render.");
@@ -177,6 +187,7 @@ namespace GlitchMod.UiTests
                 "RemoveLoader_Click",
                 "ImportMod_Click",
                 "OpenGameFolder_Click",
+                "Update_Click",
                 "Minimize_Click",
                 "Maximize_Click",
                 "Close_Click"
@@ -295,6 +306,7 @@ namespace GlitchMod.UiTests
             public string ModZip { get; set; }
             public bool ConfirmUnsupported { get; set; }
             public bool ConfirmRemove { get; set; }
+            public int UpdateConfirmations { get; private set; }
             public List<string> Warnings { get; private set; }
             public List<string> Errors { get; private set; }
 
@@ -302,8 +314,42 @@ namespace GlitchMod.UiTests
             public string ChooseModZip(Window owner) { return ModZip; }
             public bool ConfirmUnsupportedBuild(string message) { return ConfirmUnsupported; }
             public bool ConfirmRemoveLoader() { return ConfirmRemove; }
+            public bool ConfirmLauncherUpdate(string currentVersion, string newVersion)
+            {
+                UpdateConfirmations++;
+                return false;
+            }
             public void ShowWarning(string message, string title) { Warnings.Add(title + ": " + message); }
             public void ShowError(string message, string title) { Errors.Add(title + ": " + message); }
+        }
+
+        private sealed class FakeUpdateService : ILauncherUpdateService
+        {
+            public int CheckCount { get; private set; }
+
+            public Task<LauncherUpdateInfo> CheckForUpdateAsync(string currentVersion, int timeoutMs)
+            {
+                CheckCount++;
+                return Task.FromResult(new LauncherUpdateInfo
+                {
+                    Version = "9.9.9",
+                    Tag = "v9.9.9",
+                    ReleasePageUrl = "https://example.invalid/release",
+                    ZipUrl = "https://example.invalid/release.zip",
+                    HashUrl = "https://example.invalid/release.zip.sha256"
+                });
+            }
+
+            public Task<PreparedLauncherUpdate> PrepareUpdateAsync(
+                LauncherUpdateInfo update, int timeoutMs)
+            {
+                throw new InvalidOperationException("Fake updater should not download.");
+            }
+
+            public void StartApply(PreparedLauncherUpdate prepared)
+            {
+                throw new InvalidOperationException("Fake updater should not apply.");
+            }
         }
     }
 }

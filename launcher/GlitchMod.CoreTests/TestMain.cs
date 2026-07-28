@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace GlitchMod.CoreTests
@@ -129,6 +130,92 @@ namespace GlitchMod.CoreTests
                 Check(blocked, "ZIP path traversal was not blocked.");
                 Check(!File.Exists(Path.Combine(game, "escaped.txt")), "ZIP path traversal escaped the mods folder.");
 
+                Check(LauncherUpdateService.CompareVersions("0.1.0-alpha.10", "0.1.0-alpha.2") > 0,
+                    "Updater compared numeric prerelease identifiers lexically.");
+                Check(LauncherUpdateService.CompareVersions("0.1.0", "0.1.0-alpha.99") > 0,
+                    "Updater did not rank a stable release above its prerelease.");
+                Check(LauncherUpdateService.CompareVersions("1.0.0-alpha", "1.0.0-beta") < 0,
+                    "Updater prerelease ordering is incorrect.");
+
+                string releaseList = "["
+                    + "{\"tag_name\":\"v0.1.0-alpha.3\",\"draft\":true,\"assets\":[]},"
+                    + "{\"tag_name\":\"v0.1.0-alpha.10\",\"draft\":false,"
+                    + "\"html_url\":\"https://example.invalid/v0.1.0-alpha.10\",\"assets\":["
+                    + "{\"name\":\"GlitchMod-0.1.0-alpha.10-win-x86.zip\","
+                    + "\"browser_download_url\":\"https://example.invalid/update.zip\"},"
+                    + "{\"name\":\"GlitchMod-0.1.0-alpha.10-win-x86.zip.sha256\","
+                    + "\"browser_download_url\":\"https://example.invalid/update.zip.sha256\"}]},"
+                    + "{\"tag_name\":\"v0.1.0-alpha.9\",\"draft\":false,\"assets\":[]}"
+                    + "]";
+                LauncherUpdateInfo latest = LauncherUpdateService.SelectLatestRelease(
+                    releaseList, "0.1.0-alpha.2");
+                Check(latest != null && latest.Version == "0.1.0-alpha.10",
+                    "Updater did not select the highest complete non-draft release.");
+
+                string updateVersion = "9.9.9";
+                var updateInfo = new LauncherUpdateInfo { Version = updateVersion };
+                string updateZip = Path.Combine(game, "verified-update.zip");
+                using (ZipArchive archive = ZipFile.Open(updateZip, ZipArchiveMode.Create))
+                {
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/GlitchMod.exe", "new-launcher");
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/payload/release.json",
+                        "{\"version\":\"" + updateVersion + "\",\"relay\":{\"host\":\"example.invalid\",\"port\":1},"
+                        + "\"supported_game_hashes\":[]}");
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/README.txt", "updated");
+                }
+                string updateHash = Sha256(updateZip);
+                string updateWork = Path.Combine(game, "_verified-update");
+                Directory.CreateDirectory(updateWork);
+                PreparedLauncherUpdate prepared = LauncherUpdateService.VerifyAndExtract(
+                    updateInfo, updateZip, updateHash + "  release.zip", updateWork);
+                Check(prepared.VerifiedSha256 == updateHash,
+                    "Updater did not retain the verified SHA-256.");
+                Check(File.Exists(Path.Combine(prepared.PackageDirectory, "payload", "release.json")),
+                    "Updater did not safely extract the verified package.");
+
+                string launcherTarget = Path.Combine(game, "_launcher-target");
+                Directory.CreateDirectory(Path.Combine(launcherTarget, "payload"));
+                File.WriteAllText(Path.Combine(launcherTarget, "GlitchMod.exe"), "old-launcher");
+                File.WriteAllText(Path.Combine(launcherTarget, "payload", "release.json"),
+                    "{\"version\":\"old\"}");
+                LauncherUpdateHelper.ApplyStagedFiles(prepared.PackageDirectory, launcherTarget);
+                Check(File.ReadAllText(Path.Combine(launcherTarget, "GlitchMod.exe")) == "new-launcher",
+                    "Updater helper did not replace the launcher.");
+                Check(File.ReadAllText(Path.Combine(launcherTarget, "README.txt")) == "updated",
+                    "Updater helper did not copy the complete release.");
+
+                bool badHashBlocked = false;
+                string badHashWork = Path.Combine(game, "_bad-hash-update");
+                Directory.CreateDirectory(badHashWork);
+                try
+                {
+                    LauncherUpdateService.VerifyAndExtract(
+                        updateInfo, updateZip, new string('0', 64), badHashWork);
+                }
+                catch (InvalidDataException) { badHashBlocked = true; }
+                Check(badHashBlocked, "Updater accepted a release with the wrong SHA-256.");
+
+                string maliciousUpdateZip = Path.Combine(game, "malicious-update.zip");
+                using (ZipArchive archive = ZipFile.Open(maliciousUpdateZip, ZipArchiveMode.Create))
+                {
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/GlitchMod.exe", "new-launcher");
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/payload/release.json",
+                        "{\"version\":\"" + updateVersion + "\"}");
+                    WriteEntry(archive, "GlitchMod-" + updateVersion + "/../../update-escaped.txt", "blocked");
+                }
+                bool updateTraversalBlocked = false;
+                string maliciousUpdateWork = Path.Combine(game, "_malicious-update");
+                Directory.CreateDirectory(maliciousUpdateWork);
+                try
+                {
+                    LauncherUpdateService.VerifyAndExtract(updateInfo, maliciousUpdateZip,
+                        Sha256(maliciousUpdateZip), maliciousUpdateWork);
+                }
+                catch (InvalidDataException) { updateTraversalBlocked = true; }
+                Check(updateTraversalBlocked, "Updater ZIP path traversal was not blocked.");
+                Check(!File.Exists(Path.Combine(game, "update-escaped.txt")),
+                    "Updater ZIP path traversal escaped its staging folder.");
+
                 core.RemoveLoader(game);
                 Check(File.ReadAllBytes(initPath).SequenceEqual(originalInit), "lua/init.lua was not restored exactly.");
                 Check(File.ReadAllBytes(Path.Combine(game, "version.dll")).SequenceEqual(versionSentinel),
@@ -160,6 +247,14 @@ namespace GlitchMod.CoreTests
             using (Stream stream = entry.Open())
             using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
                 writer.Write(content);
+        }
+
+        private static string Sha256(string path)
+        {
+            using (SHA256 sha = SHA256.Create())
+            using (FileStream stream = File.OpenRead(path))
+                return BitConverter.ToString(sha.ComputeHash(stream))
+                    .Replace("-", "").ToLowerInvariant();
         }
 
         private static void Check(bool condition, string message)

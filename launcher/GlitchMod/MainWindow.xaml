@@ -40,6 +40,12 @@
                             <TextBlock Text="ALPHA" FontFamily="Consolas" FontSize="9" FontWeight="Bold" Foreground="{StaticResource Acid}"/>
                         </Border>
                     </StackPanel>
+                    <Button x:Name="UpdateButton" Grid.Column="1" Content="CHECK UPDATES"
+                            Style="{StaticResource FlatButton}" Foreground="{StaticResource Acid}"
+                            HorizontalAlignment="Right" VerticalAlignment="Center"
+                            Margin="0,0,10,0" Padding="11,5"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                            Click="Update_Click"/>
                     <StackPanel Grid.Column="2" Orientation="Horizontal" shell:WindowChrome.IsHitTestVisibleInChrome="True">
                         <Button Content="—" Width="44" Height="47" Style="{StaticResource FlatButton}"
                                 BorderThickness="0" Background="Transparent" Click="Minimize_Click"/>

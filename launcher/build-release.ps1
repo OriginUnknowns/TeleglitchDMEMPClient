@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0-alpha.2",
+    [string]$Version = "0.1.0-alpha.3",
     [Parameter(Mandatory = $true)][string]$RelayHost,
     [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$RelayPort
 )
@@ -23,9 +23,14 @@ if ($RelayHost -notmatch "^[A-Za-z0-9.-]+$") {
 }
 
 $clientSourcePath = Join-Path $repoRoot "mods\mp_client\init.lua"
+$manifestSourcePath = Join-Path $repoRoot "mods\mp_client\manifest.lua"
 $nativeSourcePath = Join-Path $repoRoot "modloader\dllhost\main.cpp"
 $clientSource = Get-Content -LiteralPath $clientSourcePath -Raw
+$manifestSource = Get-Content -LiteralPath $manifestSourcePath -Raw
 $nativeSource = Get-Content -LiteralPath $nativeSourcePath -Raw
+if ($manifestSource -notmatch ('version\s*=\s*"' + [Regex]::Escape($Version) + '"')) {
+    throw "Release hygiene failed: multiplayer manifest version does not match $Version."
+}
 if ($clientSource -notmatch "(?m)^\s*local DEV_TOOLS = false\s*$") {
     throw "Release hygiene failed: DEV_TOOLS must be explicitly false."
 }

@@ -9,6 +9,7 @@ namespace GlitchMod
         string ChooseModZip(Window owner);
         bool ConfirmUnsupportedBuild(string message);
         bool ConfirmRemoveLoader();
+        bool ConfirmLauncherUpdate(string currentVersion, string newVersion);
         void ShowWarning(string message, string title);
         void ShowError(string message, string title);
     }
@@ -51,6 +52,15 @@ namespace GlitchMod
             return MessageBox.Show(
                 "Remove the GlitchMod loader and restore any files it backed up?\n\nImported mod folders will be kept.",
                 "Remove loader", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
+        }
+
+        public bool ConfirmLauncherUpdate(string currentVersion, string newVersion)
+        {
+            return MessageBox.Show(
+                "GlitchMod " + newVersion + " is available (installed: " + currentVersion + ").\n\n"
+                + "Download the verified update, replace the launcher and bundled payload, then restart GlitchMod?",
+                "GlitchMod update available", MessageBoxButton.YesNo, MessageBoxImage.Information)
+                == MessageBoxResult.Yes;
         }
 
         public void ShowWarning(string message, string title)

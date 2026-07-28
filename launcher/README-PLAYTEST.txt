@@ -11,9 +11,12 @@ Quick start
 5. Click LAUNCH MULTIPLAYER.
 6. In Teleglitch, create or join a room from the multiplayer menu.
 
-There is no separate installer and no files are downloaded at runtime. The
-manager backs up files it must replace and REMOVE LOADER restores them. Imported
-mod folders are deliberately retained.
+There is no separate installer. Multiplayer assets are bundled; only an update
+you approve is downloaded. The manager backs up files it must replace and
+REMOVE LOADER restores them. Imported mod folders are deliberately retained.
+
+GlitchMod checks for launcher/payload updates at startup. It asks before
+downloading, verifies the published SHA-256, applies the update, and restarts.
 
 Profiles
 --------

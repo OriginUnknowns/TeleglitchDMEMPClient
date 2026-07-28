@@ -7,8 +7,8 @@ and launches the game. A Vanilla profile starts the game with all mods disabled.
 
 ## Play the multiplayer alpha
 
-1. Open the [GlitchMod Alpha 2 release](https://github.com/OriginUnknowns/TeleglitchDMEMPClient/releases/tag/v0.1.0-alpha.2).
-2. Under **Assets**, download `GlitchMod-0.1.0-alpha.2-win-x86.zip`. Do not
+1. Open the [GlitchMod Alpha 3 release](https://github.com/OriginUnknowns/TeleglitchDMEMPClient/releases/tag/v0.1.0-alpha.3).
+2. Under **Assets**, download `GlitchMod-0.1.0-alpha.3-win-x86.zip`. Do not
    download GitHub's automatic "Source code" ZIP.
 3. Extract the entire ZIP, then run `GlitchMod.exe`.
 4. GlitchMod normally finds the Steam game automatically. If it does not, click
@@ -18,10 +18,15 @@ and launches the game. A Vanilla profile starts the game with all mods disabled.
    multiplayer menu.
 
 That is the complete setup. There is no account, command line, port forwarding,
-server address, separate installer, or runtime download. Everyone joining the
-same room should use the same GlitchMod release.
+server address, or separate installer. Multiplayer files ship in the ZIP;
+GlitchMod only downloads a newer release after you approve its update prompt.
+Everyone joining the same room should use the same GlitchMod release.
 
 The `.sha256` asset is optional verification data; most players do not need it.
+
+Starting with Alpha 3, GlitchMod checks public GitHub prereleases at startup.
+When an update is available it asks once, verifies the downloaded ZIP against
+its published SHA-256, replaces the launcher and bundled payload, and restarts.
 
 ## Current multiplayer scope
 
@@ -38,7 +43,7 @@ Teleglitch: Die More Edition.
 
 ```powershell
 .\launcher\build-release.ps1 `
-  -Version 0.1.0-alpha.2 `
+  -Version 0.1.0-alpha.3 `
   -RelayHost yamanote.proxy.rlwy.net `
   -RelayPort 58057
 ```

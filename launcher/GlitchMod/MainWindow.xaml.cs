@@ -14,9 +14,11 @@ namespace GlitchMod
     {
         private readonly LauncherCore core;
         private readonly ILauncherDialogs dialogs;
+        private readonly ILauncherUpdateService updates;
         private LauncherSettings settings;
         private LaunchProfile selectedProfile;
         private List<ModInfo> installedMods = new List<ModInfo>();
+        private LauncherUpdateInfo availableUpdate;
 
         private Brush Acid { get { return (Brush)FindResource("Acid"); } }
         private Brush Muted { get { return (Brush)FindResource("Muted"); } }
@@ -25,23 +27,33 @@ namespace GlitchMod
         private Brush Panel { get { return (Brush)FindResource("Panel"); } }
         private Brush Danger { get { return (Brush)FindResource("Danger"); } }
 
-        public MainWindow() : this(new LauncherCore(), new SystemLauncherDialogs())
+        public MainWindow() : this(
+            new LauncherCore(), new SystemLauncherDialogs(), new LauncherUpdateService())
         {
         }
 
-        public MainWindow(LauncherCore launcherCore) : this(launcherCore, new SystemLauncherDialogs())
+        public MainWindow(LauncherCore launcherCore) : this(
+            launcherCore, new SystemLauncherDialogs(), new LauncherUpdateService())
         {
         }
 
-        public MainWindow(LauncherCore launcherCore, ILauncherDialogs launcherDialogs)
+        public MainWindow(LauncherCore launcherCore, ILauncherDialogs launcherDialogs) : this(
+            launcherCore, launcherDialogs, new LauncherUpdateService())
+        {
+        }
+
+        public MainWindow(LauncherCore launcherCore, ILauncherDialogs launcherDialogs,
+            ILauncherUpdateService launcherUpdates)
         {
             InitializeComponent();
             try
             {
                 if (launcherCore == null) throw new ArgumentNullException("launcherCore");
                 if (launcherDialogs == null) throw new ArgumentNullException("launcherDialogs");
+                if (launcherUpdates == null) throw new ArgumentNullException("launcherUpdates");
                 core = launcherCore;
                 dialogs = launcherDialogs;
+                updates = launcherUpdates;
                 settings = core.LoadSettings();
             }
             catch (Exception ex)
@@ -71,6 +83,10 @@ namespace GlitchMod
             bool online = await core.CheckRelayAsync(2500);
             RelayStateText.Text = online ? "Online" : "Unavailable";
             RelayStatusDot.Fill = online ? Acid : Danger;
+
+            if (!string.Equals(Environment.GetEnvironmentVariable("GLITCHMOD_DISABLE_UPDATES"),
+                "1", StringComparison.Ordinal))
+                await CheckForLauncherUpdateAsync(true, false);
         }
 
         private void RefreshAll()
@@ -389,6 +405,84 @@ namespace GlitchMod
         {
             if (string.IsNullOrWhiteSpace(settings.GamePath) || !Directory.Exists(settings.GamePath)) return;
             RunUiAction("OPENING GAME FOLDER", () => core.OpenGameFolder(settings.GamePath));
+        }
+
+        private async void Update_Click(object sender, RoutedEventArgs e)
+        {
+            if (availableUpdate == null)
+                await CheckForLauncherUpdateAsync(false, true);
+            else
+                await ApplyAvailableUpdateAsync();
+        }
+
+        private async System.Threading.Tasks.Task CheckForLauncherUpdateAsync(
+            bool autoPrompt, bool userInitiated)
+        {
+            UpdateButton.IsEnabled = false;
+            UpdateButton.Content = "CHECKING UPDATES...";
+            try
+            {
+                availableUpdate = await updates.CheckForUpdateAsync(core.Payload.version, 8000);
+                if (availableUpdate == null)
+                {
+                    UpdateButton.Content = "UP TO DATE - " + core.Payload.version;
+                    UpdateButton.Foreground = Muted;
+                    UpdateButton.ToolTip = "GlitchMod and the bundled payload are current.";
+                    if (userInitiated) SetStatus("GLITCHMOD IS UP TO DATE");
+                    return;
+                }
+
+                UpdateButton.Content = "UPDATE - " + availableUpdate.Version;
+                UpdateButton.Foreground = Acid;
+                UpdateButton.ToolTip = "Download and install GlitchMod " + availableUpdate.Version;
+                SetStatus("GLITCHMOD UPDATE AVAILABLE - " + availableUpdate.Version);
+                if (autoPrompt || userInitiated) await ApplyAvailableUpdateAsync();
+            }
+            catch (Exception ex)
+            {
+                UpdateButton.Content = "UPDATE CHECK FAILED";
+                UpdateButton.Foreground = Danger;
+                UpdateButton.ToolTip = ex.Message;
+                if (userInitiated)
+                    dialogs.ShowWarning(
+                        "GlitchMod could not check GitHub for updates.\n\n" + ex.Message,
+                        "Update check failed");
+            }
+            finally
+            {
+                UpdateButton.IsEnabled = true;
+            }
+        }
+
+        private async System.Threading.Tasks.Task ApplyAvailableUpdateAsync()
+        {
+            LauncherUpdateInfo update = availableUpdate;
+            if (update == null) return;
+            if (!dialogs.ConfirmLauncherUpdate(core.Payload.version, update.Version)) return;
+
+            UpdateButton.IsEnabled = false;
+            UpdateButton.Content = "DOWNLOADING " + update.Version + "...";
+            SetStatus("DOWNLOADING VERIFIED UPDATE");
+            try
+            {
+                PreparedLauncherUpdate prepared = await updates.PrepareUpdateAsync(update, 30000);
+                UpdateButton.Content = "RESTARTING...";
+                SetStatus("APPLYING UPDATE - SHA256 " + prepared.VerifiedSha256.Substring(0, 12));
+                updates.StartApply(prepared);
+                Close();
+            }
+            catch (Exception ex)
+            {
+                UpdateButton.Content = "UPDATE - " + update.Version;
+                SetStatus("UPDATE FAILED");
+                dialogs.ShowError(
+                    "The launcher was not changed.\n\n" + ex.Message,
+                    "GlitchMod update failed");
+            }
+            finally
+            {
+                UpdateButton.IsEnabled = true;
+            }
         }
 
         private void RunUiAction(string runningStatus, Action action)
